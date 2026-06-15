@@ -37,7 +37,7 @@ Facts and metrics mean different things:
 
 | Data    | Meaning                                                                                           |
 | ------- | ------------------------------------------------------------------------------------------------- |
-| Facts   | Mostly stable inventory, such as OS, architecture, hostname, CPU core count, memory total/modules, disk capacity, and network interfaces. |
+| Facts   | Mostly stable inventory, such as OS, architecture, hostname, CPU core count, memory total/modules, disk devices, mount layout, disk capacity, and network interfaces. |
 | Metrics | Time-series usage telemetry, such as CPU usage, memory usage, disk usage, process count, and service failure counts. |
 
 ## Install
@@ -231,6 +231,38 @@ By default, the agent also uploads product-safe operational log chunks every
 interval with `--log-upload-interval-seconds <SECONDS>`, or disable this upload
 with `--disable-log-upload`.
 
+Heartbeat, facts, metrics, and operational logs have separate intervals.
+Heartbeat is only the liveness tick and does not control task dispatch. Static
+inventory facts default to every 300 seconds with `--facts-interval-seconds`.
+Usage metrics default to every 30 seconds with `--metrics-interval-seconds`.
+Task assignments are pushed on the persistent session independently from those
+telemetry intervals.
+
+## How Run Works
+
+The controller does not open a connection to an agent. Each agent opens one
+outbound persistent WebSocket session to the controller after enrollment.
+
+When you run a command from Web Admin or `sponzey run`, the controller first
+stores the job and its signed task assignment. If the target agent is currently
+connected, the controller pushes the task immediately over that existing
+session. The run path does not wait for the next heartbeat. Heartbeat is only a
+liveness signal.
+
+If the target agent is offline, the job stays queued. When the agent reconnects
+and authenticates again, the controller drains pending assignments for that
+agent and pushes the next task over the renewed session.
+
+The agent returns `output_chunk` messages and one `task_result` over the same
+session. Web Admin polls the job detail and output APIs as a fallback display
+path, so the UI can show queued, delivered, running, completed, and no-output
+states without embedding raw command output in product logs.
+
+Revoking an agent key disables the agent, closes any active session with the
+`agent_revoked` reason, and blocks additional task delivery. It does not
+guarantee an immediate kill of a local OS process that the agent already
+started. That requires a separate task cancellation protocol.
+
 ## HTTPS Preparation
 
 You need this section for product, customer, production, shared, or long-running
@@ -399,9 +431,12 @@ Open `/admin`, not an API path.
 ```bash
 cargo fmt --all --check
 cargo test --workspace
-cargo clippy --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
 npm test --workspace @sponzey/fleet
 npm test --workspace web-admin
+npm run typecheck --workspace web-admin
 npm run build --workspace web-admin
 ./scripts/smoke_mvp.sh
+./scripts/smoke_immediate_dispatch.sh
+./scripts/smoke_remote_tls_loopback.sh
 ```

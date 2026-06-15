@@ -433,6 +433,16 @@ mod tests {
     }
 
     #[test]
+    fn job_running_state_represents_coarse_dispatch_or_execution() {
+        let mut job = job();
+        job.queue(false).unwrap();
+
+        job.start().unwrap();
+
+        assert_eq!(job.status(), JobStatus::Running);
+    }
+
+    #[test]
     fn transitions_running_to_success() {
         let mut job = job();
         job.queue(false).unwrap();

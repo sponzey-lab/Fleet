@@ -61,9 +61,21 @@ if [ -z "$WRAPPER_TARBALL" ] || [ -z "$PLATFORM_TARBALL" ]; then
   exit 1
 fi
 
-NPM_CONFIG_PREFIX="$WORK_DIR/prefix" \
-NPM_CONFIG_CACHE="$WORK_DIR/npm-cache" \
-  npm install -g "$PLATFORM_TARBALL" "$WRAPPER_TARBALL" >/dev/null
+INSTALL_ROOT="$WORK_DIR/prefix/lib/node_modules/@sponzey"
+mkdir -p "$INSTALL_ROOT" "$WORK_DIR/prefix/bin" "$WORK_DIR/extract-wrapper" "$WORK_DIR/extract-platform"
+tar -xzf "$PLATFORM_TARBALL" -C "$WORK_DIR/extract-platform"
+tar -xzf "$WRAPPER_TARBALL" -C "$WORK_DIR/extract-wrapper"
+mv "$WORK_DIR/extract-platform/package" "$INSTALL_ROOT/fleet-$PLATFORM_OS-$PLATFORM_ARCH"
+mv "$WORK_DIR/extract-wrapper/package" "$INSTALL_ROOT/fleet"
+ln -sf "../lib/node_modules/@sponzey/fleet/bin/sponzey" "$WORK_DIR/prefix/bin/sponzey"
+PREFIX_ROOT="$(cd "$WORK_DIR/prefix" && pwd -P)"
+PREFIX_BIN="$(cd "$WORK_DIR/prefix/bin" && pwd -P)"
+
+NPM_CONFIG_PREFIX="$PREFIX_ROOT" \
+npm_config_prefix="$PREFIX_ROOT" \
+npm_config_global=true \
+PATH="$PREFIX_BIN:$PATH" \
+  node "$INSTALL_ROOT/fleet/scripts/postinstall.js" >/dev/null
 
 SPONZEY_FLEET_NPM_OS="$PLATFORM_OS" \
 SPONZEY_FLEET_NPM_ARCH="$PLATFORM_ARCH" \

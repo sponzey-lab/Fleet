@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Sponzey Fleet Controller API",
-    "version": "0.1.12",
+    "version": "0.0.13",
     "summary": "REST API for the Sponzey Fleet controller.",
     "description": "Sponzey Fleet exposes controller APIs for agent enrollment, inventory, job dispatch, snapshots, drift reports, and audit events. HTTP transport is supported only for local or short-lived tests. Use HTTPS for product, production, shared, or long-running environments because HTTP does not provide confidentiality or integrity."
   },
@@ -159,6 +159,7 @@
           "id",
           "name",
           "status",
+          "connected",
           "revoked",
           "fingerprint",
           "labels",
@@ -171,7 +172,12 @@
         "properties": {
           "id": { "type": "string", "example": "agent-web-01" },
           "name": { "type": "string", "example": "web-01" },
-          "status": { "type": "string", "enum": ["pending", "online", "offline", "degraded", "disabled"], "example": "online" },
+          "status": { "type": "string", "enum": ["pending", "online", "reconnecting", "offline", "degraded", "disabled"], "example": "online" },
+          "connected": {
+            "type": "boolean",
+            "description": "True when the controller currently has an authenticated persistent session for this agent.",
+            "example": true
+          },
           "revoked": { "type": "boolean", "example": false },
           "fingerprint": { "type": "string", "example": "<agent-fingerprint>" },
           "labels": {
@@ -210,7 +216,7 @@
           },
           "body": {
             "type": "object",
-            "description": "Stable inventory payload. Facts should include relatively stable system characteristics such as OS, architecture, hostname, CPU logical count, total memory, memory module count when discoverable, root disk capacity, and network interface names. Facts should not include current CPU, memory, or disk usage.",
+            "description": "Stable inventory payload. Facts should include relatively stable system characteristics such as OS, architecture, hostname, CPU logical count, total memory, memory module count when discoverable, disk device inventory, mount layout, root disk capacity, and network interface names. Facts should not include current CPU, memory, or disk usage.",
             "additionalProperties": true
           }
         },
@@ -229,7 +235,7 @@
           },
           "body": {
             "type": "object",
-            "description": "Stable inventory payload. Facts should include relatively stable system characteristics such as OS, architecture, hostname, CPU logical count, total memory, memory module count when discoverable, root disk capacity, and network interface names. Facts should not include current CPU, memory, or disk usage.",
+            "description": "Stable inventory payload. Facts should include relatively stable system characteristics such as OS, architecture, hostname, CPU logical count, total memory, memory module count when discoverable, disk device inventory, mount layout, root disk capacity, and network interface names. Facts should not include current CPU, memory, or disk usage.",
             "additionalProperties": true
           },
           "cursor": { "type": "string", "example": "1710000000:42" }
@@ -436,10 +442,31 @@
       },
       "JobSummary": {
         "type": "object",
-        "required": ["id", "status", "risk", "command_program", "command_args", "target_count", "created_at_ms"],
+        "required": [
+          "id",
+          "status",
+          "dispatch_state",
+          "risk",
+          "command_program",
+          "command_args",
+          "target_count",
+          "target_agent_ids",
+          "target_agents",
+          "target_connected",
+          "created_at_ms",
+          "updated_at_ms",
+          "expires_at_ms",
+          "last_error"
+        ],
         "properties": {
           "id": { "type": "string", "example": "job-1" },
           "status": { "type": "string", "example": "queued" },
+          "dispatch_state": {
+            "type": "string",
+            "enum": ["created", "queued", "delivered", "completed", "failed", "expired", "rejected"],
+            "description": "Operator-facing dispatch state derived by the controller. It does not contain raw command output.",
+            "example": "queued"
+          },
           "risk": { "type": "string", "example": "high" },
           "command_program": { "type": ["string", "null"], "example": "uptime" },
           "command_args": {
@@ -447,7 +474,39 @@
             "items": { "type": "string" }
           },
           "target_count": { "type": "integer", "example": 1 },
-          "created_at_ms": { "type": "integer", "example": 1710000000000 }
+          "target_agent_ids": {
+            "type": "array",
+            "items": { "type": "string" },
+            "example": ["agent-web-01"]
+          },
+          "target_agents": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/JobTargetSummary" }
+          },
+          "target_connected": {
+            "type": "boolean",
+            "description": "True when at least one target currently has an authenticated persistent session.",
+            "example": false
+          },
+          "created_at_ms": { "type": "integer", "example": 1710000000000 },
+          "updated_at_ms": { "type": "integer", "example": 1710000001000 },
+          "expires_at_ms": { "type": ["integer", "null"], "example": 1710000060000 },
+          "last_error": {
+            "type": "string",
+            "description": "Controller-visible dispatch or terminal error summary. Raw stdout/stderr is only available through the output API.",
+            "example": ""
+          }
+        },
+        "additionalProperties": false
+      },
+      "JobTargetSummary": {
+        "type": "object",
+        "required": ["agent_id", "status", "connected", "revoked"],
+        "properties": {
+          "agent_id": { "type": "string", "example": "agent-web-01" },
+          "status": { "type": "string", "example": "online" },
+          "connected": { "type": "boolean", "example": true },
+          "revoked": { "type": "boolean", "example": false }
         },
         "additionalProperties": false
       },
@@ -986,6 +1045,29 @@
             }
           },
           "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/api/jobs/{job_id}": {
+      "get": {
+        "tags": ["Jobs"],
+        "summary": "Get one job summary.",
+        "description": "Returns the controller-visible job status, dispatch state, target agent connection state, and metadata. Raw stdout/stderr is not embedded in this response.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "job_id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "Job summary.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/JobSummary" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
         }
       }
     },

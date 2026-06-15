@@ -12,6 +12,7 @@ fleet-application = { path = "../fleet-application" }
 fleet-domain = { path = "../fleet-domain" }
 fleet-protocol = { path = "../fleet-protocol" }
 fleet-store = { path = "../fleet-store" }
+futures-util = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

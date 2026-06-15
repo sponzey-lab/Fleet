@@ -60,6 +60,7 @@ OpenAPI 문서 범위:
 - `/api/agents/{agent_id}/drift`
 - `/api/agents/{agent_id}/drift/latest`
 - `/api/jobs`
+- `/api/jobs/{job_id}`
 - `/api/jobs/command`
 - `/api/jobs/runbook`
 - `/api/jobs/drift-check`
@@ -246,7 +247,21 @@ Controller는 raw enrollment token을 hash로 검증하고, 성공 시 token use
 
 ## Command Job API
 
-MVP의 command job API는 admin token 인증 후 command job과 controller-signed task assignment를 생성한다. 등록된 agent가 다음 heartbeat WebSocket session을 열면 controller는 queued assignment 하나를 dispatch하고, agent는 command를 실행한 뒤 output chunk와 task result를 controller에 돌려보낸다. 실행 중 실시간 streaming과 별도 output subscribe API는 아직 후속 범위다.
+Command job API는 admin token 인증 후 command job과 controller-signed task assignment를 생성한다. Controller는 job과 assignment를 DB에 저장한 뒤 active authenticated agent session이 있으면 즉시 `task_assignment`를 dispatch한다. 등록된 agent가 disconnected 상태이면 assignment는 queued 상태로 남고, agent가 reconnect하여 session registry에 등록되는 즉시 pending queue drain 대상으로 처리된다. Agent는 command를 실행한 뒤 output chunk와 task result를 같은 WebSocket session으로 controller에 돌려보낸다. 별도 output subscribe API는 아직 후속 범위다.
+
+Job과 task assignment는 항상 DB에 먼저 저장된다. WebSocket send는 저장 이후에만 시도할 수 있으며, DB transaction과 WebSocket send는 하나의 원자적 작업으로 취급하지 않는다. 따라서 queued assignment가 source of truth이고, active session dispatch 실패 시 assignment는 queued 상태로 남아 재시도 대상이 된다.
+
+현재 1차 상태 모델은 `queued -> running -> success/failed/expired/canceled`를 유지한다. 별도 `dispatched`, `accepted`, `rejected` 상태는 아직 도입하지 않는다. 이 단계에서 `running`은 "active session으로 전달되었거나 agent가 실행 중인 coarse 상태"를 의미할 수 있다. 이후 `task_ack`, `task_started`, `task_rejected` protocol payload가 들어오면 더 세밀한 상태로 분리한다.
+
+Agent가 running 중 disconnect되더라도 Controller는 task result 없이 job을 즉시 failed로 바꾸지 않는다. 이 경우 running 상태는 expiry/reconciler 정책이 최종 상태를 결정할 때까지 유지될 수 있다. Agent local command는 task timeout과 runner output limit을 계속 적용받는다.
+
+Dispatch 대상 선택 정책:
+
+- disabled/revoked agent에는 dispatch하지 않는다.
+- disconnected agent의 assignment는 queued 상태로 둔다.
+- expired assignment는 agent로 보내지 않고 expired 처리 대상이 된다.
+- 같은 `(job_id, agent_id, stream, chunk_index)` output chunk가 같은 body로 다시 오면 idempotent duplicate로 처리한다.
+- 같은 key의 output chunk가 다른 body로 오면 conflicting duplicate이며 raw output body 없이 `websocket_output_chunk_conflict` security audit를 남기고 protocol error로 session cleanup 대상이 된다.
 
 ```http
 POST /api/jobs/command
@@ -357,16 +372,83 @@ Authorization: Bearer <admin-token>
   {
     "id": "job-1",
     "status": "queued",
+    "dispatch_state": "queued",
     "risk": "high",
     "command_program": "uptime",
     "command_args": ["-a"],
     "target_count": 1,
-    "created_at_ms": 1710000000000
+    "target_agent_ids": ["agent-web-01"],
+    "target_agents": [
+      {
+        "agent_id": "agent-web-01",
+        "status": "offline",
+        "connected": false,
+        "revoked": false
+      }
+    ],
+    "target_connected": false,
+    "created_at_ms": 1710000000000,
+    "updated_at_ms": 1710000000000,
+    "expires_at_ms": 1710000060000,
+    "last_error": ""
   }
 ]
 ```
 
-이 API는 저장된 summary만 보여준다. authorization 판단이나 job 상태 전이는 controller application/domain 경계에서 처리한다.
+이 API는 저장된 summary와 controller가 알고 있는 target connection 상태만 보여준다.
+authorization 판단이나 job 상태 전이는 controller application/domain 경계에서 처리한다.
+raw command output은 포함하지 않는다.
+
+`status`는 domain job 상태이고, `dispatch_state`는 운영자가 보기 위한 dispatch 상태다.
+예를 들어 `status=queued`라도 target agent가 persistent session으로 이미 연결되어
+있으면 `dispatch_state=created`로 보일 수 있다. `dispatch_state=delivered`는
+controller가 active authenticated agent session으로 task assignment를 보냈다는 뜻이다.
+
+### Get Job Detail
+
+특정 job의 현재 상태, target agent 연결 상태, 만료 시각을 조회한다. Web Admin UI는
+이 응답과 output polling 결과를 함께 사용해서 queued/offline/running/completed/no-output
+상태를 구분한다.
+
+```http
+GET /api/jobs/{job_id}
+Authorization: Bearer <admin-token>
+```
+
+응답:
+
+```json
+{
+  "id": "job-1",
+  "status": "running",
+  "dispatch_state": "delivered",
+  "risk": "high",
+  "command_program": "uptime",
+  "command_args": ["-a"],
+  "target_count": 1,
+  "target_agent_ids": ["agent-web-01"],
+  "target_agents": [
+    {
+      "agent_id": "agent-web-01",
+      "status": "online",
+      "connected": true,
+      "revoked": false
+    }
+  ],
+  "target_connected": true,
+  "created_at_ms": 1710000000000,
+  "updated_at_ms": 1710000000000,
+  "expires_at_ms": 1710000060000,
+  "last_error": ""
+}
+```
+
+규칙:
+
+- raw stdout/stderr는 이 API에 포함하지 않는다.
+- output은 `/api/jobs/{job_id}/output`에서만 조회한다.
+- `target_connected`는 target 중 하나 이상이 현재 authenticated persistent session에 붙어 있으면 `true`다.
+- rejected/expired/failed 상태에서는 `last_error`가 비어 있을 수 있으므로, 운영자는 audit과 output을 함께 확인해야 한다.
 
 ### Poll Output
 
@@ -410,6 +492,7 @@ Authorization: Bearer <admin-token>
     "id": "agent-web-01",
     "name": "web-01",
     "status": "online",
+    "connected": true,
     "revoked": false,
     "fingerprint": "<agent-fingerprint>",
     "labels": [
@@ -426,7 +509,22 @@ Authorization: Bearer <admin-token>
 
 `hostname`, `os`, `arch`는 최신 facts snapshot에서 추출한 얇은 inventory summary다. facts가 아직 없으면 `null`이다. `last_seen_age_seconds`는 response 생성 시점 기준의 health 판단 보조값이며, `last_seen_at_ms`가 없으면 `null`이다.
 
-Agent key가 revoke되어 더 이상 heartbeat를 받아들이면 안 되는 agent는 inventory에서 `"status": "offline"`과 `"revoked": true`를 함께 반환한다. 내부 저장 상태는 disabled/revoked로 분리될 수 있지만, 운영 화면에서는 연결 불가 상태와 revoke 상태가 동시에 드러나야 한다.
+Session summary 필드:
+
+- `connected`: controller session registry에 active authenticated persistent session이 있으면 `true`다.
+- `status`: 저장된 agent 상태와 현재 session 상태를 조합한 운영자용 상태다.
+- `last_seen_at_ms`: controller가 agent heartbeat 또는 session payload를 마지막으로 수신한 시각이다.
+- `last_seen_age_seconds`: 응답 생성 시점 기준으로 계산한 age다.
+- 상세 queue depth, connection id, close reason history는 Product API 응답에 포함하지 않고 audit와 Field Debug 로그에서 확인한다.
+
+Inventory 상태 정책:
+
+- active authenticated persistent session이 있으면 `"connected": true`, `"status": "online"`이다.
+- session은 없지만 `last_seen_at_ms`가 최근 threshold 이내이면 `"connected": false`, `"status": "reconnecting"`이다.
+- threshold를 넘으면 `"connected": false`, `"status": "offline"`이다.
+- Agent key가 revoke되어 더 이상 heartbeat를 받아들이면 안 되는 agent는 `"connected": false`, `"status": "offline"`, `"revoked": true`를 함께 반환한다.
+
+내부 저장 상태는 disabled/revoked로 분리될 수 있지만, 운영 화면에서는 연결 불가 상태와 revoke 상태가 동시에 드러나야 한다.
 
 ### Detail
 
@@ -444,7 +542,9 @@ POST /api/agents/{agent_id}/revoke-key
 Authorization: Bearer <admin-token>
 ```
 
-Agent key를 revoke하고 agent를 disabled 상태로 전환한다. 응답은 갱신된 agent detail object이며, 운영 화면에서는 `"status": "offline"`과 `"revoked": true`가 함께 표시된다. 이후 같은 key를 사용하는 WebSocket 인증과 heartbeat online 전환은 허용되지 않는다. 존재하지 않는 agent는 `404`를 반환한다. 성공 시 `agent_key_revoked` audit event를 남긴다.
+Agent key를 revoke하고 agent를 disabled 상태로 전환한다. 응답은 갱신된 agent detail object이며, 운영 화면에서는 `"connected": false`, `"status": "offline"`, `"revoked": true`가 함께 표시된다. revoke 성공 직후 active session이 있으면 controller는 해당 session을 `agent_revoked` close reason으로 종료한다. 이후 같은 key를 사용하는 WebSocket 인증과 heartbeat online 전환은 허용되지 않는다. 존재하지 않는 agent는 `404`를 반환한다. 성공 시 `agent_key_revoked` audit event를 남기고, active session을 닫은 경우 `agent_session_revoked_closed` audit event도 남긴다.
+
+이미 agent 로컬 OS process로 실행 중인 task를 즉시 kill하는 것은 이 API의 보장 범위가 아니다. task cancellation protocol이 추가되기 전까지 running process 경계는 기존 command timeout과 runner boundary가 담당한다. revoke는 추가 task 수신 차단과 session 종료를 보장한다.
 
 ### Update Labels
 
@@ -499,7 +599,36 @@ Authorization: Bearer <admin-token>
       "interfaces": ["lo", "eth0"]
     },
     "disk": {
+      "device_inventory_known": true,
+      "device_count": 1,
+      "devices": [
+        {
+          "name": "nvme0n1",
+          "kind": "disk",
+          "size_kb": 52428800,
+          "removable": false,
+          "rotational": false
+        }
+      ],
+      "mount_inventory_known": true,
+      "mount_count": 2,
+      "mounts": [
+        {
+          "source": "/dev/nvme0n1p1",
+          "mount_point": "/",
+          "fs_type": "ext4",
+          "read_only": false
+        },
+        {
+          "source": "/dev/nvme0n1p2",
+          "mount_point": "/data",
+          "fs_type": "xfs",
+          "read_only": false
+        }
+      ],
       "root_mount_known": true,
+      "root_source": "/dev/nvme0n1p1",
+      "root_fs_type": "ext4",
       "root_capacity_known": true,
       "root_filesystem": "/dev/root",
       "root_total_kb": 52428800
@@ -512,7 +641,7 @@ Authorization: Bearer <admin-token>
 }
 ```
 
-Agent facts snapshot은 heartbeat session에서 전송된다. `collected_at_ms`는 controller가 저장한 snapshot 시각이며, 신규 agent message에서는 agent가 보낸 message timestamp를 기준으로 한다. `agent_system_time_ms`는 해당 snapshot을 만든 agent 시스템 기준 시각이다. Facts/metrics payload 내부의 `body.system_time_ms`도 동일한 agent 시스템 시각을 담는다. Facts는 OS, architecture, platform family, hostname, CPU logical count, memory total/module count, Linux `/proc/net/dev` 기반 network interface, root disk capacity 같은 비교적 변하지 않는 inventory만 담는다. 현재 메모리 사용량, 디스크 사용량, CPU 사용률은 facts가 아니라 metrics에 담는다. Facts payload의 `degraded.status=true`는 controller에서 agent 상태 `degraded`로 반영된다.
+Agent facts snapshot은 persistent session에서 전송되지만 heartbeat마다 전송되지 않는다. 기본 agent start 설정에서는 initial session snapshot 이후 `--facts-interval-seconds` 기준으로 전송되며 기본값은 300초다. `collected_at_ms`는 controller가 저장한 snapshot 시각이며, 신규 agent message에서는 agent가 보낸 message timestamp를 기준으로 한다. `agent_system_time_ms`는 해당 snapshot을 만든 agent 시스템 기준 시각이다. Facts/metrics payload 내부의 `body.system_time_ms`도 동일한 agent 시스템 시각을 담는다. Facts는 OS, architecture, platform family, hostname, CPU logical count, memory total/module count, Linux `/sys/block` 기반 disk device inventory, Linux `/proc/mounts` 기반 mount layout, Linux `/proc/net/dev` 기반 network interface, root disk capacity 같은 비교적 변하지 않는 inventory만 담는다. 현재 메모리 사용량, 디스크 사용량, CPU 사용률은 facts가 아니라 metrics에 담는다. Facts payload의 `degraded.status=true`는 controller에서 agent 상태 `degraded`로 반영된다.
 
 ### Facts Snapshot Pages
 
@@ -591,7 +720,7 @@ Authorization: Bearer <admin-token>
 }
 ```
 
-Metrics snapshot도 heartbeat session에서 전송된다. `collected_at_ms`는 저장된 snapshot 시각이고, `agent_system_time_ms`는 agent가 metrics를 만든 시스템 시각이다. Metrics는 CPU 사용률, 메모리 사용량/사용률, 디스크 사용량/사용률, process count, service failure count처럼 시간에 따라 변하는 사용량 telemetry를 담는다. MVP는 lightweight snapshot만 저장하며 time-series observability platform으로 확장하지 않는다. `service.status_available=false`는 systemd가 없거나 조회가 불가능한 환경을 의미하며, collector 실패로 process를 중단하지 않는다. Retention cleanup은 `sponzey retention cleanup`으로 명시적으로 실행한다.
+Metrics snapshot도 persistent session에서 전송되지만 heartbeat 주기와는 독립적이다. 기본 agent start 설정에서는 initial session snapshot 이후 `--metrics-interval-seconds` 기준으로 전송되며 기본값은 30초다. `collected_at_ms`는 저장된 snapshot 시각이고, `agent_system_time_ms`는 agent가 metrics를 만든 시스템 시각이다. Metrics는 CPU 사용률, 메모리 사용량/사용률, 디스크 사용량/사용률, process count, service failure count처럼 시간에 따라 변하는 사용량 telemetry를 담는다. MVP는 lightweight snapshot만 저장하며 time-series observability platform으로 확장하지 않는다. `service.status_available=false`는 systemd가 없거나 조회가 불가능한 환경을 의미하며, collector 실패로 process를 중단하지 않는다. Retention cleanup은 `sponzey retention cleanup`으로 명시적으로 실행한다.
 
 ### Metrics Snapshot Pages
 

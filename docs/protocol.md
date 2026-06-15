@@ -72,15 +72,59 @@ ws://127.0.0.1:7700/api/agents/ws
 3. Controller sends `auth_challenge` with nonce.
 4. Agent signs the nonce with its local Ed25519 private key and sends `auth_response`.
 5. Controller sends `auth_accepted`.
-6. Agent sends `heartbeat`.
-7. Controller updates `last_seen_at` and marks the agent `online`.
-8. If one queued assignment exists for the agent, Controller sends `task_assignment`.
-9. Agent verifies the signed envelope and executes the command, drift check, or runbook task.
-10. Agent sends `output_chunk` messages and one `task_result`.
+6. Controller registers the authenticated persistent session.
+7. Controller drains at most one pending assignment for the agent immediately after session registration.
+8. Agent sends periodic `heartbeat` liveness ticks on the same session.
+   Facts, metrics, and operational log chunks use separate agent-side intervals.
+9. New command, drift-check, or runbook jobs are stored first, then dispatched immediately to active sessions.
+10. Agent verifies the signed envelope and executes the command, drift check, or runbook task.
+11. Agent sends `output_chunk` messages and one `task_result`.
+
+### Current WebSocket lifecycle
+
+현재 lifecycle은 persistent outbound session이다.
+
+- Agent가 Controller로 outbound WebSocket을 연다.
+- 인증이 끝난 뒤 Agent가 heartbeat를 보낸다.
+- Controller는 인증된 session을 runtime registry에 등록한다.
+- session 등록 직후 해당 agent의 pending assignment를 최대 1개 drain한다.
+- `POST /api/jobs/command`, `POST /api/jobs/runbook`, `POST /api/jobs/drift-check`는 job과 assignment를 DB에 저장한 뒤 active session으로 즉시 dispatch를 시도한다.
+- connected session이 없거나 outbound queue가 가득 차면 assignment는 DB queued 상태로 남고 dispatch failure가 audit된다.
+- queued assignment가 없더라도 Controller는 연결을 유지하고 heartbeat/facts/metrics/log/output/result payload를 같은 session에서 계속 처리한다.
+- Controller는 Agent로 직접 접속하지 않는다. 현재 구조와 목표 구조 모두 Agent outbound 연결을 기준으로 한다.
 
 Agent enrollment generates an Ed25519 key pair locally. The private key is stored in `agent_private.key`; the controller stores the public key and fingerprint. On Unix, `agent.conf` and `agent_private.key` must not be readable, writable, or executable by group/other.
 
-`sponzey agent start` runs as a heartbeat loop by default. Controller connection failures are retried indefinitely unless `--once` or `--max-reconnect-attempts` is set. For smoke tests and one-shot checks, pass `--once`.
+`sponzey agent start` runs as a persistent session loop by default. `--heartbeat-interval-seconds` controls liveness ticks only, not the connection cycle, facts upload, metrics upload, log upload, or task dispatch. Facts default to a lower-frequency static inventory interval controlled by `--facts-interval-seconds` (300 seconds). Metrics default to a chart-friendly interval controlled by `--metrics-interval-seconds` (30 seconds). Controller connection failures are retried indefinitely unless `--once` or `--max-reconnect-attempts` is set. For smoke tests and one-shot checks, pass `--once`.
+
+Controller session implementation note:
+
+- 인증이 끝난 Controller WebSocket handler는 read loop와 write loop를 분리한다.
+- session당 WebSocket writer는 하나의 writer loop만 소유한다.
+- Controller 내부 producer는 bounded outbound channel로 `task_assignment` 같은 `WireMessage`를 전달한다.
+- outbound queue overflow는 write queue overflow로 구분되며, dispatch 계층에서는 DB queued assignment를 source of truth로 유지해야 한다.
+- read loop가 처리하는 heartbeat, facts, metrics, log, output, task result, drift, security event는 authenticated session agent id와 payload agent id를 비교한다.
+- agent id mismatch payload는 저장하지 않고 security audit 대상으로 처리한다.
+- DB write failure는 message만 조용히 무시하지 않고 `store_error` close reason으로 session cleanup 대상이 된다.
+- raw command output은 일반 product log로 흘리지 않고 job output storage에만 저장한다.
+- output chunk는 bounded runner output limit과 chunk sequence를 유지한다.
+- 같은 `(job_id, agent_id, stream, sequence)` output chunk가 같은 body로 다시 오면 idempotent duplicate로 보고 무시한다.
+- 같은 key의 output chunk가 다른 body로 오면 raw body를 audit/log에 남기지 않고 `websocket_output_chunk_conflict` security audit를 남긴 뒤 protocol error로 session cleanup 대상이 된다.
+- controller connection drop만으로 `running` job을 즉시 `failed`로 바꾸지 않는다. task result가 없으면 기존 expiry/reconciler 정책이 최종 상태를 결정한다.
+- Agent key revoke 성공 직후 controller는 active session이 있으면 `agent_revoked` close reason으로 writer loop에 close를 enqueue하고 registry에서 제거한다.
+- Revoke는 추가 task 수신 차단과 session 종료를 보장한다. 이미 agent 로컬 OS process로 실행 중인 task의 즉시 kill은 별도 cancellation protocol 범위다.
+- session lifecycle audit action은 `agent_session_started`, `agent_session_ended`, `agent_session_replaced`, `agent_session_revoked_closed`, `agent_session_auth_failed`를 사용한다.
+
+Close reason policy:
+
+- `normal_shutdown`: agent 또는 controller session loop가 정상 종료됐다.
+- `handler_ended`: request handler가 끝나면서 registry guard가 정리됐다.
+- `replaced_by_new_session`: 같은 agent id의 새 authenticated session이 이전 session을 대체했다.
+- `agent_revoked`: agent key revoke로 active session이 닫혔다.
+- `auth_failed`: authentication이 실패했다.
+- `protocol_error`: malformed payload, invalid sequence, duplicate output body mismatch 같은 protocol 위반이다.
+- `store_error`: controller가 session payload를 저장하지 못했다.
+- `write_failure` / `write_queue_overflow`: WebSocket writer 또는 bounded outbound queue 문제다.
 
 Security notes:
 
@@ -107,7 +151,7 @@ task 실행과 결과 전달용 payload:
 
 Facts and metrics payloads include a lightweight system timestamp inside the JSON body so operators can identify when the agent produced the snapshot even after paging or exporting API responses.
 
-- `facts_snapshot` is inventory data. It should describe relatively stable system characteristics such as OS, architecture, hostname, CPU logical count, total memory, memory module count when discoverable, root filesystem, root disk capacity, and network interface names. It must not carry current memory usage, disk usage, or CPU usage.
+- `facts_snapshot` is inventory data. It should describe relatively stable system characteristics such as OS, architecture, hostname, CPU logical count, total memory, memory module count when discoverable, disk device inventory, mount layout, root filesystem, root disk capacity, and network interface names. It must not carry current memory usage, disk usage, or CPU usage.
 - `metrics_snapshot` is usage telemetry. It should describe values that change over time, such as CPU usage percent, memory used/available/used percent, disk used/available/used percent, process count, and service failure counts.
 
 Facts snapshot:
@@ -117,7 +161,7 @@ Facts snapshot:
   "type": "facts_snapshot",
   "payload": {
     "agent_id": "agent-1",
-    "body": "{\"system_time_ms\":1710000000000,\"os\":\"linux\",\"arch\":\"x86_64\",\"memory\":{\"total_kb\":16777216,\"module_count_known\":true,\"module_count\":2},\"disk\":{\"root_capacity_known\":true,\"root_total_kb\":104857600}}"
+    "body": "{\"system_time_ms\":1710000000000,\"os\":\"linux\",\"arch\":\"x86_64\",\"memory\":{\"total_kb\":16777216,\"module_count_known\":true,\"module_count\":2},\"disk\":{\"device_inventory_known\":true,\"device_count\":1,\"devices\":[{\"name\":\"nvme0n1\",\"kind\":\"disk\",\"size_kb\":104857600,\"removable\":false,\"rotational\":false}],\"mount_inventory_known\":true,\"mount_count\":1,\"mounts\":[{\"source\":\"/dev/nvme0n1p1\",\"mount_point\":\"/\",\"fs_type\":\"ext4\",\"read_only\":false}],\"root_capacity_known\":true,\"root_total_kb\":104857600}}"
   }
 }
 ```
@@ -151,7 +195,8 @@ Agent operational log chunk:
 The default agent start mode sends product-safe operational log chunks every
 30 seconds. Operators can change the interval with
 `--log-upload-interval-seconds` or disable it with `--disable-log-upload`.
-These chunks are not raw file tails or journald streams.
+These chunks are not raw file tails or journald streams. They are independent
+from heartbeat, facts, metrics, and task assignment dispatch.
 
 ## Signed Task Envelope
 

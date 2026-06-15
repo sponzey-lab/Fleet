@@ -10,8 +10,9 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, ExitCode};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
+    mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -25,6 +26,8 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 const LOG_TAIL_MAX_LINES: usize = 50;
 const LOG_TAIL_MAX_LINE_BYTES: usize = 4096;
 const LOG_TAIL_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const AGENT_SESSION_OUTBOUND_QUEUE_CAPACITY: usize = 64;
+const AGENT_SESSION_READ_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Parser)]
 #[command(name = "sponzey")]
@@ -178,8 +181,8 @@ pub enum AgentSubcommand {
     },
     #[command(
         about = "Start the enrolled local agent",
-        long_about = "Start the enrolled local agent heartbeat and task loop.\n\nThe agent reads its local identity from <data-dir>/agent/agent.conf, verifies the pinned controller fingerprint during heartbeat, sends facts, metrics, and product-safe agent operational logs, and receives controller-signed tasks. Connection failures are retried indefinitely by default. The agent must be enrolled before this command can run.",
-        after_help = "Examples:\n  sponzey agent start --data-dir .sponzey\n  sponzey agent start --data-dir /var/lib/sponzey-fleet\n  sponzey agent start --data-dir .sponzey --once\n\nLocal development flow:\n  sponzey controller init --data-dir .sponzey\n  sponzey enroll-token create --data-dir .sponzey --labels role=web,env=dev\n  sponzey agent init --data-dir .sponzey --url http://127.0.0.1:7700 --token <token> --name web-01 --labels role=web,env=dev\n  sponzey agent start --data-dir .sponzey"
+        long_about = "Start the enrolled local agent persistent session loop.\n\nThe agent reads its local identity from <data-dir>/agent/agent.conf, verifies the pinned controller fingerprint before opening the session, sends heartbeat liveness ticks, static facts inventory, metrics snapshots, and product-safe agent operational logs through one outbound writer queue, and receives controller-signed tasks on the same session. Heartbeat is only a liveness signal; facts, metrics, and logs each have their own bootstrap CLI interval. Connection failures are retried indefinitely by default. The agent must be enrolled before this command can run.",
+        after_help = "Examples:\n  sponzey agent start --data-dir .sponzey\n  sponzey agent start --data-dir /var/lib/sponzey-fleet\n  sponzey agent start --data-dir .sponzey --once\n  sponzey agent start --data-dir .sponzey --facts-interval-seconds 300 --metrics-interval-seconds 30 --log-upload-interval-seconds 30\n\nLocal development flow:\n  sponzey controller init --data-dir .sponzey\n  sponzey enroll-token create --data-dir .sponzey --labels role=web,env=dev\n  sponzey agent init --data-dir .sponzey --url http://127.0.0.1:7700 --token <token> --name web-01 --labels role=web,env=dev\n  sponzey agent start --data-dir .sponzey"
     )]
     Start {
         #[arg(
@@ -196,9 +199,21 @@ pub enum AgentSubcommand {
         #[arg(
             long,
             default_value_t = 30,
-            help = "Seconds between heartbeats in continuous mode"
+            help = "Seconds between heartbeat liveness ticks; this does not control facts, metrics, log upload, or task dispatch"
         )]
         heartbeat_interval_seconds: u64,
+        #[arg(
+            long,
+            default_value_t = 300,
+            help = "Seconds between static inventory facts snapshots after the initial session snapshot"
+        )]
+        facts_interval_seconds: u64,
+        #[arg(
+            long,
+            default_value_t = 30,
+            help = "Seconds between usage metrics snapshots after the initial session snapshot"
+        )]
+        metrics_interval_seconds: u64,
         #[arg(long, help = "Disable periodic product-safe agent log upload")]
         disable_log_upload: bool,
         #[arg(
@@ -735,6 +750,8 @@ fn execute_agent(command: AgentCommand) -> Result<(), CliError> {
             data_dir,
             once,
             heartbeat_interval_seconds,
+            facts_interval_seconds,
+            metrics_interval_seconds,
             disable_log_upload,
             log_upload_interval_seconds,
             max_reconnect_attempts,
@@ -752,13 +769,30 @@ fn execute_agent(command: AgentCommand) -> Result<(), CliError> {
                         .to_owned(),
                 ));
             }
+            if heartbeat_interval_seconds == 0 {
+                return Err(CliError::Http(
+                    "heartbeat interval must be at least 1 second".to_owned(),
+                ));
+            }
+            if facts_interval_seconds == 0 {
+                return Err(CliError::Http(
+                    "facts interval must be at least 1 second".to_owned(),
+                ));
+            }
+            if metrics_interval_seconds == 0 {
+                return Err(CliError::Http(
+                    "metrics interval must be at least 1 second".to_owned(),
+                ));
+            }
             let config = read_agent_config(&path)?;
             warn_if_insecure_http_url(&config.url);
-            run_agent_heartbeat_loop(
+            run_agent_session_loop(
                 &config,
                 AgentHeartbeatOptions {
                     once,
                     heartbeat_interval: Duration::from_secs(heartbeat_interval_seconds),
+                    facts_interval: Duration::from_secs(facts_interval_seconds),
+                    metrics_interval: Duration::from_secs(metrics_interval_seconds),
                     log_upload: AgentLogUploadOptions {
                         enabled: !disable_log_upload,
                         interval: Duration::from_secs(log_upload_interval_seconds),
@@ -1289,7 +1323,6 @@ fn execute_demo(command: DemoCommand) -> Result<(), CliError> {
     wait_for_controller_health(port)?;
     let controller_url = format!("http://127.0.0.1:{port}");
     let agent_config = enroll_demo_agent(&data_dir, &controller_url, &enroll_token)?;
-    run_agent_heartbeat_once(&agent_config, true)?;
     create_demo_command_job(port, &admin_token)?;
     run_agent_heartbeat_once(&agent_config, true)?;
     let output = http_get(port, "/api/jobs/job-demo-1/output", Some(&admin_token))?;
@@ -2196,6 +2229,8 @@ struct LocalAgentConfig {
 struct AgentHeartbeatOptions {
     once: bool,
     heartbeat_interval: Duration,
+    facts_interval: Duration,
+    metrics_interval: Duration,
     log_upload: AgentLogUploadOptions,
     max_reconnect_attempts: u32,
 }
@@ -2266,17 +2301,101 @@ fn controller_signing_public_key(identity: &fleet_controller::ControllerIdentity
     }
 }
 
-fn run_agent_heartbeat_loop(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentSessionEnd {
+    ControllerClosed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct AgentSessionTickActions {
+    heartbeat: bool,
+    facts: bool,
+    metrics: bool,
+    log: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AgentSessionInbound {
+    Message(Box<fleet_protocol::WireMessage>),
+    Idle,
+    Closed,
+}
+
+fn run_agent_session_loop(
     config: &LocalAgentConfig,
     options: AgentHeartbeatOptions,
 ) -> Result<(), CliError> {
-    run_agent_heartbeat_loop_with(
+    run_agent_session_loop_with(
         options,
-        |upload_log| run_agent_heartbeat_once(config, upload_log),
+        || run_agent_session_once(config, options),
         std::thread::sleep,
     )
 }
 
+fn run_agent_session_loop_with<F, S>(
+    options: AgentHeartbeatOptions,
+    mut session_once: F,
+    mut sleep: S,
+) -> Result<(), CliError>
+where
+    F: FnMut() -> Result<AgentSessionEnd, CliError>,
+    S: FnMut(Duration),
+{
+    let mut reconnect_attempts = 0;
+    loop {
+        match session_once() {
+            Ok(AgentSessionEnd::ControllerClosed) => {
+                reconnect_attempts = 0;
+                println!("agent session closed by controller");
+                if options.once {
+                    return Ok(());
+                }
+                sleep(options.heartbeat_interval);
+            }
+            Err(error) => {
+                if is_fatal_agent_session_error(&error) {
+                    return Err(error);
+                }
+                reconnect_attempts += 1;
+                if options.once
+                    || (options.max_reconnect_attempts != 0
+                        && reconnect_attempts > options.max_reconnect_attempts)
+                {
+                    return Err(error);
+                }
+                eprintln!(
+                    "{}",
+                    format_warning_message(format!("agent session failed: {error}"))
+                );
+                sleep(reconnect_backoff(reconnect_attempts));
+            }
+        }
+    }
+}
+
+fn is_fatal_agent_session_error(error: &CliError) -> bool {
+    matches!(
+        error,
+        CliError::Http(message) if message.contains("controller signing fingerprint changed")
+    )
+}
+
+fn agent_session_tick_actions(
+    heartbeat_elapsed: Duration,
+    facts_elapsed: Duration,
+    metrics_elapsed: Duration,
+    log_elapsed: Duration,
+    options: AgentHeartbeatOptions,
+) -> AgentSessionTickActions {
+    AgentSessionTickActions {
+        heartbeat: heartbeat_elapsed >= options.heartbeat_interval,
+        facts: facts_elapsed >= options.facts_interval,
+        metrics: metrics_elapsed >= options.metrics_interval,
+        log: should_upload_agent_log(options.log_upload, log_elapsed),
+    }
+}
+
+#[cfg(test)]
 fn run_agent_heartbeat_loop_with<F, S>(
     options: AgentHeartbeatOptions,
     mut heartbeat_once: F,
@@ -2385,6 +2504,7 @@ fn run_agent_heartbeat_once(
     if !matches!(accepted.payload, fleet_protocol::WirePayload::AuthAccepted) {
         return Err(CliError::Http("expected auth accepted".to_owned()));
     }
+    set_agent_socket_read_timeout(&mut socket, Some(Duration::from_secs(10)))?;
 
     let heartbeat = fleet_protocol::WireMessage::new(
         prefixed_ulid("msg")?,
@@ -2421,6 +2541,421 @@ fn run_agent_heartbeat_once(
     )?;
 
     Ok(())
+}
+
+type AgentWebSocket = tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>;
+type AgentOutboundSender = SyncSender<fleet_protocol::WireMessage>;
+type AgentOutboundReceiver = Receiver<fleet_protocol::WireMessage>;
+
+fn run_agent_session_once(
+    config: &LocalAgentConfig,
+    options: AgentHeartbeatOptions,
+) -> Result<AgentSessionEnd, CliError> {
+    let identity = controller_identity_via_controller(&config.url, config.tls_ca_cert.as_deref())?;
+    validate_pinned_controller_identity(config, &identity)?;
+    let endpoint = parse_controller_url(&config.url)?;
+    let ws_url = endpoint.websocket_url("/api/agents/ws");
+    let (mut socket, _) =
+        connect_agent_websocket(&ws_url, &endpoint, config.tls_ca_cert.as_deref())?;
+    set_agent_socket_read_timeout(&mut socket, Some(AGENT_SESSION_READ_POLL_INTERVAL))?;
+    let correlation_id = prefixed_ulid("corr")?;
+
+    perform_agent_session_handshake(&mut socket, config, &correlation_id)?;
+
+    let (outbound_sender, outbound_receiver) =
+        mpsc::sync_channel(AGENT_SESSION_OUTBOUND_QUEUE_CAPACITY);
+    let task_busy = Arc::new(AtomicBool::new(false));
+    let replay_guard = Arc::new(Mutex::new(fleet_runner::NonceReplayGuard::default()));
+    enqueue_initial_agent_session_messages(&outbound_sender, config, &correlation_id, options)?;
+
+    let mut last_heartbeat = Instant::now();
+    let mut last_facts = Instant::now();
+    let mut last_metrics = Instant::now();
+    let mut last_log = if options.log_upload.enabled {
+        Instant::now()
+    } else {
+        Instant::now() - options.log_upload.interval
+    };
+
+    loop {
+        flush_agent_outbound_queue(&mut socket, &outbound_receiver)?;
+
+        match read_agent_session_message(&mut socket)? {
+            AgentSessionInbound::Message(message) => handle_agent_session_message(
+                *message,
+                config,
+                controller_signing_public_key(&identity),
+                &correlation_id,
+                &outbound_sender,
+                &task_busy,
+                &replay_guard,
+            )?,
+            AgentSessionInbound::Idle => {}
+            AgentSessionInbound::Closed => return Ok(AgentSessionEnd::ControllerClosed),
+        }
+
+        let now = Instant::now();
+        let actions = agent_session_tick_actions(
+            now.saturating_duration_since(last_heartbeat),
+            now.saturating_duration_since(last_facts),
+            now.saturating_duration_since(last_metrics),
+            now.saturating_duration_since(last_log),
+            options,
+        );
+        enqueue_agent_session_tick_messages(&outbound_sender, config, &correlation_id, actions)?;
+        if actions.heartbeat {
+            last_heartbeat = now;
+        }
+        if actions.facts {
+            last_facts = now;
+        }
+        if actions.metrics {
+            last_metrics = now;
+        }
+        if actions.log {
+            last_log = now;
+        }
+        flush_agent_outbound_queue(&mut socket, &outbound_receiver)?;
+    }
+}
+
+fn enqueue_agent_session_tick_messages(
+    outbound_sender: &AgentOutboundSender,
+    config: &LocalAgentConfig,
+    correlation_id: &str,
+    actions: AgentSessionTickActions,
+) -> Result<(), CliError> {
+    if actions.heartbeat {
+        enqueue_wire_message(
+            outbound_sender,
+            agent_heartbeat_message(config, correlation_id)?,
+        )?;
+    }
+    if actions.facts {
+        enqueue_wire_message(
+            outbound_sender,
+            agent_facts_snapshot_message(config, correlation_id)?,
+        )?;
+    }
+    if actions.metrics {
+        enqueue_wire_message(
+            outbound_sender,
+            agent_metrics_snapshot_message(config, correlation_id)?,
+        )?;
+    }
+    if actions.log {
+        enqueue_wire_message(
+            outbound_sender,
+            agent_log_chunk_message(config, correlation_id, &agent_operational_log_line(config))?,
+        )?;
+    }
+    Ok(())
+}
+
+fn perform_agent_session_handshake(
+    socket: &mut AgentWebSocket,
+    config: &LocalAgentConfig,
+    correlation_id: &str,
+) -> Result<(), CliError> {
+    send_wire_message_to_socket(
+        socket,
+        &fleet_protocol::WireMessage::new(
+            prefixed_ulid("msg")?,
+            correlation_id.to_owned(),
+            Some(config.agent_id.clone()),
+            epoch_millis() as u64,
+            fleet_protocol::WirePayload::AgentHello {
+                agent_id: config.agent_id.clone(),
+                fingerprint: config.fingerprint.clone(),
+            },
+        ),
+    )?;
+
+    let challenge = read_ws_message(socket)?;
+    let fleet_protocol::WirePayload::AuthChallenge { nonce } = challenge.payload else {
+        return Err(CliError::Http("expected auth challenge".to_owned()));
+    };
+
+    send_wire_message_to_socket(
+        socket,
+        &fleet_protocol::WireMessage::new(
+            prefixed_ulid("msg")?,
+            correlation_id.to_owned(),
+            Some(config.agent_id.clone()),
+            epoch_millis() as u64,
+            fleet_protocol::WirePayload::AuthResponse {
+                nonce: nonce.clone(),
+                signature: fleet_core::sign_challenge(&config.private_key, &nonce)?,
+            },
+        ),
+    )?;
+
+    let accepted = read_ws_message(socket)?;
+    if !matches!(accepted.payload, fleet_protocol::WirePayload::AuthAccepted) {
+        return Err(CliError::Http("expected auth accepted".to_owned()));
+    }
+    Ok(())
+}
+
+fn enqueue_initial_agent_session_messages(
+    outbound_sender: &AgentOutboundSender,
+    config: &LocalAgentConfig,
+    correlation_id: &str,
+    options: AgentHeartbeatOptions,
+) -> Result<(), CliError> {
+    enqueue_wire_message(
+        outbound_sender,
+        agent_heartbeat_message(config, correlation_id)?,
+    )?;
+    enqueue_wire_message(
+        outbound_sender,
+        agent_facts_snapshot_message(config, correlation_id)?,
+    )?;
+    enqueue_wire_message(
+        outbound_sender,
+        agent_metrics_snapshot_message(config, correlation_id)?,
+    )?;
+    if options.log_upload.enabled {
+        enqueue_wire_message(
+            outbound_sender,
+            agent_log_chunk_message(config, correlation_id, &agent_operational_log_line(config))?,
+        )?;
+    }
+    Ok(())
+}
+
+fn flush_agent_outbound_queue(
+    socket: &mut AgentWebSocket,
+    outbound_receiver: &AgentOutboundReceiver,
+) -> Result<(), CliError> {
+    loop {
+        match outbound_receiver.try_recv() {
+            Ok(message) => send_wire_message_to_socket(socket, &message)?,
+            Err(TryRecvError::Empty) => return Ok(()),
+            Err(TryRecvError::Disconnected) => {
+                return Err(CliError::Http(
+                    "agent session outbound queue disconnected".to_owned(),
+                ));
+            }
+        }
+    }
+}
+
+fn read_agent_session_message(
+    socket: &mut AgentWebSocket,
+) -> Result<AgentSessionInbound, CliError> {
+    match socket.read() {
+        Ok(message) if message.is_close() => Ok(AgentSessionInbound::Closed),
+        Ok(message) => {
+            let body = message
+                .to_text()
+                .map_err(|error| CliError::Http(error.to_string()))?;
+            let message = fleet_protocol::decode_message(body)
+                .map_err(|error| CliError::Http(error.to_string()))?;
+            Ok(AgentSessionInbound::Message(Box::new(message)))
+        }
+        Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => {
+            Ok(AgentSessionInbound::Closed)
+        }
+        Err(tungstenite::Error::Io(error))
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            Ok(AgentSessionInbound::Idle)
+        }
+        Err(error) => Err(CliError::Http(error.to_string())),
+    }
+}
+
+fn handle_agent_session_message(
+    message: fleet_protocol::WireMessage,
+    config: &LocalAgentConfig,
+    controller_public_key: &str,
+    correlation_id: &str,
+    outbound_sender: &AgentOutboundSender,
+    task_busy: &Arc<AtomicBool>,
+    replay_guard: &Arc<Mutex<fleet_runner::NonceReplayGuard>>,
+) -> Result<(), CliError> {
+    let fleet_protocol::WirePayload::TaskAssignment { envelope, task } = message.payload else {
+        return Ok(());
+    };
+    if task_busy.swap(true, Ordering::SeqCst) {
+        enqueue_wire_message(
+            outbound_sender,
+            agent_security_event_message(config, correlation_id, "task_rejected", "agent is busy")?,
+        )?;
+        return Ok(());
+    }
+
+    let worker_config = config.clone();
+    let worker_public_key = controller_public_key.to_owned();
+    let worker_correlation_id = correlation_id.to_owned();
+    let worker_sender = outbound_sender.clone();
+    let worker_busy = task_busy.clone();
+    let worker_replay_guard = replay_guard.clone();
+    thread::spawn(move || {
+        if let Err(error) = handle_task_assignment_with_queue(
+            &worker_sender,
+            &worker_config,
+            &worker_public_key,
+            &worker_correlation_id,
+            envelope,
+            task,
+            &worker_replay_guard,
+        ) {
+            let _ = enqueue_wire_message(
+                &worker_sender,
+                agent_security_event_message(
+                    &worker_config,
+                    &worker_correlation_id,
+                    "task_worker_failed",
+                    &error.to_string(),
+                )
+                .unwrap_or_else(|_| {
+                    fleet_protocol::WireMessage::new(
+                        "msg-task-worker-failed",
+                        worker_correlation_id.clone(),
+                        Some(worker_config.agent_id.clone()),
+                        epoch_millis() as u64,
+                        fleet_protocol::WirePayload::SecurityEvent {
+                            agent_id: worker_config.agent_id.clone(),
+                            action: "task_worker_failed".to_owned(),
+                            detail: "task worker failed".to_owned(),
+                        },
+                    )
+                }),
+            );
+        }
+        worker_busy.store(false, Ordering::SeqCst);
+    });
+    Ok(())
+}
+
+fn set_agent_socket_read_timeout(
+    socket: &mut AgentWebSocket,
+    timeout: Option<Duration>,
+) -> Result<(), CliError> {
+    match socket.get_mut() {
+        tungstenite::stream::MaybeTlsStream::Plain(stream) => stream.set_read_timeout(timeout)?,
+        tungstenite::stream::MaybeTlsStream::Rustls(stream) => {
+            stream.get_mut().set_read_timeout(timeout)?
+        }
+        #[allow(unreachable_patterns)]
+        _ => {}
+    }
+    Ok(())
+}
+
+fn send_wire_message_to_socket(
+    socket: &mut AgentWebSocket,
+    message: &fleet_protocol::WireMessage,
+) -> Result<(), CliError> {
+    socket
+        .send(Message::Text(
+            fleet_protocol::encode_message(message)
+                .map_err(|error| CliError::Http(error.to_string()))?,
+        ))
+        .map_err(|error| CliError::Http(error.to_string()))
+}
+
+fn enqueue_wire_message(
+    outbound_sender: &AgentOutboundSender,
+    message: fleet_protocol::WireMessage,
+) -> Result<(), CliError> {
+    outbound_sender
+        .try_send(message)
+        .map_err(|error| match error {
+            TrySendError::Full(_) => CliError::Http("agent outbound queue is full".to_owned()),
+            TrySendError::Disconnected(_) => {
+                CliError::Http("agent outbound queue disconnected".to_owned())
+            }
+        })
+}
+
+fn agent_heartbeat_message(
+    config: &LocalAgentConfig,
+    correlation_id: &str,
+) -> Result<fleet_protocol::WireMessage, CliError> {
+    Ok(fleet_protocol::WireMessage::new(
+        prefixed_ulid("msg")?,
+        correlation_id.to_owned(),
+        Some(config.agent_id.clone()),
+        epoch_millis() as u64,
+        fleet_protocol::WirePayload::Heartbeat {
+            agent_id: config.agent_id.clone(),
+            status: "online".to_owned(),
+        },
+    ))
+}
+
+fn agent_facts_snapshot_message(
+    config: &LocalAgentConfig,
+    correlation_id: &str,
+) -> Result<fleet_protocol::WireMessage, CliError> {
+    Ok(fleet_protocol::WireMessage::new(
+        prefixed_ulid("msg")?,
+        correlation_id.to_owned(),
+        Some(config.agent_id.clone()),
+        epoch_millis() as u64,
+        fleet_protocol::WirePayload::FactsSnapshot {
+            agent_id: config.agent_id.clone(),
+            body: collect_local_facts().to_string(),
+        },
+    ))
+}
+
+fn agent_metrics_snapshot_message(
+    config: &LocalAgentConfig,
+    correlation_id: &str,
+) -> Result<fleet_protocol::WireMessage, CliError> {
+    Ok(fleet_protocol::WireMessage::new(
+        prefixed_ulid("msg")?,
+        correlation_id.to_owned(),
+        Some(config.agent_id.clone()),
+        epoch_millis() as u64,
+        fleet_protocol::WirePayload::MetricsSnapshot {
+            agent_id: config.agent_id.clone(),
+            body: collect_local_metrics().to_string(),
+        },
+    ))
+}
+
+fn agent_log_chunk_message(
+    config: &LocalAgentConfig,
+    correlation_id: &str,
+    line: &str,
+) -> Result<fleet_protocol::WireMessage, CliError> {
+    Ok(fleet_protocol::WireMessage::new(
+        prefixed_ulid("msg")?,
+        correlation_id.to_owned(),
+        Some(config.agent_id.clone()),
+        epoch_millis() as u64,
+        fleet_protocol::WirePayload::LogChunk {
+            agent_id: config.agent_id.clone(),
+            line: redact_and_truncate_log_line(line),
+        },
+    ))
+}
+
+fn agent_security_event_message(
+    config: &LocalAgentConfig,
+    correlation_id: &str,
+    action: &str,
+    detail: &str,
+) -> Result<fleet_protocol::WireMessage, CliError> {
+    Ok(fleet_protocol::WireMessage::new(
+        prefixed_ulid("msg")?,
+        correlation_id.to_owned(),
+        Some(config.agent_id.clone()),
+        epoch_millis() as u64,
+        fleet_protocol::WirePayload::SecurityEvent {
+            agent_id: config.agent_id.clone(),
+            action: action.to_owned(),
+            detail: detail.to_owned(),
+        },
+    ))
 }
 
 fn send_agent_log_chunk(
@@ -2518,6 +3053,12 @@ fn collect_local_facts() -> serde_json::Value {
         .and_then(|body| linux_meminfo_kb(body, "MemTotal"));
     let memory_modules = collect_memory_module_inventory();
     let root_disk = collect_root_disk_usage();
+    let mount_body = read_optional_trimmed("/proc/mounts");
+    let mounts = mount_body.as_deref().map(parse_linux_mounts);
+    let root_mount = mounts
+        .as_ref()
+        .and_then(|mounts| mounts.iter().find(|mount| mount.mount_point == "/"));
+    let block_devices = collect_linux_block_devices(Path::new("/sys/block"));
     let mut degraded_signals = Vec::new();
     if memory_total_kb.is_none() {
         degraded_signals.push("memory_facts_unavailable");
@@ -2525,7 +3066,7 @@ fn collect_local_facts() -> serde_json::Value {
     if network_body.is_none() {
         degraded_signals.push("network_facts_unavailable");
     }
-    if root_disk.is_none() {
+    if root_disk.is_none() && mounts.is_none() && block_devices.is_none() {
         degraded_signals.push("disk_inventory_unavailable");
     }
 
@@ -2552,9 +3093,15 @@ fn collect_local_facts() -> serde_json::Value {
             "module_count_source": memory_modules.as_ref().map(|inventory| inventory.source),
         },
         "disk": {
-            "root_mount_known": read_optional_trimmed("/proc/mounts")
-                .map(|body| body.lines().any(|line| line.split_whitespace().nth(1) == Some("/")))
-                .unwrap_or(false),
+            "device_inventory_known": block_devices.is_some(),
+            "device_count": block_devices.as_ref().map(Vec::len),
+            "devices": block_devices.unwrap_or_default(),
+            "mount_inventory_known": mounts.is_some(),
+            "mount_count": mounts.as_ref().map(Vec::len),
+            "mounts": mounts.clone().unwrap_or_default(),
+            "root_mount_known": root_mount.is_some(),
+            "root_source": root_mount.map(|mount| mount.source.as_str()),
+            "root_fs_type": root_mount.map(|mount| mount.fs_type.as_str()),
             "root_capacity_known": root_disk.is_some(),
             "root_filesystem": root_disk.as_ref().map(|usage| usage.filesystem.as_str()),
             "root_total_kb": root_disk.as_ref().map(|usage| usage.total_kb),
@@ -2647,6 +3194,103 @@ fn parse_df_root_usage(body: &str) -> Option<DiskUsage> {
         available_kb: parts.get(3)?.parse().ok()?,
         used_percent: parts.get(4)?.trim_end_matches('%').parse().ok()?,
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct BlockDeviceFact {
+    name: String,
+    kind: String,
+    size_kb: Option<u64>,
+    removable: Option<bool>,
+    rotational: Option<bool>,
+}
+
+fn collect_linux_block_devices(path: &Path) -> Option<Vec<BlockDeviceFact>> {
+    let entries = fs::read_dir(path).ok()?;
+    let mut devices = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| linux_block_device_from_sysfs_entry(&entry.path()))
+        .collect::<Vec<_>>();
+    devices.sort_by(|left, right| left.name.cmp(&right.name));
+    Some(devices)
+}
+
+fn linux_block_device_from_sysfs_entry(path: &Path) -> Option<BlockDeviceFact> {
+    let name = path.file_name()?.to_string_lossy().to_string();
+    if is_ignored_linux_block_device(&name) {
+        return None;
+    }
+    Some(BlockDeviceFact {
+        kind: linux_block_device_kind(&name).to_owned(),
+        size_kb: read_optional_trimmed_path(&path.join("size"))
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(|sectors| sectors / 2),
+        removable: read_linux_bool_file(&path.join("removable")),
+        rotational: read_linux_bool_file(&path.join("queue").join("rotational")),
+        name,
+    })
+}
+
+fn is_ignored_linux_block_device(name: &str) -> bool {
+    name.starts_with("loop") || name.starts_with("ram") || name.starts_with("zram")
+}
+
+fn linux_block_device_kind(name: &str) -> &'static str {
+    if name.starts_with("nvme")
+        || name.starts_with("sd")
+        || name.starts_with("vd")
+        || name.starts_with("xvd")
+        || name.starts_with("hd")
+        || name.starts_with("mmcblk")
+    {
+        "disk"
+    } else {
+        "block"
+    }
+}
+
+fn read_linux_bool_file(path: &Path) -> Option<bool> {
+    read_optional_trimmed_path(path).and_then(|value| match value.as_str() {
+        "0" => Some(false),
+        "1" => Some(true),
+        _ => None,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct MountFact {
+    source: String,
+    mount_point: String,
+    fs_type: String,
+    read_only: bool,
+}
+
+fn parse_linux_mounts(body: &str) -> Vec<MountFact> {
+    body.lines()
+        .filter_map(parse_linux_mount_line)
+        .collect::<Vec<_>>()
+}
+
+fn parse_linux_mount_line(line: &str) -> Option<MountFact> {
+    let mut parts = line.split_whitespace();
+    let source = decode_linux_mount_field(parts.next()?);
+    let mount_point = decode_linux_mount_field(parts.next()?);
+    let fs_type = decode_linux_mount_field(parts.next()?);
+    let options = parts.next().unwrap_or("");
+    Some(MountFact {
+        source,
+        mount_point,
+        fs_type,
+        read_only: options.split(',').any(|option| option == "ro"),
+    })
+}
+
+fn decode_linux_mount_field(value: &str) -> String {
+    value
+        .replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2817,6 +3461,10 @@ fn parse_systemd_failed_services(body: &str) -> Vec<String> {
 }
 
 fn read_optional_trimmed(path: &str) -> Option<String> {
+    read_optional_trimmed_path(Path::new(path))
+}
+
+fn read_optional_trimmed_path(path: &Path) -> Option<String> {
     fs::read_to_string(path)
         .ok()
         .map(|value| value.trim().to_owned())
@@ -2922,6 +3570,304 @@ fn read_and_handle_task_assignment(
             run_signed_runbook_task(socket, config, correlation_id, &envelope, task)?;
         }
     }
+    Ok(())
+}
+
+fn handle_task_assignment_with_queue(
+    outbound_sender: &AgentOutboundSender,
+    config: &LocalAgentConfig,
+    controller_public_key: &str,
+    correlation_id: &str,
+    envelope: fleet_protocol::SignedTaskEnvelopeWire,
+    task: fleet_protocol::TaskWire,
+    replay_guard: &Arc<Mutex<fleet_runner::NonceReplayGuard>>,
+) -> Result<(), CliError> {
+    let envelope = task_envelope_from_wire(envelope)?;
+    let verifier = ControllerSignatureVerifier {
+        controller_public_key,
+    };
+    let agent_id = fleet_domain::AgentId::new(config.agent_id.clone())
+        .map_err(|error| CliError::Http(error.to_string()))?;
+    let verification = {
+        let mut replay_guard = replay_guard
+            .lock()
+            .map_err(|_| CliError::Http("agent nonce replay guard lock poisoned".to_owned()))?;
+        fleet_runner::verify_signed_envelope_once(
+            &envelope,
+            &agent_id,
+            SystemTime::now(),
+            &verifier,
+            &mut replay_guard,
+        )
+    };
+    if let Err(error) = verification {
+        send_agent_security_event_queue(
+            outbound_sender,
+            config,
+            correlation_id,
+            "task_verification_failed",
+            &error.to_string(),
+        )?;
+        return Ok(());
+    }
+
+    match task {
+        fleet_protocol::TaskWire::Command(command) => {
+            run_signed_command_task_queue(
+                outbound_sender,
+                config,
+                correlation_id,
+                &envelope,
+                command,
+            )?;
+        }
+        fleet_protocol::TaskWire::DriftCheck(task) => {
+            run_signed_drift_check_task_queue(
+                outbound_sender,
+                config,
+                correlation_id,
+                &envelope,
+                task,
+            )?;
+        }
+        fleet_protocol::TaskWire::RunbookExecution(task) => {
+            run_signed_runbook_task_queue(
+                outbound_sender,
+                config,
+                correlation_id,
+                &envelope,
+                task,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn run_signed_command_task_queue(
+    outbound_sender: &AgentOutboundSender,
+    config: &LocalAgentConfig,
+    correlation_id: &str,
+    envelope: &fleet_domain::TaskEnvelope,
+    command: fleet_protocol::CommandTaskWire,
+) -> Result<(), CliError> {
+    let mut spec = fleet_runner::CommandSpec::new(
+        command.program,
+        command.args,
+        Duration::from_millis(command.timeout_ms),
+    );
+    spec.max_output_bytes = command.max_output_bytes;
+    let mut streamed_any = false;
+    let output = match fleet_runner::run_command_streaming(spec, |chunk| {
+        streamed_any = true;
+        send_agent_output_chunk_queue(outbound_sender, config, correlation_id, envelope, chunk)
+            .map_err(|error| fleet_runner::RunnerError::Stream(error.to_string()))
+    }) {
+        Ok(output) => output,
+        Err(error) => fleet_runner::CommandOutput {
+            stdout: String::new(),
+            stderr: error.to_string(),
+            exit_code: -1,
+            truncated: false,
+        },
+    };
+    if !streamed_any && output.exit_code != 0 && !output.stderr.is_empty() {
+        send_agent_output_chunk_queue(
+            outbound_sender,
+            config,
+            correlation_id,
+            envelope,
+            fleet_runner::CommandOutputChunk {
+                stream: fleet_runner::CommandOutputStream::Stderr,
+                sequence: 0,
+                data: output.stderr.clone(),
+            },
+        )?;
+    }
+    send_agent_task_result_queue(
+        outbound_sender,
+        config,
+        correlation_id,
+        envelope,
+        output.exit_code,
+    )?;
+    Ok(())
+}
+
+fn run_signed_drift_check_task_queue(
+    outbound_sender: &AgentOutboundSender,
+    config: &LocalAgentConfig,
+    correlation_id: &str,
+    envelope: &fleet_domain::TaskEnvelope,
+    task: fleet_protocol::DriftCheckTaskWire,
+) -> Result<(), CliError> {
+    let policy = match fleet_domain::parse_policy_document(&task.policy_document) {
+        Ok(policy) => policy,
+        Err(error) => {
+            send_agent_output_chunk_queue(
+                outbound_sender,
+                config,
+                correlation_id,
+                envelope,
+                fleet_runner::CommandOutputChunk {
+                    stream: fleet_runner::CommandOutputStream::Stderr,
+                    sequence: 0,
+                    data: format!("invalid drift policy: {error}"),
+                },
+            )?;
+            send_agent_task_result_queue(outbound_sender, config, correlation_id, envelope, -1)?;
+            return Ok(());
+        }
+    };
+    let report = fleet_runner::evaluate_policy_drift(&policy, &fleet_runner::LocalDriftProbe);
+    enqueue_wire_message(
+        outbound_sender,
+        fleet_protocol::WireMessage::new(
+            prefixed_ulid("msg")?,
+            correlation_id.to_owned(),
+            Some(config.agent_id.clone()),
+            epoch_millis() as u64,
+            fleet_protocol::WirePayload::DriftReport {
+                agent_id: config.agent_id.clone(),
+                status: drift_status_to_cli(&report.status).to_owned(),
+                expected: report.expected,
+                actual: report.actual,
+            },
+        ),
+    )?;
+    send_agent_task_result_queue(outbound_sender, config, correlation_id, envelope, 0)?;
+    Ok(())
+}
+
+fn run_signed_runbook_task_queue(
+    outbound_sender: &AgentOutboundSender,
+    config: &LocalAgentConfig,
+    correlation_id: &str,
+    envelope: &fleet_domain::TaskEnvelope,
+    task: fleet_protocol::RunbookExecutionTaskWire,
+) -> Result<(), CliError> {
+    let runbook = match fleet_domain::parse_runbook_document(&task.runbook_document) {
+        Ok(runbook) => runbook,
+        Err(error) => {
+            send_agent_output_chunk_queue(
+                outbound_sender,
+                config,
+                correlation_id,
+                envelope,
+                fleet_runner::CommandOutputChunk {
+                    stream: fleet_runner::CommandOutputStream::Stderr,
+                    sequence: 0,
+                    data: format!("invalid runbook: {error}"),
+                },
+            )?;
+            send_agent_task_result_queue(outbound_sender, config, correlation_id, envelope, -1)?;
+            return Ok(());
+        }
+    };
+    let Some(package_manager) = fleet_runner::detect_local_linux_package_manager() else {
+        send_agent_output_chunk_queue(
+            outbound_sender,
+            config,
+            correlation_id,
+            envelope,
+            fleet_runner::CommandOutputChunk {
+                stream: fleet_runner::CommandOutputStream::Stderr,
+                sequence: 0,
+                data: "no supported Linux package manager detected".to_owned(),
+            },
+        )?;
+        send_agent_task_result_queue(outbound_sender, config, correlation_id, envelope, -1)?;
+        return Ok(());
+    };
+    let plan = match fleet_runner::build_runbook_execution_plan(&runbook, package_manager) {
+        Ok(plan) => plan,
+        Err(error) => {
+            send_agent_output_chunk_queue(
+                outbound_sender,
+                config,
+                correlation_id,
+                envelope,
+                fleet_runner::CommandOutputChunk {
+                    stream: fleet_runner::CommandOutputStream::Stderr,
+                    sequence: 0,
+                    data: format!("invalid runbook primitive: {error}"),
+                },
+            )?;
+            send_agent_task_result_queue(outbound_sender, config, correlation_id, envelope, -1)?;
+            return Ok(());
+        }
+    };
+    let report = match fleet_runner::execute_runbook_execution_plan(
+        &plan,
+        fleet_runner::RunbookExecutionOptions {
+            confirmed_high_risk: task.confirmed_high_risk,
+            command_timeout: Duration::from_millis(task.timeout_ms),
+            ..fleet_runner::RunbookExecutionOptions::default()
+        },
+    ) {
+        Ok(report) => report,
+        Err(error) => {
+            send_agent_output_chunk_queue(
+                outbound_sender,
+                config,
+                correlation_id,
+                envelope,
+                fleet_runner::CommandOutputChunk {
+                    stream: fleet_runner::CommandOutputStream::Stderr,
+                    sequence: 0,
+                    data: error.to_string(),
+                },
+            )?;
+            send_agent_task_result_queue(outbound_sender, config, correlation_id, envelope, -1)?;
+            return Ok(());
+        }
+    };
+    let mut sequence = 0;
+    for outcome in report.outcomes {
+        send_agent_output_chunk_queue(
+            outbound_sender,
+            config,
+            correlation_id,
+            envelope,
+            fleet_runner::CommandOutputChunk {
+                stream: fleet_runner::CommandOutputStream::Stdout,
+                sequence,
+                data: format!(
+                    "runbook_step={} changed={:?} exit_code={:?} {}",
+                    outcome.id, outcome.changed, outcome.exit_code, outcome.audit_metadata
+                ),
+            },
+        )?;
+        sequence += 1;
+        if !outcome.stdout.is_empty() {
+            send_agent_output_chunk_queue(
+                outbound_sender,
+                config,
+                correlation_id,
+                envelope,
+                fleet_runner::CommandOutputChunk {
+                    stream: fleet_runner::CommandOutputStream::Stdout,
+                    sequence,
+                    data: outcome.stdout,
+                },
+            )?;
+            sequence += 1;
+        }
+        if !outcome.stderr.is_empty() {
+            send_agent_output_chunk_queue(
+                outbound_sender,
+                config,
+                correlation_id,
+                envelope,
+                fleet_runner::CommandOutputChunk {
+                    stream: fleet_runner::CommandOutputStream::Stderr,
+                    sequence,
+                    data: outcome.stderr,
+                },
+            )?;
+            sequence += 1;
+        }
+    }
+    send_agent_task_result_queue(outbound_sender, config, correlation_id, envelope, 0)?;
     Ok(())
 }
 
@@ -3178,6 +4124,29 @@ fn send_agent_task_result(
     Ok(())
 }
 
+fn send_agent_task_result_queue(
+    outbound_sender: &AgentOutboundSender,
+    config: &LocalAgentConfig,
+    correlation_id: &str,
+    envelope: &fleet_domain::TaskEnvelope,
+    exit_code: i32,
+) -> Result<(), CliError> {
+    enqueue_wire_message(
+        outbound_sender,
+        fleet_protocol::WireMessage::new(
+            prefixed_ulid("msg")?,
+            correlation_id.to_owned(),
+            Some(config.agent_id.clone()),
+            epoch_millis() as u64,
+            fleet_protocol::WirePayload::TaskResult {
+                job_id: envelope.job_id.as_str().to_owned(),
+                task_id: envelope.task_id.as_str().to_owned(),
+                exit_code,
+            },
+        ),
+    )
+}
+
 fn send_agent_output_chunk(
     socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
     config: &LocalAgentConfig,
@@ -3206,6 +4175,31 @@ fn send_agent_output_chunk(
         .map_err(|error| CliError::Http(error.to_string()))
 }
 
+fn send_agent_output_chunk_queue(
+    outbound_sender: &AgentOutboundSender,
+    config: &LocalAgentConfig,
+    correlation_id: &str,
+    envelope: &fleet_domain::TaskEnvelope,
+    chunk: fleet_runner::CommandOutputChunk,
+) -> Result<(), CliError> {
+    enqueue_wire_message(
+        outbound_sender,
+        fleet_protocol::WireMessage::new(
+            prefixed_ulid("msg")?,
+            correlation_id.to_owned(),
+            Some(config.agent_id.clone()),
+            epoch_millis() as u64,
+            fleet_protocol::WirePayload::OutputChunk {
+                job_id: envelope.job_id.as_str().to_owned(),
+                task_id: envelope.task_id.as_str().to_owned(),
+                stream: output_stream_to_wire(chunk.stream),
+                sequence: chunk.sequence,
+                data: chunk.data,
+            },
+        ),
+    )
+}
+
 fn send_agent_security_event(
     socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
     config: &LocalAgentConfig,
@@ -3231,6 +4225,19 @@ fn send_agent_security_event(
         ))
         .map_err(|error| CliError::Http(error.to_string()))?;
     Ok(())
+}
+
+fn send_agent_security_event_queue(
+    outbound_sender: &AgentOutboundSender,
+    config: &LocalAgentConfig,
+    correlation_id: &str,
+    action: &str,
+    detail: &str,
+) -> Result<(), CliError> {
+    enqueue_wire_message(
+        outbound_sender,
+        agent_security_event_message(config, correlation_id, action, detail)?,
+    )
 }
 
 struct ControllerSignatureVerifier<'a> {
@@ -3925,6 +4932,77 @@ mod tests {
     }
 
     #[test]
+    fn parses_linux_mounts_without_exposing_options() {
+        let body = "\
+/dev/sda1 / ext4 rw,relatime 0 0
+/dev/disk\\040with\\040space /mnt/space ext4 ro,nosuid 0 0
+server:/export /mnt/nfs nfs4 rw,vers=4.2 0 0
+";
+
+        let mounts = parse_linux_mounts(body);
+
+        assert_eq!(
+            mounts,
+            vec![
+                MountFact {
+                    source: "/dev/sda1".to_owned(),
+                    mount_point: "/".to_owned(),
+                    fs_type: "ext4".to_owned(),
+                    read_only: false,
+                },
+                MountFact {
+                    source: "/dev/disk with space".to_owned(),
+                    mount_point: "/mnt/space".to_owned(),
+                    fs_type: "ext4".to_owned(),
+                    read_only: true,
+                },
+                MountFact {
+                    source: "server:/export".to_owned(),
+                    mount_point: "/mnt/nfs".to_owned(),
+                    fs_type: "nfs4".to_owned(),
+                    read_only: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn collects_linux_block_device_inventory_from_sysfs_fixture() {
+        let dir = unique_test_dir("block-devices");
+        fs::create_dir_all(dir.join("sda").join("queue")).unwrap();
+        fs::write(dir.join("sda").join("size"), "2097152\n").unwrap();
+        fs::write(dir.join("sda").join("removable"), "0\n").unwrap();
+        fs::write(dir.join("sda").join("queue").join("rotational"), "1\n").unwrap();
+        fs::create_dir_all(dir.join("nvme0n1").join("queue")).unwrap();
+        fs::write(dir.join("nvme0n1").join("size"), "4194304\n").unwrap();
+        fs::write(dir.join("nvme0n1").join("removable"), "0\n").unwrap();
+        fs::write(dir.join("nvme0n1").join("queue").join("rotational"), "0\n").unwrap();
+        fs::create_dir_all(dir.join("loop0")).unwrap();
+
+        let devices = collect_linux_block_devices(&dir).unwrap();
+
+        assert_eq!(
+            devices,
+            vec![
+                BlockDeviceFact {
+                    name: "nvme0n1".to_owned(),
+                    kind: "disk".to_owned(),
+                    size_kb: Some(2_097_152),
+                    removable: Some(false),
+                    rotational: Some(false),
+                },
+                BlockDeviceFact {
+                    name: "sda".to_owned(),
+                    kind: "disk".to_owned(),
+                    size_kb: Some(1_048_576),
+                    removable: Some(false),
+                    rotational: Some(true),
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn parses_systemd_failed_service_summary_fixture() {
         let body = "\
 UNIT LOAD ACTIVE SUB DESCRIPTION
@@ -3999,6 +5077,34 @@ postgresql.service loaded failed failed PostgreSQL database server
         assert!(
             disk.get("root_capacity_known").is_some(),
             "facts must expose whether root disk capacity is known",
+        );
+        assert!(
+            disk.get("device_inventory_known").is_some(),
+            "facts must expose whether disk device inventory is known",
+        );
+        assert!(
+            disk.get("device_count").is_some(),
+            "facts must include disk device count",
+        );
+        assert!(
+            disk.get("devices")
+                .and_then(serde_json::Value::as_array)
+                .is_some(),
+            "facts must include disk device inventory",
+        );
+        assert!(
+            disk.get("mount_inventory_known").is_some(),
+            "facts must expose whether mount inventory is known",
+        );
+        assert!(
+            disk.get("mount_count").is_some(),
+            "facts must include mount count",
+        );
+        assert!(
+            disk.get("mounts")
+                .and_then(serde_json::Value::as_array)
+                .is_some(),
+            "facts must include mount layout",
         );
         assert!(
             disk.get("root_total_kb").is_some(),
@@ -4156,15 +5262,23 @@ postgresql.service loaded failed failed PostgreSQL database server
         let help = start.render_long_help().to_string();
 
         for expected in [
-            "Start the enrolled local agent heartbeat and task loop",
+            "Start the enrolled local agent persistent session loop",
             "agent/agent.conf",
+            "pinned controller fingerprint",
+            "heartbeat liveness ticks",
+            "static facts inventory",
+            "metrics snapshots",
+            "Heartbeat is only a liveness signal",
             "controller-signed tasks",
+            "one outbound writer queue",
             "product-safe agent operational logs",
             "Connection failures are retried indefinitely by default",
             "The agent must be enrolled before this command can run",
             "Examples:",
             "Local development flow:",
             "--heartbeat-interval-seconds",
+            "--facts-interval-seconds",
+            "--metrics-interval-seconds",
             "--disable-log-upload",
             "--log-upload-interval-seconds",
             "0 means retry indefinitely",
@@ -4181,6 +5295,10 @@ postgresql.service loaded failed failed PostgreSQL database server
             "start",
             "--data-dir",
             ".sponzey",
+            "--facts-interval-seconds",
+            "600",
+            "--metrics-interval-seconds",
+            "15",
             "--disable-log-upload",
             "--log-upload-interval-seconds",
             "45",
@@ -4191,6 +5309,8 @@ postgresql.service loaded failed failed PostgreSQL database server
             cli.command,
             Command::Agent(AgentCommand {
                 command: AgentSubcommand::Start {
+                    facts_interval_seconds: 600,
+                    metrics_interval_seconds: 15,
                     disable_log_upload: true,
                     log_upload_interval_seconds: 45,
                     ..
@@ -4536,6 +5656,8 @@ postgresql.service loaded failed failed PostgreSQL database server
             AgentHeartbeatOptions {
                 once: true,
                 heartbeat_interval: Duration::from_secs(30),
+                facts_interval: Duration::from_secs(300),
+                metrics_interval: Duration::from_secs(30),
                 log_upload: AgentLogUploadOptions {
                     enabled: true,
                     interval: Duration::from_secs(30),
@@ -4561,6 +5683,8 @@ postgresql.service loaded failed failed PostgreSQL database server
             AgentHeartbeatOptions {
                 once: true,
                 heartbeat_interval: Duration::from_secs(30),
+                facts_interval: Duration::from_secs(300),
+                metrics_interval: Duration::from_secs(30),
                 log_upload: AgentLogUploadOptions {
                     enabled: false,
                     interval: Duration::from_secs(30),
@@ -4587,6 +5711,8 @@ postgresql.service loaded failed failed PostgreSQL database server
             AgentHeartbeatOptions {
                 once: false,
                 heartbeat_interval: Duration::from_secs(30),
+                facts_interval: Duration::from_secs(300),
+                metrics_interval: Duration::from_secs(30),
                 log_upload: AgentLogUploadOptions {
                     enabled: true,
                     interval: Duration::from_secs(30),
@@ -4606,6 +5732,42 @@ postgresql.service loaded failed failed PostgreSQL database server
     }
 
     #[test]
+    fn agent_heartbeat_loop_current_lifecycle_sleeps_between_successful_heartbeats() {
+        let mut attempts = 0;
+        let mut sleeps = Vec::new();
+
+        let result = run_agent_heartbeat_loop_with(
+            AgentHeartbeatOptions {
+                once: false,
+                heartbeat_interval: Duration::from_secs(30),
+                facts_interval: Duration::from_secs(300),
+                metrics_interval: Duration::from_secs(30),
+                log_upload: AgentLogUploadOptions {
+                    enabled: true,
+                    interval: Duration::from_secs(30),
+                },
+                max_reconnect_attempts: 1,
+            },
+            |_| {
+                attempts += 1;
+                if attempts == 1 {
+                    Ok(())
+                } else {
+                    Err(CliError::Http(format!("connection refused #{attempts}")))
+                }
+            },
+            |duration| sleeps.push(duration),
+        );
+
+        assert!(matches!(result, Err(CliError::Http(_))));
+        assert_eq!(attempts, 3);
+        assert_eq!(
+            sleeps,
+            vec![Duration::from_secs(30), Duration::from_secs(2)]
+        );
+    }
+
+    #[test]
     fn agent_heartbeat_loop_once_exits_on_first_failure() {
         let mut attempts = 0;
 
@@ -4613,6 +5775,8 @@ postgresql.service loaded failed failed PostgreSQL database server
             AgentHeartbeatOptions {
                 once: true,
                 heartbeat_interval: Duration::from_secs(30),
+                facts_interval: Duration::from_secs(300),
+                metrics_interval: Duration::from_secs(30),
                 log_upload: AgentLogUploadOptions {
                     enabled: true,
                     interval: Duration::from_secs(30),
@@ -4628,6 +5792,403 @@ postgresql.service loaded failed failed PostgreSQL database server
 
         assert!(matches!(result, Err(CliError::Http(_))));
         assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn agent_session_loop_retries_connection_failures_until_configured_cap() {
+        let mut attempts = 0;
+        let mut sleeps = Vec::new();
+
+        let result = run_agent_session_loop_with(
+            AgentHeartbeatOptions {
+                once: false,
+                heartbeat_interval: Duration::from_secs(30),
+                facts_interval: Duration::from_secs(300),
+                metrics_interval: Duration::from_secs(30),
+                log_upload: AgentLogUploadOptions {
+                    enabled: true,
+                    interval: Duration::from_secs(30),
+                },
+                max_reconnect_attempts: 2,
+            },
+            || {
+                attempts += 1;
+                Err(CliError::Http(format!("connection refused #{attempts}")))
+            },
+            |duration| sleeps.push(duration),
+        );
+
+        assert!(matches!(result, Err(CliError::Http(_))));
+        assert_eq!(attempts, 3);
+        assert_eq!(sleeps, vec![Duration::from_secs(2), Duration::from_secs(4)]);
+    }
+
+    #[test]
+    fn agent_session_loop_reconnects_after_controller_close() {
+        let mut attempts = 0;
+        let mut sleeps = Vec::new();
+
+        let result = run_agent_session_loop_with(
+            AgentHeartbeatOptions {
+                once: false,
+                heartbeat_interval: Duration::from_secs(30),
+                facts_interval: Duration::from_secs(300),
+                metrics_interval: Duration::from_secs(30),
+                log_upload: AgentLogUploadOptions {
+                    enabled: true,
+                    interval: Duration::from_secs(30),
+                },
+                max_reconnect_attempts: 1,
+            },
+            || {
+                attempts += 1;
+                if attempts == 1 {
+                    Ok(AgentSessionEnd::ControllerClosed)
+                } else {
+                    Err(CliError::Http(format!("connection refused #{attempts}")))
+                }
+            },
+            |duration| sleeps.push(duration),
+        );
+
+        assert!(matches!(result, Err(CliError::Http(_))));
+        assert_eq!(attempts, 3);
+        assert_eq!(
+            sleeps,
+            vec![Duration::from_secs(30), Duration::from_secs(2)]
+        );
+    }
+
+    #[test]
+    fn agent_session_loop_once_exits_after_controller_close() {
+        let mut attempts = 0;
+
+        let result = run_agent_session_loop_with(
+            AgentHeartbeatOptions {
+                once: true,
+                heartbeat_interval: Duration::from_secs(30),
+                facts_interval: Duration::from_secs(300),
+                metrics_interval: Duration::from_secs(30),
+                log_upload: AgentLogUploadOptions {
+                    enabled: true,
+                    interval: Duration::from_secs(30),
+                },
+                max_reconnect_attempts: 0,
+            },
+            || {
+                attempts += 1;
+                Ok(AgentSessionEnd::ControllerClosed)
+            },
+            |_| panic!("once mode must not sleep after controller close"),
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn agent_session_loop_treats_fingerprint_mismatch_as_fatal() {
+        let mut attempts = 0;
+
+        let result = run_agent_session_loop_with(
+            AgentHeartbeatOptions {
+                once: false,
+                heartbeat_interval: Duration::from_secs(30),
+                facts_interval: Duration::from_secs(300),
+                metrics_interval: Duration::from_secs(30),
+                log_upload: AgentLogUploadOptions {
+                    enabled: true,
+                    interval: Duration::from_secs(30),
+                },
+                max_reconnect_attempts: 0,
+            },
+            || {
+                attempts += 1;
+                Err(CliError::Http(
+                    "controller signing fingerprint changed from a to b; re-enroll the agent"
+                        .to_owned(),
+                ))
+            },
+            |_| panic!("fatal fingerprint mismatch must not sleep or retry"),
+        );
+
+        assert!(matches!(result, Err(CliError::Http(_))));
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn agent_session_heartbeat_interval_controls_liveness_ticks() {
+        let options = AgentHeartbeatOptions {
+            once: false,
+            heartbeat_interval: Duration::from_secs(30),
+            facts_interval: Duration::from_secs(300),
+            metrics_interval: Duration::from_secs(30),
+            log_upload: AgentLogUploadOptions {
+                enabled: true,
+                interval: Duration::from_secs(45),
+            },
+            max_reconnect_attempts: 0,
+        };
+
+        assert_eq!(
+            agent_session_tick_actions(
+                Duration::from_secs(29),
+                Duration::from_secs(29),
+                Duration::from_secs(29),
+                Duration::from_secs(44),
+                options,
+            ),
+            AgentSessionTickActions::default()
+        );
+        assert_eq!(
+            agent_session_tick_actions(
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+                Duration::from_secs(44),
+                options,
+            ),
+            AgentSessionTickActions {
+                heartbeat: true,
+                facts: false,
+                metrics: true,
+                log: false,
+            }
+        );
+    }
+
+    #[test]
+    fn agent_session_facts_do_not_send_on_every_heartbeat() {
+        let options = AgentHeartbeatOptions {
+            once: false,
+            heartbeat_interval: Duration::from_secs(30),
+            facts_interval: Duration::from_secs(300),
+            metrics_interval: Duration::from_secs(30),
+            log_upload: AgentLogUploadOptions {
+                enabled: true,
+                interval: Duration::from_secs(30),
+            },
+            max_reconnect_attempts: 0,
+        };
+
+        assert_eq!(
+            agent_session_tick_actions(
+                Duration::from_secs(30),
+                Duration::from_secs(299),
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+                options,
+            ),
+            AgentSessionTickActions {
+                heartbeat: true,
+                facts: false,
+                metrics: true,
+                log: true,
+            }
+        );
+        assert_eq!(
+            agent_session_tick_actions(
+                Duration::from_secs(30),
+                Duration::from_secs(300),
+                Duration::from_secs(29),
+                Duration::from_secs(29),
+                options,
+            ),
+            AgentSessionTickActions {
+                heartbeat: true,
+                facts: true,
+                metrics: false,
+                log: false,
+            }
+        );
+    }
+
+    #[test]
+    fn agent_session_metrics_respect_configured_interval() {
+        let options = AgentHeartbeatOptions {
+            once: false,
+            heartbeat_interval: Duration::from_secs(10),
+            facts_interval: Duration::from_secs(300),
+            metrics_interval: Duration::from_secs(45),
+            log_upload: AgentLogUploadOptions {
+                enabled: true,
+                interval: Duration::from_secs(30),
+            },
+            max_reconnect_attempts: 0,
+        };
+
+        assert_eq!(
+            agent_session_tick_actions(
+                Duration::from_secs(10),
+                Duration::from_secs(299),
+                Duration::from_secs(44),
+                Duration::from_secs(30),
+                options,
+            ),
+            AgentSessionTickActions {
+                heartbeat: true,
+                facts: false,
+                metrics: false,
+                log: true,
+            }
+        );
+        assert_eq!(
+            agent_session_tick_actions(
+                Duration::from_secs(9),
+                Duration::from_secs(299),
+                Duration::from_secs(45),
+                Duration::from_secs(29),
+                options,
+            ),
+            AgentSessionTickActions {
+                heartbeat: false,
+                facts: false,
+                metrics: true,
+                log: false,
+            }
+        );
+    }
+
+    #[test]
+    fn agent_session_outbound_queue_full_is_bounded() {
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        let config = test_agent_config();
+
+        enqueue_wire_message(
+            &sender,
+            agent_heartbeat_message(&config, "corr-test").unwrap(),
+        )
+        .unwrap();
+        let result = enqueue_wire_message(
+            &sender,
+            agent_metrics_snapshot_message(&config, "corr-test").unwrap(),
+        );
+
+        assert!(
+            matches!(result, Err(CliError::Http(message)) if message.contains("queue is full"))
+        );
+    }
+
+    #[test]
+    fn agent_session_busy_task_rejects_new_assignment() {
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let config = test_agent_config();
+        let task_busy = Arc::new(AtomicBool::new(true));
+        let replay_guard = Arc::new(Mutex::new(fleet_runner::NonceReplayGuard::default()));
+
+        handle_agent_session_message(
+            test_task_assignment_message(&config.agent_id),
+            &config,
+            "controller-public-key",
+            "corr-test",
+            &sender,
+            &task_busy,
+            &replay_guard,
+        )
+        .unwrap();
+
+        let event = receiver.try_recv().expect("busy reject event");
+        let fleet_protocol::WirePayload::SecurityEvent {
+            agent_id,
+            action,
+            detail,
+        } = event.payload
+        else {
+            panic!("expected security event");
+        };
+        assert_eq!(agent_id, config.agent_id);
+        assert_eq!(action, "task_rejected");
+        assert_eq!(detail, "agent is busy");
+        assert!(task_busy.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn agent_session_due_telemetry_does_not_precede_inbound_task_handling() {
+        let (sender, receiver) = mpsc::sync_channel(8);
+        let config = test_agent_config();
+        let task_busy = Arc::new(AtomicBool::new(true));
+        let replay_guard = Arc::new(Mutex::new(fleet_runner::NonceReplayGuard::default()));
+
+        handle_agent_session_message(
+            test_task_assignment_message(&config.agent_id),
+            &config,
+            "controller-public-key",
+            "corr-test",
+            &sender,
+            &task_busy,
+            &replay_guard,
+        )
+        .unwrap();
+        enqueue_agent_session_tick_messages(
+            &sender,
+            &config,
+            "corr-test",
+            AgentSessionTickActions {
+                heartbeat: true,
+                facts: true,
+                metrics: true,
+                log: true,
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            receiver.try_recv().unwrap().payload,
+            fleet_protocol::WirePayload::SecurityEvent { ref action, .. } if action == "task_rejected"
+        ));
+        assert!(matches!(
+            receiver.try_recv().unwrap().payload,
+            fleet_protocol::WirePayload::Heartbeat { .. }
+        ));
+        assert!(matches!(
+            receiver.try_recv().unwrap().payload,
+            fleet_protocol::WirePayload::FactsSnapshot { .. }
+        ));
+        assert!(matches!(
+            receiver.try_recv().unwrap().payload,
+            fleet_protocol::WirePayload::MetricsSnapshot { .. }
+        ));
+        assert!(matches!(
+            receiver.try_recv().unwrap().payload,
+            fleet_protocol::WirePayload::LogChunk { ref line, .. }
+                if line.contains("agent_heartbeat_completed")
+        ));
+    }
+
+    #[test]
+    fn agent_session_task_worker_output_uses_outbound_queue() {
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let config = test_agent_config();
+        let envelope = test_task_envelope(&config.agent_id);
+
+        send_agent_output_chunk_queue(
+            &sender,
+            &config,
+            "corr-test",
+            &envelope,
+            fleet_runner::CommandOutputChunk {
+                stream: fleet_runner::CommandOutputStream::Stdout,
+                sequence: 7,
+                data: "hello".to_owned(),
+            },
+        )
+        .unwrap();
+        send_agent_task_result_queue(&sender, &config, "corr-test", &envelope, 0).unwrap();
+        send_agent_security_event_queue(&sender, &config, "corr-test", "task_checked", "ok")
+            .unwrap();
+
+        assert!(matches!(
+            receiver.try_recv().unwrap().payload,
+            fleet_protocol::WirePayload::OutputChunk { sequence: 7, .. }
+        ));
+        assert!(matches!(
+            receiver.try_recv().unwrap().payload,
+            fleet_protocol::WirePayload::TaskResult { exit_code: 0, .. }
+        ));
+        assert!(matches!(
+            receiver.try_recv().unwrap().payload,
+            fleet_protocol::WirePayload::SecurityEvent { ref action, .. } if action == "task_checked"
+        ));
     }
 
     #[test]
@@ -4759,5 +6320,56 @@ postgresql.service loaded failed failed PostgreSQL database server
             std::process::id(),
             epoch_millis()
         ))
+    }
+
+    fn test_agent_config() -> LocalAgentConfig {
+        LocalAgentConfig {
+            url: "http://127.0.0.1:7700".to_owned(),
+            tls_ca_cert: None,
+            agent_id: "agent-web-01".to_owned(),
+            fingerprint: "agent-fp-1".to_owned(),
+            private_key: "private-key-1".to_owned(),
+            controller_fingerprint: "controller-fp-1".to_owned(),
+        }
+    }
+
+    fn test_task_envelope(agent_id: &str) -> fleet_domain::TaskEnvelope {
+        fleet_domain::TaskEnvelope {
+            job_id: fleet_domain::JobId::new("job-queue").unwrap(),
+            task_id: fleet_domain::TaskId::new("task-queue").unwrap(),
+            target_agent_id: fleet_domain::AgentId::new(agent_id).unwrap(),
+            issued_at: UNIX_EPOCH + Duration::from_millis(1),
+            expires_at: fleet_domain::TaskExpiry::new(UNIX_EPOCH + Duration::from_secs(60)),
+            nonce: fleet_domain::TaskNonce::new("nonce-queue").unwrap(),
+            payload_hash: "hash-queue".to_owned(),
+            signature: Some(fleet_domain::TaskSignature::new("signature-queue").unwrap()),
+        }
+    }
+
+    fn test_task_assignment_message(agent_id: &str) -> fleet_protocol::WireMessage {
+        fleet_protocol::WireMessage::new(
+            "msg-task-test",
+            "corr-test",
+            Some(agent_id.to_owned()),
+            1,
+            fleet_protocol::WirePayload::TaskAssignment {
+                envelope: fleet_protocol::SignedTaskEnvelopeWire {
+                    job_id: "job-test".to_owned(),
+                    task_id: "task-test".to_owned(),
+                    target_agent_id: agent_id.to_owned(),
+                    issued_at_ms: 1,
+                    expires_at_ms: 60_000,
+                    nonce: "nonce-test".to_owned(),
+                    payload_hash: "hash-test".to_owned(),
+                    signature: "signature-test".to_owned(),
+                },
+                task: fleet_protocol::TaskWire::Command(fleet_protocol::CommandTaskWire {
+                    program: "uptime".to_owned(),
+                    args: Vec::new(),
+                    timeout_ms: 30_000,
+                    max_output_bytes: 1024,
+                }),
+            },
+        )
     }
 }

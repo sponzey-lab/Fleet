@@ -31,8 +31,17 @@ if rg -n '/api/.*/config|runtime_config|set_config|patch_config|std::env::set_va
   fail "runtime configuration mutation endpoints are not allowed"
 fi
 
-rg -n 'rejects_non_loopback_insecure_controller_url|insecure_mode_rejects_remote_host' crates >/dev/null \
-  || fail "non-loopback insecure transport rejection tests are missing"
+rg -n 'parses_http_controller_url_for_remote_agent_with_warning_policy' crates/fleet-cli >/dev/null \
+  || fail "remote HTTP agent warning-policy test is missing"
+
+rg -n 'controller_allows_remote_http_external_url' crates/fleet-controller >/dev/null \
+  || fail "remote HTTP controller warning-policy test is missing"
+
+rg -n 'controller_marks_plain_http_listener_without_external_url' crates/fleet-controller >/dev/null \
+  || fail "plain HTTP listener warning-policy test is missing"
+
+rg -n 'insecure_http_transport_start_is_audited' crates/fleet-controller >/dev/null \
+  || fail "insecure HTTP security audit test is missing"
 
 rg -n 'rejects_unsigned_envelope|invalid_signature_is_rejected|expired_task_is_rejected|replayed_nonce_is_rejected|target_mismatch_is_rejected' crates >/dev/null \
   || fail "signed task envelope rejection tests are missing"

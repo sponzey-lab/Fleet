@@ -2,21 +2,24 @@ use fleet_application::{
     AdminTokenRepository, AgentIdentityRecord as AppAgentIdentityRecord, AgentIdentityRepository,
     AgentRepository, ApprovalDecisionRecord as AppApprovalDecisionRecord, ApprovalRepository,
     AuditRepository, AuditWriter, CommandJobRepository, ControllerIdentityMetadata,
-    ControllerIdentityRepository, DriftCheckJobRepository,
+    ControllerIdentityRepository, DispatchAssignmentRepository, DriftCheckJobRepository,
     DriftReportPageRecord as AppDriftReportPageRecord, DriftReportRecord as AppDriftReportRecord,
     DriftRepository, EnrollmentTokenRecord as AppEnrollmentTokenRecord, EnrollmentTokenRepository,
     FactsRepository, FactsSnapshotPageRecord as AppFactsSnapshotPageRecord,
     FactsSnapshotRecord as AppFactsSnapshotRecord, JobOutputChunk, JobOutputRepository,
     JobOutputStream, JobQueryRepository, JobRepository, JobSummaryRecord as AppJobSummaryRecord,
-    MetricsRepository, MetricsSnapshotPageRecord as AppMetricsSnapshotPageRecord,
-    MetricsSnapshotRecord as AppMetricsSnapshotRecord, RunbookJobRepository, SnapshotPageCursor,
+    JobTargetSummaryRecord as AppJobTargetSummaryRecord, MetricsRepository,
+    MetricsSnapshotPageRecord as AppMetricsSnapshotPageRecord,
+    MetricsSnapshotRecord as AppMetricsSnapshotRecord,
+    PendingTaskAssignment as AppPendingTaskAssignment, RunbookJobRepository, SnapshotPageCursor,
     TaskAssignmentRepository,
 };
 use fleet_domain::{
     Agent, AgentError, AgentFingerprint, AgentId, AgentIdentity, AgentLabel, AgentName,
     AgentPublicKey, AgentStatus, AuditActor, AuditCategory, AuditEvent, AuditTarget, AuditValue,
     CommandTask, ControllerPublicKey, DriftCheckTask, DriftReport, DriftStatus, Job, JobId,
-    JobStatus, RunbookExecutionTask, TaskEnvelope, TaskExpiry, TaskId, TaskNonce, TaskSignature,
+    JobStatus, RunbookExecutionTask, TaskEnvelope, TaskExpiry, TaskId, TaskKind, TaskNonce,
+    TaskSignature,
 };
 use rusqlite::{Connection, ErrorCode, OptionalExtension, params};
 use std::collections::BTreeMap;
@@ -130,7 +133,15 @@ pub struct JobSummaryRecord {
     pub command_program: Option<String>,
     pub command_args: Vec<String>,
     pub target_count: usize,
+    pub target_agents: Vec<JobTargetSummaryRecord>,
     pub created_at: SystemTime,
+    pub expires_at: Option<SystemTime>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobTargetSummaryRecord {
+    pub agent_id: String,
+    pub status: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1162,6 +1173,124 @@ impl SqliteStore {
             .collect()
     }
 
+    pub fn list_pending_dispatch_assignments(
+        &self,
+        agent_id: Option<&AgentId>,
+        job_id: Option<&JobId>,
+        limit: usize,
+    ) -> Result<Vec<AppPendingTaskAssignment>, StoreError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let agent_id = agent_id.map(AgentId::as_str);
+        let job_id = job_id.map(JobId::as_str);
+        let limit = limit.min(100) as i64;
+        let mut statement = self.connection.prepare(
+            "SELECT
+                ta.job_id, ta.id, ta.agent_id, ta.nonce, ta.payload_hash,
+                ta.signature, ta.issued_at, ta.expires_at,
+                j.command_program, j.command_args_json, j.drift_policy_document,
+                j.runbook_document, j.timeout_ms
+             FROM task_assignments ta
+             JOIN jobs j ON j.id = ta.job_id
+             WHERE j.status = 'queued'
+               AND (?1 IS NULL OR ta.agent_id = ?1)
+               AND (?2 IS NULL OR ta.job_id = ?2)
+               AND (
+                    j.command_program IS NOT NULL
+                 OR j.drift_policy_document IS NOT NULL
+                 OR j.runbook_document IS NOT NULL
+               )
+             ORDER BY ta.created_at, ta.id
+             LIMIT ?3",
+        )?;
+        let rows = statement
+            .query_map(params![agent_id, job_id, limit], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, Option<String>>(11)?,
+                    row.get::<_, i64>(12)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        rows.into_iter()
+            .map(
+                |(
+                    job_id,
+                    task_id,
+                    target_agent_id,
+                    nonce,
+                    payload_hash,
+                    signature,
+                    issued_at,
+                    expires_at,
+                    command_program,
+                    command_args_json,
+                    drift_policy_document,
+                    runbook_document,
+                    timeout_ms,
+                )| {
+                    let envelope = TaskEnvelope {
+                        job_id: JobId::new(job_id)
+                            .map_err(|error| StoreError::Domain(error.to_string()))?,
+                        task_id: TaskId::new(task_id)
+                            .map_err(|error| StoreError::Domain(error.to_string()))?,
+                        target_agent_id: AgentId::new(target_agent_id)
+                            .map_err(|error| StoreError::Domain(error.to_string()))?,
+                        issued_at: unix_secs_to_system_time(issued_at),
+                        expires_at: TaskExpiry::new(unix_secs_to_system_time(expires_at)),
+                        nonce: TaskNonce::new(nonce)
+                            .map_err(|error| StoreError::Domain(error.to_string()))?,
+                        payload_hash,
+                        signature: Some(
+                            TaskSignature::new(signature)
+                                .map_err(|error| StoreError::Domain(error.to_string()))?,
+                        ),
+                    };
+                    let timeout = Duration::from_millis(timeout_ms as u64);
+                    let task = if let Some(program) = command_program {
+                        TaskKind::Command(
+                            CommandTask::new(
+                                program,
+                                parse_command_args(&command_args_json)?,
+                                timeout,
+                            )
+                            .map_err(|error| StoreError::Domain(error.to_string()))?,
+                        )
+                    } else if let Some(policy_document) = drift_policy_document {
+                        TaskKind::DriftCheck(
+                            DriftCheckTask::new(policy_document, timeout)
+                                .map_err(|error| StoreError::Domain(error.to_string()))?,
+                        )
+                    } else if let Some(runbook_document) = runbook_document {
+                        TaskKind::RunbookExecution(
+                            RunbookExecutionTask::new(runbook_document, timeout)
+                                .map_err(|error| StoreError::Domain(error.to_string()))?,
+                        )
+                    } else {
+                        return Err(StoreError::Domain(
+                            "pending assignment has no task payload".to_owned(),
+                        ));
+                    };
+
+                    Ok(AppPendingTaskAssignment { envelope, task })
+                },
+            )
+            .collect()
+    }
+
     pub fn update_job_status(&self, job_id: &str, status: JobStatus) -> Result<bool, StoreError> {
         let changed = self.connection.execute(
             "UPDATE jobs SET status = ?2 WHERE id = ?1",
@@ -1182,6 +1311,21 @@ impl SqliteStore {
     }
 
     pub fn list_job_summaries(&self, limit: usize) -> Result<Vec<JobSummaryRecord>, StoreError> {
+        self.list_job_summaries_filtered(None, limit)
+    }
+
+    pub fn find_job_summary(&self, job_id: &str) -> Result<Option<JobSummaryRecord>, StoreError> {
+        Ok(self
+            .list_job_summaries_filtered(Some(job_id), 1)?
+            .into_iter()
+            .next())
+    }
+
+    fn list_job_summaries_filtered(
+        &self,
+        job_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<JobSummaryRecord>, StoreError> {
         let limit = limit.min(100) as i64;
         let mut statement = self.connection.prepare(
             "SELECT
@@ -1191,15 +1335,19 @@ impl SqliteStore {
                 j.command_program,
                 j.command_args_json,
                 j.created_at,
-                COUNT(ta.id) AS target_count
+                COUNT(ta.id) AS target_count,
+                COALESCE(GROUP_CONCAT(ta.agent_id || char(30) || COALESCE(a.status, 'unknown'), char(31)), '') AS target_agents,
+                MAX(ta.expires_at) AS expires_at
              FROM jobs j
              LEFT JOIN task_assignments ta ON ta.job_id = j.id
+             LEFT JOIN agents a ON a.id = ta.agent_id
+             WHERE (?1 IS NULL OR j.id = ?1)
              GROUP BY j.id
              ORDER BY j.created_at DESC, j.id DESC
-             LIMIT ?1",
+             LIMIT ?2",
         )?;
         let rows = statement
-            .query_map(params![limit], |row| {
+            .query_map(params![job_id, limit], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -1208,6 +1356,8 @@ impl SqliteStore {
                     row.get::<_, String>(4)?,
                     row.get::<_, i64>(5)?,
                     row.get::<_, i64>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, Option<i64>>(8)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -1221,6 +1371,8 @@ impl SqliteStore {
                     command_args_json,
                     created_at,
                     target_count,
+                    target_agents,
+                    expires_at,
                 )| {
                     Ok(JobSummaryRecord {
                         id,
@@ -1229,7 +1381,9 @@ impl SqliteStore {
                         command_program,
                         command_args: parse_command_args(&command_args_json)?,
                         target_count: target_count.max(0) as usize,
+                        target_agents: parse_job_target_summaries(&target_agents),
                         created_at: unix_secs_to_system_time(created_at),
+                        expires_at: expires_at.map(unix_secs_to_system_time),
                     })
                 },
             )
@@ -1237,19 +1391,51 @@ impl SqliteStore {
     }
 
     pub fn append_job_output_chunk_record(&self, chunk: &JobOutputChunk) -> Result<(), StoreError> {
-        self.connection.execute(
+        let stream = output_stream_to_str(chunk.stream);
+        let result = self.connection.execute(
             "INSERT INTO job_output_chunks (
                 job_id, agent_id, stream, chunk_index, body
              ) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 chunk.job_id.as_str(),
                 chunk.agent_id.as_str(),
-                output_stream_to_str(chunk.stream),
+                stream,
                 chunk.sequence as i64,
                 chunk.body.as_str(),
             ],
-        )?;
-        Ok(())
+        );
+
+        match result {
+            Ok(_) => Ok(()),
+            Err(rusqlite::Error::SqliteFailure(error, Some(message)))
+                if error.code == ErrorCode::ConstraintViolation =>
+            {
+                let existing_body = self
+                    .connection
+                    .query_row(
+                        "SELECT body
+                         FROM job_output_chunks
+                         WHERE job_id = ?1
+                           AND agent_id = ?2
+                           AND stream = ?3
+                           AND chunk_index = ?4",
+                        params![
+                            chunk.job_id.as_str(),
+                            chunk.agent_id.as_str(),
+                            stream,
+                            chunk.sequence as i64,
+                        ],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                if existing_body.as_deref() == Some(chunk.body.as_str()) {
+                    Ok(())
+                } else {
+                    Err(StoreError::ConstraintViolation(message))
+                }
+            }
+            Err(error) => Err(StoreError::from(error)),
+        }
     }
 
     pub fn list_job_output_chunks(
@@ -1721,6 +1907,33 @@ impl TaskAssignmentRepository for SqliteStore {
     }
 }
 
+impl DispatchAssignmentRepository for SqliteStore {
+    type Error = StoreError;
+
+    fn list_pending_assignments(
+        &self,
+        agent_id: Option<&AgentId>,
+        job_id: Option<&JobId>,
+        limit: usize,
+    ) -> Result<Vec<AppPendingTaskAssignment>, Self::Error> {
+        self.list_pending_dispatch_assignments(agent_id, job_id, limit)
+    }
+
+    fn find_dispatch_agent(&self, agent_id: &AgentId) -> Result<Option<Agent>, Self::Error> {
+        self.find_agent_by_id(agent_id.as_str())
+    }
+
+    fn mark_job_running(&mut self, job_id: &JobId, _now: SystemTime) -> Result<(), Self::Error> {
+        self.update_job_status(job_id.as_str(), JobStatus::Running)?;
+        Ok(())
+    }
+
+    fn mark_job_expired(&mut self, job_id: &JobId, _now: SystemTime) -> Result<(), Self::Error> {
+        self.update_job_status(job_id.as_str(), JobStatus::Expired)?;
+        Ok(())
+    }
+}
+
 impl CommandJobRepository for SqliteStore {
     fn save_command_job(&mut self, job: Job, task: &CommandTask) -> Result<(), Self::Error> {
         self.save_command_job_record(&job, task)
@@ -1776,9 +1989,41 @@ impl JobQueryRepository for SqliteStore {
                 command_program: record.command_program,
                 command_args: record.command_args,
                 target_count: record.target_count,
+                target_agents: record
+                    .target_agents
+                    .into_iter()
+                    .map(|target| AppJobTargetSummaryRecord {
+                        agent_id: target.agent_id,
+                        status: target.status,
+                    })
+                    .collect(),
                 created_at: record.created_at,
+                expires_at: record.expires_at,
             })
             .collect())
+    }
+
+    fn find_job_summary(&self, job_id: &str) -> Result<Option<AppJobSummaryRecord>, Self::Error> {
+        Ok(
+            SqliteStore::find_job_summary(self, job_id)?.map(|record| AppJobSummaryRecord {
+                id: record.id,
+                status: record.status,
+                risk: record.risk,
+                command_program: record.command_program,
+                command_args: record.command_args,
+                target_count: record.target_count,
+                target_agents: record
+                    .target_agents
+                    .into_iter()
+                    .map(|target| AppJobTargetSummaryRecord {
+                        agent_id: target.agent_id,
+                        status: target.status,
+                    })
+                    .collect(),
+                created_at: record.created_at,
+                expires_at: record.expires_at,
+            }),
+        )
     }
 }
 
@@ -2082,6 +2327,25 @@ fn parse_command_args(value: &str) -> Result<Vec<String>, StoreError> {
     serde_json::from_str(value).map_err(|error| StoreError::Domain(error.to_string()))
 }
 
+fn parse_job_target_summaries(value: &str) -> Vec<JobTargetSummaryRecord> {
+    if value.is_empty() {
+        return Vec::new();
+    }
+    value
+        .split('\u{1f}')
+        .filter_map(|item| {
+            let (agent_id, status) = item.split_once('\u{1e}')?;
+            if agent_id.is_empty() {
+                return None;
+            }
+            Some(JobTargetSummaryRecord {
+                agent_id: agent_id.to_owned(),
+                status: status.to_owned(),
+            })
+        })
+        .collect()
+}
+
 fn encode_labels(labels: &[AgentLabel]) -> String {
     labels
         .iter()
@@ -2287,12 +2551,16 @@ mod tests {
     use super::*;
 
     fn agent() -> Agent {
+        agent_with_id("a1", "web-01", "0123456789abcdef")
+    }
+
+    fn agent_with_id(id: &str, name: &str, fingerprint: &str) -> Agent {
         let mut agent = Agent::new(
-            AgentId::new("a1").unwrap(),
-            AgentName::new("web-01").unwrap(),
+            AgentId::new(id).unwrap(),
+            AgentName::new(name).unwrap(),
             AgentIdentity {
                 public_key: AgentPublicKey::new("pk").unwrap(),
-                fingerprint: AgentFingerprint::new("0123456789abcdef").unwrap(),
+                fingerprint: AgentFingerprint::new(fingerprint).unwrap(),
             },
         );
         agent.set_labels(vec![AgentLabel::new("role", "web").unwrap()]);
@@ -2930,6 +3198,123 @@ mod tests {
     }
 
     #[test]
+    fn pending_dispatch_assignments_are_fifo_across_task_types() {
+        let store = SqliteStore::in_memory().unwrap();
+        store.save_agent(agent()).unwrap();
+        let mut command_job = fleet_domain::Job::new(
+            fleet_domain::JobId::new("job-command").unwrap(),
+            fleet_domain::TaskRisk::High,
+            fleet_domain::ApprovalRequirement::AdminConfirmation,
+            Duration::from_secs(30),
+        );
+        command_job.queue(true).unwrap();
+        let command =
+            CommandTask::new("echo", vec!["hello".to_owned()], Duration::from_secs(30)).unwrap();
+        store
+            .save_command_job_record(&command_job, &command)
+            .unwrap();
+        store
+            .save_task_assignment_record(&task_envelope_for_job(
+                "job-command",
+                "a1",
+                "nonce-command",
+                "task-command",
+            ))
+            .unwrap();
+        let mut runbook_job = fleet_domain::Job::new(
+            fleet_domain::JobId::new("job-runbook").unwrap(),
+            fleet_domain::TaskRisk::High,
+            fleet_domain::ApprovalRequirement::AdminConfirmation,
+            Duration::from_secs(30),
+        );
+        runbook_job.queue(true).unwrap();
+        let runbook = RunbookExecutionTask::new("kind: Runbook", Duration::from_secs(30)).unwrap();
+        store
+            .save_runbook_job_record(&runbook_job, &runbook)
+            .unwrap();
+        store
+            .save_task_assignment_record(&task_envelope_for_job(
+                "job-runbook",
+                "a1",
+                "nonce-runbook-fifo",
+                "task-runbook-fifo",
+            ))
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE task_assignments
+                 SET created_at = CASE id
+                   WHEN 'task-runbook-fifo' THEN 1
+                   WHEN 'task-command' THEN 2
+                   ELSE created_at
+                 END",
+                [],
+            )
+            .unwrap();
+
+        let assignments = store
+            .list_pending_dispatch_assignments(Some(&AgentId::new("a1").unwrap()), None, 10)
+            .unwrap();
+
+        assert_eq!(assignments.len(), 2);
+        assert_eq!(
+            assignments[0].envelope.task_id.as_str(),
+            "task-runbook-fifo"
+        );
+        assert!(matches!(assignments[0].task, TaskKind::RunbookExecution(_)));
+        assert_eq!(assignments[1].envelope.task_id.as_str(), "task-command");
+        assert!(matches!(assignments[1].task, TaskKind::Command(_)));
+    }
+
+    #[test]
+    fn pending_dispatch_assignments_filter_by_agent_and_job() {
+        let store = SqliteStore::in_memory().unwrap();
+        store.save_agent(agent()).unwrap();
+        store
+            .save_agent(agent_with_id("a2", "web-02", "1123456789abcdef"))
+            .unwrap();
+        for (job_id, agent_id, nonce, task_id) in [
+            ("job-1", "a1", "nonce-1", "task-1"),
+            ("job-2", "a2", "nonce-2", "task-2"),
+        ] {
+            let mut job = fleet_domain::Job::new(
+                fleet_domain::JobId::new(job_id).unwrap(),
+                fleet_domain::TaskRisk::High,
+                fleet_domain::ApprovalRequirement::AdminConfirmation,
+                Duration::from_secs(30),
+            );
+            job.queue(true).unwrap();
+            let command = CommandTask::new("uptime", Vec::new(), Duration::from_secs(30)).unwrap();
+            store.save_command_job_record(&job, &command).unwrap();
+            store
+                .save_task_assignment_record(&task_envelope_for_job(
+                    job_id, agent_id, nonce, task_id,
+                ))
+                .unwrap();
+        }
+
+        let assignments = store
+            .list_pending_dispatch_assignments(
+                Some(&AgentId::new("a2").unwrap()),
+                Some(&fleet_domain::JobId::new("job-2").unwrap()),
+                10,
+            )
+            .unwrap();
+        let mismatched = store
+            .list_pending_dispatch_assignments(
+                Some(&AgentId::new("a2").unwrap()),
+                Some(&fleet_domain::JobId::new("job-1").unwrap()),
+                10,
+            )
+            .unwrap();
+
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].envelope.task_id.as_str(), "task-2");
+        assert!(mismatched.is_empty());
+    }
+
+    #[test]
     fn lists_recent_job_summaries() {
         let store = SqliteStore::in_memory().unwrap();
         store.save_agent(agent()).unwrap();
@@ -2995,7 +3380,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_output_chunk_is_constraint_violation() {
+    fn duplicate_job_output_chunks_with_same_body_are_idempotent() {
         let store = SqliteStore::in_memory().unwrap();
         store.save_agent(agent()).unwrap();
         store
@@ -3015,8 +3400,40 @@ mod tests {
         };
         store.append_job_output_chunk_record(&chunk).unwrap();
 
+        store.append_job_output_chunk_record(&chunk).unwrap();
+
+        let chunks = store.list_job_output_chunks("job-1", "a1").unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].body, "first");
+    }
+
+    #[test]
+    fn duplicate_job_output_chunks_with_different_body_are_constraint_violation() {
+        let store = SqliteStore::in_memory().unwrap();
+        store.save_agent(agent()).unwrap();
+        store
+            .save_job_record(&fleet_domain::Job::new(
+                fleet_domain::JobId::new("job-1").unwrap(),
+                fleet_domain::TaskRisk::Low,
+                fleet_domain::ApprovalRequirement::NotRequired,
+                Duration::from_secs(30),
+            ))
+            .unwrap();
+        let chunk = JobOutputChunk {
+            job_id: "job-1".to_owned(),
+            agent_id: "a1".to_owned(),
+            stream: JobOutputStream::Stdout,
+            sequence: 0,
+            body: "first".to_owned(),
+        };
+        store.append_job_output_chunk_record(&chunk).unwrap();
+        let conflicting = JobOutputChunk {
+            body: "changed".to_owned(),
+            ..chunk
+        };
+
         assert!(matches!(
-            store.append_job_output_chunk_record(&chunk),
+            store.append_job_output_chunk_record(&conflicting),
             Err(StoreError::ConstraintViolation(_))
         ));
     }
@@ -3048,10 +3465,19 @@ mod tests {
     }
 
     fn task_envelope(nonce: &str, task_id: &str) -> TaskEnvelope {
+        task_envelope_for_job("job-1", "a1", nonce, task_id)
+    }
+
+    fn task_envelope_for_job(
+        job_id: &str,
+        agent_id: &str,
+        nonce: &str,
+        task_id: &str,
+    ) -> TaskEnvelope {
         TaskEnvelope {
-            job_id: fleet_domain::JobId::new("job-1").unwrap(),
+            job_id: fleet_domain::JobId::new(job_id).unwrap(),
             task_id: fleet_domain::TaskId::new(task_id).unwrap(),
-            target_agent_id: AgentId::new("a1").unwrap(),
+            target_agent_id: AgentId::new(agent_id).unwrap(),
             issued_at: SystemTime::UNIX_EPOCH,
             expires_at: fleet_domain::TaskExpiry::new(
                 SystemTime::UNIX_EPOCH + Duration::from_secs(60),

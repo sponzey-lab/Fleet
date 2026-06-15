@@ -15,6 +15,7 @@ Sponzey Fleet는 agent 기반 실시간 서버 운영 자동화 플랫폼이다.
 - `sponzey agent ...` 역할
 - `sponzey` CLI 역할
 - WebSocket over TLS 기반 outbound agent 연결
+- Agent가 Controller에 유지하는 persistent outbound WebSocket session
 - SQLite/Postgres storage
 - 가벼운 Web Admin UI
 - npm 설치 UX는 유지하되, npm package는 Rust 바이너리 배포 wrapper로 사용
@@ -268,6 +269,7 @@ fleet-cli
 - Controller와 Agent 역할은 별도 실행 파일이 아니라 `sponzey controller ...`, `sponzey agent ...` subcommand로 선택한다.
 - `fleet-controller`와 `fleet-agent` crate는 library crate로 유지하고 독립 `main.rs`를 만들지 않는다.
 - npm wrapper, systemd unit, release artifact는 모두 resolved absolute path의 `sponzey` 바이너리를 참조한다.
+- Agent 실행 모델은 Controller로의 outbound persistent session을 기본으로 한다. Controller가 Agent로 직접 inbound 접속하는 구조를 기본 제품 경로로 만들지 않는다.
 
 금지:
 
@@ -784,6 +786,55 @@ Agent-controller protocol은 명시적 version을 가져야 한다.
 - unknown message는 reject 또는 ignore 정책을 명확히 둔다.
 - malformed payload는 audit 가능한 security event로 남긴다.
 - 재시도 가능한 오류와 치명 오류를 구분한다.
+
+### 9.3 Persistent Agent Session
+
+Sponzey Fleet의 원격 실행 경로는 Agent가 Controller에 outbound WebSocket session을 유지하는 구조를 기본으로 한다.
+
+목표:
+
+- Controller가 Agent로 직접 TCP 접속하지 않는다.
+- Agent가 Controller에 인증된 persistent session을 열어 둔다.
+- Controller는 이미 인증된 Agent session으로 task를 즉시 push한다.
+- heartbeat는 연결을 여는 주기가 아니라 session liveness signal이다.
+- facts, metrics, operational log 전송 주기는 task dispatch 즉시성과 분리한다.
+
+필수 규칙:
+
+- WebSocket task channel은 agent identity proof 이후에만 session registry에 등록한다.
+- active session registry는 runtime infrastructure state다. WebSocket handle이나 channel sender를 DB/domain object에 저장하지 않는다.
+- duplicate session은 명확한 정책을 가진다. 기본 방향은 new session wins이며, 기존 session close reason과 audit를 남긴다.
+- revoked/disabled agent의 active session은 revoke API 성공 직후 닫는다.
+- connected agent에 job을 dispatch할 때도 controller-signed task envelope, approval, expiry, nonce replay, target 검증을 우회하지 않는다.
+- DB에 job/assignment를 저장하기 전에 WebSocket으로 task를 먼저 보내지 않는다.
+- store lock을 잡은 상태에서 WebSocket read/write await를 수행하지 않는다.
+- socket writer는 session당 하나만 둔다. heartbeat, facts, metrics, log, output producer는 outbound queue로 message를 전달한다.
+- command/runbook 실행 중에도 heartbeat/liveness와 session read/write가 막히지 않아야 한다.
+- output chunk는 job output storage에 저장하고 Product application log에는 원문을 남기지 않는다.
+
+권장 구현 경계:
+
+```text
+Controller HTTP API
+  -> Application dispatch use case
+  -> Store repository
+  -> SessionRegistry/SessionDispatcher
+  -> WebSocket writer loop
+
+Agent session
+  -> read loop
+  -> single writer queue
+  -> heartbeat/facts/metrics/log ticks
+  -> task worker
+```
+
+거부해야 하는 패턴:
+
+- heartbeat 주기마다 연결을 열고 닫는 구조를 제품 기본 경로로 유지하는 것
+- 즉시성을 이유로 Controller가 Agent로 inbound 접속하는 구조
+- 여러 thread/task가 같은 WebSocket writer에 직접 쓰는 구조
+- active session이 있다는 이유로 high-risk approval을 생략하는 구조
+- UI가 agent connected/running 상태를 자체 추정하는 구조
 
 ## 10. Web Admin UI 규칙
 

@@ -1,8 +1,8 @@
 use fleet_domain::{
     Agent, AgentError, AgentId, AgentLabel, AgentStatus, AuditActor, AuditCategory, AuditEvent,
     AuditTarget, AuditValue, CommandTask, DriftCheckTask, DriftReport, Job, JobError, JobId,
-    JobTarget, RunbookExecutionTask, Selector, TaskEnvelope, TaskExpiry, TaskId, TaskNonce,
-    TaskSignature,
+    JobTarget, RunbookExecutionTask, Selector, TaskEnvelope, TaskExpiry, TaskId, TaskKind,
+    TaskNonce, TaskSignature,
 };
 use std::fmt::{Display, Formatter};
 use std::time::{Duration, SystemTime};
@@ -202,13 +202,22 @@ pub struct JobSummaryRecord {
     pub command_program: Option<String>,
     pub command_args: Vec<String>,
     pub target_count: usize,
+    pub target_agents: Vec<JobTargetSummaryRecord>,
     pub created_at: SystemTime,
+    pub expires_at: Option<SystemTime>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobTargetSummaryRecord {
+    pub agent_id: String,
+    pub status: String,
 }
 
 pub trait JobQueryRepository {
     type Error;
 
     fn list_job_summaries(&self, limit: usize) -> Result<Vec<JobSummaryRecord>, Self::Error>;
+    fn find_job_summary(&self, job_id: &str) -> Result<Option<JobSummaryRecord>, Self::Error>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -983,6 +992,184 @@ pub fn select_dispatch_targets(agents: &[Agent], selector: &Selector) -> Dispatc
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingTaskAssignment {
+    pub envelope: TaskEnvelope,
+    pub task: TaskKind,
+}
+
+pub trait DispatchAssignmentRepository {
+    type Error;
+
+    fn list_pending_assignments(
+        &self,
+        agent_id: Option<&AgentId>,
+        job_id: Option<&JobId>,
+        limit: usize,
+    ) -> Result<Vec<PendingTaskAssignment>, Self::Error>;
+    fn find_dispatch_agent(&self, agent_id: &AgentId) -> Result<Option<Agent>, Self::Error>;
+    fn mark_job_running(&mut self, job_id: &JobId, now: SystemTime) -> Result<(), Self::Error>;
+    fn mark_job_expired(&mut self, job_id: &JobId, now: SystemTime) -> Result<(), Self::Error>;
+}
+
+pub trait PendingAssignmentDispatcher {
+    type Error;
+
+    fn has_active_session(&self, agent_id: &AgentId) -> bool;
+    fn dispatch(&mut self, assignment: &PendingTaskAssignment) -> Result<(), Self::Error>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchPendingAssignmentsInput {
+    pub agent_id: Option<AgentId>,
+    pub job_id: Option<JobId>,
+    pub now: SystemTime,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DispatchPendingAssignmentsOutput {
+    pub dispatched_count: usize,
+    pub queued_count: usize,
+    pub skipped_expired_count: usize,
+    pub skipped_disabled_count: usize,
+    pub failed_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DispatchPendingAssignmentsError<RepoError, AuditError> {
+    Repository(RepoError),
+    Audit(AuditError),
+}
+
+impl<RepoError, AuditError> Display for DispatchPendingAssignmentsError<RepoError, AuditError>
+where
+    RepoError: Display,
+    AuditError: Display,
+{
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Repository(error) => write!(formatter, "repository error: {error}"),
+            Self::Audit(error) => write!(formatter, "audit error: {error}"),
+        }
+    }
+}
+
+pub struct DispatchPendingAssignments;
+
+impl DispatchPendingAssignments {
+    pub fn execute<R, D, A>(
+        repo: &mut R,
+        dispatcher: &mut D,
+        audit: &mut A,
+        input: DispatchPendingAssignmentsInput,
+    ) -> Result<DispatchPendingAssignmentsOutput, DispatchPendingAssignmentsError<R::Error, A::Error>>
+    where
+        R: DispatchAssignmentRepository,
+        D: PendingAssignmentDispatcher,
+        D::Error: Display,
+        A: AuditWriter,
+    {
+        let assignments = repo
+            .list_pending_assignments(input.agent_id.as_ref(), input.job_id.as_ref(), input.limit)
+            .map_err(DispatchPendingAssignmentsError::Repository)?;
+        let mut output = DispatchPendingAssignmentsOutput::default();
+
+        for assignment in assignments {
+            if assignment.envelope.expires_at.is_expired_at(input.now) {
+                repo.mark_job_expired(&assignment.envelope.job_id, input.now)
+                    .map_err(DispatchPendingAssignmentsError::Repository)?;
+                output.skipped_expired_count += 1;
+                continue;
+            }
+
+            let Some(agent) = repo
+                .find_dispatch_agent(&assignment.envelope.target_agent_id)
+                .map_err(DispatchPendingAssignmentsError::Repository)?
+            else {
+                output.skipped_disabled_count += 1;
+                continue;
+            };
+
+            if agent.status() == AgentStatus::Disabled {
+                output.skipped_disabled_count += 1;
+                continue;
+            }
+
+            if !dispatcher.has_active_session(&assignment.envelope.target_agent_id) {
+                output.queued_count += 1;
+                continue;
+            }
+
+            match dispatcher.dispatch(&assignment) {
+                Ok(()) => {
+                    repo.mark_job_running(&assignment.envelope.job_id, input.now)
+                        .map_err(DispatchPendingAssignmentsError::Repository)?;
+                    let dispatch_latency_ms = input
+                        .now
+                        .duration_since(assignment.envelope.issued_at)
+                        .unwrap_or_default()
+                        .as_millis();
+                    audit
+                        .write(dispatch_audit_event(
+                            "task_dispatched",
+                            &assignment,
+                            AuditValue::Plain(format!(
+                                "agent_id={},task_id={},dispatch_state=delivered,dispatch_latency_ms={},active_session=true",
+                                assignment.envelope.target_agent_id.as_str(),
+                                assignment.envelope.task_id.as_str(),
+                                dispatch_latency_ms
+                            )),
+                            input.now,
+                        ))
+                        .map_err(DispatchPendingAssignmentsError::Audit)?;
+                    output.dispatched_count += 1;
+                }
+                Err(error) => {
+                    let dispatch_latency_ms = input
+                        .now
+                        .duration_since(assignment.envelope.issued_at)
+                        .unwrap_or_default()
+                        .as_millis();
+                    audit
+                        .write(dispatch_audit_event(
+                            "task_dispatch_failed",
+                            &assignment,
+                            AuditValue::Plain(format!(
+                                "agent_id={},task_id={},dispatch_state=queued,dispatch_latency_ms={},active_session=true,failure_reason={}",
+                                assignment.envelope.target_agent_id.as_str(),
+                                assignment.envelope.task_id.as_str(),
+                                dispatch_latency_ms,
+                                error
+                            )),
+                            input.now,
+                        ))
+                        .map_err(DispatchPendingAssignmentsError::Audit)?;
+                    output.failed_count += 1;
+                }
+            }
+        }
+
+        Ok(output)
+    }
+}
+
+fn dispatch_audit_event(
+    action: &str,
+    assignment: &PendingTaskAssignment,
+    value: AuditValue,
+    occurred_at: SystemTime,
+) -> AuditEvent {
+    AuditEvent {
+        category: AuditCategory::Job,
+        action: action.to_owned(),
+        actor: AuditActor::new("controller"),
+        target: AuditTarget::new(assignment.envelope.job_id.as_str().to_owned()),
+        value,
+        occurred_at,
+    }
+}
+
 pub struct EnrollAgentInput {
     pub agent: Agent,
 }
@@ -1203,6 +1390,17 @@ impl ListJobSummaries {
     }
 }
 
+pub struct GetJobSummary;
+
+impl GetJobSummary {
+    pub fn execute<R>(repo: &R, job_id: &str) -> Result<Option<JobSummaryRecord>, R::Error>
+    where
+        R: JobQueryRepository,
+    {
+        repo.find_job_summary(job_id)
+    }
+}
+
 pub struct ListJobOutputForJob;
 
 impl ListJobOutputForJob {
@@ -1385,6 +1583,236 @@ mod tests {
 
         assert_eq!(selected.targets.len(), 1);
         assert_eq!(selected.targets[0].id().as_str(), "web-01");
+    }
+
+    #[test]
+    fn dispatch_pending_assignments_sends_connected_agent_and_marks_running() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let mut repo = FakeDispatchAssignmentRepository {
+            agents: vec![agent("web-01", "web")],
+            assignments: vec![pending_assignment(
+                "job-1",
+                "task-1",
+                "web-01",
+                now + Duration::from_secs(60),
+            )],
+            ..Default::default()
+        };
+        let mut dispatcher = FakePendingAssignmentDispatcher {
+            active_agent_ids: vec!["web-01".to_owned()],
+            ..Default::default()
+        };
+        let mut audit = FakeAuditWriter::default();
+
+        let output = DispatchPendingAssignments::execute(
+            &mut repo,
+            &mut dispatcher,
+            &mut audit,
+            DispatchPendingAssignmentsInput {
+                agent_id: Some(AgentId::new("web-01").unwrap()),
+                job_id: None,
+                now,
+                limit: 10,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            output,
+            DispatchPendingAssignmentsOutput {
+                dispatched_count: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(dispatcher.sent_task_ids, vec!["task-1"]);
+        assert_eq!(repo.running_jobs, vec!["job-1"]);
+        assert_eq!(audit.events[0].action, "task_dispatched");
+        assert!(matches!(
+            &audit.events[0].value,
+            AuditValue::Plain(value)
+                if value.contains("dispatch_state=delivered")
+                    && value.contains("dispatch_latency_ms=")
+                    && value.contains("active_session=true")
+        ));
+    }
+
+    #[test]
+    fn dispatch_pending_assignments_keeps_disconnected_agent_queued() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let mut repo = FakeDispatchAssignmentRepository {
+            agents: vec![agent("web-01", "web")],
+            assignments: vec![pending_assignment(
+                "job-1",
+                "task-1",
+                "web-01",
+                now + Duration::from_secs(60),
+            )],
+            ..Default::default()
+        };
+        let mut dispatcher = FakePendingAssignmentDispatcher::default();
+        let mut audit = FakeAuditWriter::default();
+
+        let output = DispatchPendingAssignments::execute(
+            &mut repo,
+            &mut dispatcher,
+            &mut audit,
+            DispatchPendingAssignmentsInput {
+                agent_id: Some(AgentId::new("web-01").unwrap()),
+                job_id: None,
+                now,
+                limit: 10,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            output,
+            DispatchPendingAssignmentsOutput {
+                queued_count: 1,
+                ..Default::default()
+            }
+        );
+        assert!(dispatcher.sent_task_ids.is_empty());
+        assert!(repo.running_jobs.is_empty());
+        assert!(audit.events.is_empty());
+    }
+
+    #[test]
+    fn dispatch_pending_assignments_skips_disabled_agents() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let mut disabled = agent("web-01", "web");
+        disabled.disable();
+        let mut repo = FakeDispatchAssignmentRepository {
+            agents: vec![disabled],
+            assignments: vec![pending_assignment(
+                "job-1",
+                "task-1",
+                "web-01",
+                now + Duration::from_secs(60),
+            )],
+            ..Default::default()
+        };
+        let mut dispatcher = FakePendingAssignmentDispatcher {
+            active_agent_ids: vec!["web-01".to_owned()],
+            ..Default::default()
+        };
+        let mut audit = FakeAuditWriter::default();
+
+        let output = DispatchPendingAssignments::execute(
+            &mut repo,
+            &mut dispatcher,
+            &mut audit,
+            DispatchPendingAssignmentsInput {
+                agent_id: Some(AgentId::new("web-01").unwrap()),
+                job_id: None,
+                now,
+                limit: 10,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            output,
+            DispatchPendingAssignmentsOutput {
+                skipped_disabled_count: 1,
+                ..Default::default()
+            }
+        );
+        assert!(dispatcher.sent_task_ids.is_empty());
+        assert!(repo.running_jobs.is_empty());
+    }
+
+    #[test]
+    fn dispatch_pending_assignments_skips_expired_assignments() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let mut repo = FakeDispatchAssignmentRepository {
+            agents: vec![agent("web-01", "web")],
+            assignments: vec![pending_assignment(
+                "job-1",
+                "task-1",
+                "web-01",
+                now - Duration::from_secs(1),
+            )],
+            ..Default::default()
+        };
+        let mut dispatcher = FakePendingAssignmentDispatcher {
+            active_agent_ids: vec!["web-01".to_owned()],
+            ..Default::default()
+        };
+        let mut audit = FakeAuditWriter::default();
+
+        let output = DispatchPendingAssignments::execute(
+            &mut repo,
+            &mut dispatcher,
+            &mut audit,
+            DispatchPendingAssignmentsInput {
+                agent_id: Some(AgentId::new("web-01").unwrap()),
+                job_id: None,
+                now,
+                limit: 10,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            output,
+            DispatchPendingAssignmentsOutput {
+                skipped_expired_count: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(repo.expired_jobs, vec!["job-1"]);
+        assert!(dispatcher.sent_task_ids.is_empty());
+    }
+
+    #[test]
+    fn dispatch_pending_assignments_keeps_queued_after_send_failure_and_audits() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        let mut repo = FakeDispatchAssignmentRepository {
+            agents: vec![agent("web-01", "web")],
+            assignments: vec![pending_assignment(
+                "job-1",
+                "task-1",
+                "web-01",
+                now + Duration::from_secs(60),
+            )],
+            ..Default::default()
+        };
+        let mut dispatcher = FakePendingAssignmentDispatcher {
+            active_agent_ids: vec!["web-01".to_owned()],
+            failed_task_ids: vec!["task-1".to_owned()],
+            ..Default::default()
+        };
+        let mut audit = FakeAuditWriter::default();
+
+        let output = DispatchPendingAssignments::execute(
+            &mut repo,
+            &mut dispatcher,
+            &mut audit,
+            DispatchPendingAssignmentsInput {
+                agent_id: Some(AgentId::new("web-01").unwrap()),
+                job_id: None,
+                now,
+                limit: 10,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            output,
+            DispatchPendingAssignmentsOutput {
+                failed_count: 1,
+                ..Default::default()
+            }
+        );
+        assert!(repo.running_jobs.is_empty());
+        assert_eq!(audit.events[0].action, "task_dispatch_failed");
+        assert!(matches!(
+            &audit.events[0].value,
+            AuditValue::Plain(value)
+                if value.contains("dispatch_state=queued")
+                    && value.contains("failure_reason=")
+        ));
     }
 
     #[test]
@@ -1786,7 +2214,12 @@ mod tests {
             command_program: Some("uptime".to_owned()),
             command_args: vec!["-a".to_owned()],
             target_count: 1,
+            target_agents: vec![JobTargetSummaryRecord {
+                agent_id: "agent-1".to_owned(),
+                status: "online".to_owned(),
+            }],
             created_at: SystemTime::UNIX_EPOCH,
+            expires_at: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(60)),
         });
         repo.output.push(JobOutputChunk {
             job_id: "job-1".to_owned(),
@@ -1971,6 +2404,115 @@ spec:
     }
 
     #[derive(Default)]
+    struct FakeDispatchAssignmentRepository {
+        agents: Vec<Agent>,
+        assignments: Vec<PendingTaskAssignment>,
+        running_jobs: Vec<String>,
+        expired_jobs: Vec<String>,
+    }
+
+    impl DispatchAssignmentRepository for FakeDispatchAssignmentRepository {
+        type Error = Infallible;
+
+        fn list_pending_assignments(
+            &self,
+            agent_id: Option<&AgentId>,
+            job_id: Option<&JobId>,
+            limit: usize,
+        ) -> Result<Vec<PendingTaskAssignment>, Self::Error> {
+            Ok(self
+                .assignments
+                .iter()
+                .filter(|assignment| {
+                    agent_id
+                        .map(|id| &assignment.envelope.target_agent_id == id)
+                        .unwrap_or(true)
+                        && job_id
+                            .map(|id| &assignment.envelope.job_id == id)
+                            .unwrap_or(true)
+                })
+                .take(limit)
+                .cloned()
+                .collect())
+        }
+
+        fn find_dispatch_agent(&self, agent_id: &AgentId) -> Result<Option<Agent>, Self::Error> {
+            Ok(self
+                .agents
+                .iter()
+                .find(|agent| agent.id() == agent_id)
+                .cloned())
+        }
+
+        fn mark_job_running(
+            &mut self,
+            job_id: &JobId,
+            _now: SystemTime,
+        ) -> Result<(), Self::Error> {
+            self.running_jobs.push(job_id.as_str().to_owned());
+            Ok(())
+        }
+
+        fn mark_job_expired(
+            &mut self,
+            job_id: &JobId,
+            _now: SystemTime,
+        ) -> Result<(), Self::Error> {
+            self.expired_jobs.push(job_id.as_str().to_owned());
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FakePendingAssignmentDispatcher {
+        active_agent_ids: Vec<String>,
+        failed_task_ids: Vec<String>,
+        sent_task_ids: Vec<String>,
+    }
+
+    impl PendingAssignmentDispatcher for FakePendingAssignmentDispatcher {
+        type Error = String;
+
+        fn has_active_session(&self, agent_id: &AgentId) -> bool {
+            self.active_agent_ids
+                .iter()
+                .any(|active_agent_id| active_agent_id == agent_id.as_str())
+        }
+
+        fn dispatch(&mut self, assignment: &PendingTaskAssignment) -> Result<(), Self::Error> {
+            let task_id = assignment.envelope.task_id.as_str().to_owned();
+            if self.failed_task_ids.iter().any(|id| id == &task_id) {
+                return Err("send failed".to_owned());
+            }
+            self.sent_task_ids.push(task_id);
+            Ok(())
+        }
+    }
+
+    fn pending_assignment(
+        job_id: &str,
+        task_id: &str,
+        agent_id: &str,
+        expires_at: SystemTime,
+    ) -> PendingTaskAssignment {
+        PendingTaskAssignment {
+            envelope: TaskEnvelope {
+                job_id: JobId::new(job_id).unwrap(),
+                task_id: TaskId::new(task_id).unwrap(),
+                target_agent_id: AgentId::new(agent_id).unwrap(),
+                issued_at: SystemTime::UNIX_EPOCH,
+                expires_at: TaskExpiry::new(expires_at),
+                nonce: TaskNonce::new(format!("{task_id}-nonce")).unwrap(),
+                payload_hash: "hash".to_owned(),
+                signature: Some(TaskSignature::new("sig").unwrap()),
+            },
+            task: TaskKind::Command(
+                CommandTask::new("uptime", Vec::new(), Duration::from_secs(30)).unwrap(),
+            ),
+        }
+    }
+
+    #[derive(Default)]
     struct FakeAgentInventoryRepository {
         agents: Vec<Agent>,
     }
@@ -2048,6 +2590,10 @@ spec:
 
         fn list_job_summaries(&self, limit: usize) -> Result<Vec<JobSummaryRecord>, Self::Error> {
             Ok(self.jobs.iter().take(limit).cloned().collect())
+        }
+
+        fn find_job_summary(&self, job_id: &str) -> Result<Option<JobSummaryRecord>, Self::Error> {
+            Ok(self.jobs.iter().find(|job| job.id == job_id).cloned())
         }
     }
 

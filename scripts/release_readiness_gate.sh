@@ -45,7 +45,7 @@ require_linux_root() {
 
 run cargo fmt --all --check
 run cargo test --workspace
-run cargo clippy --workspace --all-targets
+run cargo clippy --workspace --all-targets -- -D warnings
 run npm test --workspace @sponzey/fleet
 run npm test --workspace web-admin
 run npm run typecheck --workspace web-admin
@@ -53,6 +53,7 @@ run ./scripts/npm_local_pack_smoke.sh
 run ./scripts/npm_platform_local_install_smoke.sh
 run ./scripts/npm_demo_smoke.sh
 run ./scripts/smoke_mvp.sh
+run ./scripts/smoke_immediate_dispatch.sh
 run ./scripts/smoke_remote_tls_loopback.sh
 if [ -f target/release/sponzey ]; then
   run ./scripts/check_linux_glibc_baseline.sh target/release/sponzey

@@ -90,6 +90,9 @@ export function createApiClient({ fetchImpl = globalThis.fetch, tokenProvider = 
     listJobs() {
       return request("/api/jobs");
     },
+    getJob(jobId) {
+      return request(`/api/jobs/${encodePathValue(jobId)}`);
+    },
     getJobOutput(jobId) {
       return request(`/api/jobs/${encodePathValue(jobId)}/output`);
     },

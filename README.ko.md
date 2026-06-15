@@ -34,10 +34,10 @@ Controller 하나에 agent 여러 대가 붙습니다.
 
 Facts와 Metrics는 서로 다른 데이터입니다.
 
-| 데이터     | 뜻                                                                 |
-| ------- | ----------------------------------------------------------------- |
-| Facts   | 거의 변하지 않는 인벤토리입니다. OS, 아키텍처, hostname, CPU 코어 수, 메모리 총량/모듈 수, 디스크 총 용량, 네트워크 인터페이스 등을 담습니다. |
-| Metrics | 시간에 따라 변하는 사용량입니다. CPU 사용률, 메모리 사용량, 디스크 사용량, 프로세스 수, 실패한 서비스 수 등을 담습니다. |
+| 데이터     | 뜻                                                                                                             |
+| ------- | ------------------------------------------------------------------------------------------------------------- |
+| Facts   | 거의 변하지 않는 인벤토리입니다. OS, 아키텍처, hostname, CPU 코어 수, 메모리 총량/모듈 수, 디스크 장치 수, 마운트 구조, 디스크 총 용량, 네트워크 인터페이스 등을 담습니다. |
+| Metrics | 시간에 따라 변하는 사용량입니다. CPU 사용률, 메모리 사용량, 디스크 사용량, 프로세스 수, 실패한 서비스 수 등을 담습니다.                                      |
 
 ## 설치
 
@@ -227,6 +227,39 @@ agent 상태 이벤트이며, raw system log 파일을 자동 업로드하는 �
 아닙니다. 주기는 `--log-upload-interval-seconds <SECONDS>`로 바꾸고,
 업로드를 끄려면 `--disable-log-upload`을 사용합니다.
 
+heartbeat, facts, metrics, 운영 로그는 각각 다른 주기를 가집니다.
+heartbeat는 생존 신호일 뿐이며 task dispatch 주기를 제어하지 않습니다.
+정적 inventory facts는 기본 300초마다 `--facts-interval-seconds` 기준으로
+전송되고, 사용량 metrics는 기본 30초마다 `--metrics-interval-seconds`
+기준으로 전송됩니다. task assignment는 이 telemetry 주기와 별개로
+persistent session에서 push됩니다.
+
+## Run은 어떻게 동작하나
+
+Controller는 agent로 직접 접속하지 않습니다. Enrollment가 끝난 agent가
+controller로 outbound persistent WebSocket session을 하나 열어 유지합니다.
+
+Web Admin이나 `sponzey run`에서 명령을 실행하면 controller는 먼저 job과
+controller가 서명한 task assignment를 DB에 저장합니다. 대상 agent가 현재
+연결되어 있으면 controller는 이미 열린 session으로 task를 즉시 push합니다.
+Run 경로는 다음 heartbeat를 기다리지 않습니다. Heartbeat는 생존 신호일
+뿐입니다.
+
+대상 agent가 offline이면 job은 queued 상태로 남습니다. agent가 다시
+접속하고 인증되면 controller가 해당 agent의 pending assignment를 꺼내
+새 session으로 다음 task를 push합니다.
+
+Agent는 같은 session으로 `output_chunk` 여러 개와 `task_result` 하나를
+controller에 돌려보냅니다. Web Admin은 표시 fallback으로 job detail API와
+output API를 polling합니다. 이 방식으로 queued, delivered, running,
+completed, no-output 상태를 보여주면서도 raw command output을 product log에
+넣지 않습니다.
+
+Agent key를 revoke하면 agent가 disabled 상태가 되고, active session이
+있다면 `agent_revoked` reason으로 즉시 닫으며, 추가 task 전달을 막습니다.
+이미 agent가 시작한 local OS process를 즉시 kill한다는 보장은 아닙니다.
+그 기능은 별도 task cancellation protocol 범위입니다.
+
 ## HTTPS 준비
 
 제품, 고객, 운영, 공동 사용, 장시간 실행 환경에서는 이 준비가 필요합니다.
@@ -392,9 +425,12 @@ API 주소를 연 것입니다. `/admin`으로 열어야 합니다.
 ```bash
 cargo fmt --all --check
 cargo test --workspace
-cargo clippy --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
 npm test --workspace @sponzey/fleet
 npm test --workspace web-admin
+npm run typecheck --workspace web-admin
 npm run build --workspace web-admin
 ./scripts/smoke_mvp.sh
+./scripts/smoke_immediate_dispatch.sh
+./scripts/smoke_remote_tls_loopback.sh
 ```

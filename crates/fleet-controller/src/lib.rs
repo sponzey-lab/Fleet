@@ -13,31 +13,40 @@ use fleet_application::{
     AdminTokenRepository, AgentInventoryRepository, CommandJobRepository, CreateCommandJob,
     CreateCommandJobError, CreateCommandJobInput, CreateDriftCheckJob, CreateDriftCheckJobError,
     CreateDriftCheckJobInput, CreateEnrollmentToken, CreateEnrollmentTokenInput, CreateRunbookJob,
-    CreateRunbookJobError, CreateRunbookJobInput, DriftRepository, EnrollmentTokenRepository,
-    EnrollmentTokenUseCaseError, EnsureAdminToken, FactsRepository, GetInventoryAgent,
-    GetLatestDrift, GetLatestFacts, GetLatestMetrics, JobOutputChunk, JobOutputRepository,
-    JobOutputStream, JobQueryRepository, JobRepository, ListAuditEvents, ListDriftReports,
-    ListEnrollmentTokens, ListFactsSnapshots, ListInventoryAgents, ListJobOutputForJob,
-    ListJobSummaries, ListMetricsSnapshots, MetricsRepository, RevokeAgentKey, RevokeAgentKeyError,
-    RevokeAgentKeyInput, RevokeEnrollmentToken, RevokeEnrollmentTokenInput, RunbookJobRepository,
-    SnapshotPageCursor, TaskAssignmentRepository, TaskEnvelopeSigner, UpdateAgentLabels,
-    UpdateAgentLabelsError, UpdateAgentLabelsInput, VerifyAdminToken, select_dispatch_targets,
+    CreateRunbookJobError, CreateRunbookJobInput, DispatchAssignmentRepository,
+    DispatchPendingAssignments, DispatchPendingAssignmentsInput, DispatchPendingAssignmentsOutput,
+    DriftRepository, EnrollmentTokenRepository, EnrollmentTokenUseCaseError, EnsureAdminToken,
+    FactsRepository, GetInventoryAgent, GetJobSummary, GetLatestDrift, GetLatestFacts,
+    GetLatestMetrics, JobOutputChunk, JobOutputRepository, JobOutputStream, JobQueryRepository,
+    JobRepository, ListAuditEvents, ListDriftReports, ListEnrollmentTokens, ListFactsSnapshots,
+    ListInventoryAgents, ListJobOutputForJob, ListJobSummaries, ListMetricsSnapshots,
+    MetricsRepository, PendingAssignmentDispatcher, PendingTaskAssignment, RevokeAgentKey,
+    RevokeAgentKeyError, RevokeAgentKeyInput, RevokeEnrollmentToken, RevokeEnrollmentTokenInput,
+    RunbookJobRepository, SnapshotPageCursor, TaskAssignmentRepository, TaskEnvelopeSigner,
+    UpdateAgentLabels, UpdateAgentLabelsError, UpdateAgentLabelsInput, VerifyAdminToken,
+    select_dispatch_targets,
 };
 use fleet_domain::{
     Agent, AgentFingerprint, AgentId, AgentIdentity, AgentLabel, AgentName, AgentPublicKey,
     AgentStatus, AuditActor, AuditCategory, AuditEvent, AuditTarget, AuditValue,
-    ControllerPublicKey, DriftReport, DriftStatus, Job, JobStatus, Selector, TaskEnvelope,
+    ControllerPublicKey, DriftReport, DriftStatus, Job, JobId, JobStatus, Selector, TaskEnvelope,
 };
 use fleet_store::SqliteStore;
+use futures_util::{
+    SinkExt, StreamExt,
+    stream::{SplitSink, SplitStream},
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::io::BufReader;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc;
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -53,6 +62,9 @@ const ADMIN_API_SCHEMA_JSON: &str = include_str!("../../../web-admin/api.schema.
 const OPENAPI_JSON: &str = include_str!("../../../docs/openapi.json");
 const SWAGGER_UI_HTML: &str = include_str!("../../../docs/swagger-ui.html");
 const AGENT_OFFLINE_AFTER: Duration = Duration::from_secs(90);
+const AGENT_RECENTLY_SEEN_AFTER: Duration = Duration::from_secs(90);
+const HEARTBEAT_BOUND_IDLE_CLOSE_AFTER: Duration = Duration::from_millis(75);
+const AGENT_SESSION_OUTBOUND_QUEUE_CAPACITY: usize = 64;
 const AGENT_LOG_CHUNK_MAX_BYTES: usize = 4096;
 
 #[derive(Debug, Clone)]
@@ -71,12 +83,307 @@ struct ControllerAppState {
     store: Arc<Mutex<SqliteStore>>,
     identity: Arc<ControllerIdentity>,
     metadata: Arc<ControllerRuntimeMetadata>,
+    sessions: Arc<Mutex<AgentSessionRegistry>>,
 }
 
 #[derive(Debug, Clone, Default)]
 struct ControllerRuntimeMetadata {
     external_url: Option<String>,
     tls_enabled: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentSessionCloseReason {
+    NormalShutdown,
+    IdleTimeout,
+    HeartbeatTimeout,
+    HandlerEnded,
+    ReplacedByNewSession,
+    Revoked,
+    AuthFailed,
+    ProtocolError,
+    WriteFailure,
+    WriteQueueOverflow,
+    StoreError,
+}
+
+impl AgentSessionCloseReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NormalShutdown => "normal_shutdown",
+            Self::IdleTimeout => "idle_timeout",
+            Self::HeartbeatTimeout => "heartbeat_timeout",
+            Self::HandlerEnded => "handler_ended",
+            Self::ReplacedByNewSession => "replaced_by_new_session",
+            Self::Revoked => "agent_revoked",
+            Self::AuthFailed => "auth_failed",
+            Self::ProtocolError => "protocol_error",
+            Self::WriteFailure => "write_failure",
+            Self::WriteQueueOverflow => "write_queue_overflow",
+            Self::StoreError => "store_error",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentSessionOutboundMessage {
+    Wire(Box<fleet_protocol::WireMessage>),
+    Close { reason: AgentSessionCloseReason },
+}
+
+pub type AgentSessionOutboundSender = mpsc::Sender<AgentSessionOutboundMessage>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentSessionSendError {
+    NotConnected,
+    QueueFull,
+    Closed,
+}
+
+impl Display for AgentSessionSendError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotConnected => write!(formatter, "agent session is not connected"),
+            Self::QueueFull => write!(formatter, "agent session outbound queue is full"),
+            Self::Closed => write!(formatter, "agent session outbound queue is closed"),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct AgentSessionHandle {
+    agent_id: String,
+    connection_id: String,
+    connected_at: SystemTime,
+    last_seen_at: SystemTime,
+    capabilities: Vec<String>,
+    outbound_sender: AgentSessionOutboundSender,
+    queue_capacity: Option<usize>,
+}
+
+impl AgentSessionHandle {
+    pub fn new(
+        agent_id: impl Into<String>,
+        connection_id: impl Into<String>,
+        connected_at: SystemTime,
+        capabilities: Vec<String>,
+        outbound_sender: AgentSessionOutboundSender,
+        queue_capacity: Option<usize>,
+    ) -> Self {
+        Self {
+            agent_id: agent_id.into(),
+            connection_id: connection_id.into(),
+            connected_at,
+            last_seen_at: connected_at,
+            capabilities,
+            outbound_sender,
+            queue_capacity,
+        }
+    }
+
+    pub fn agent_id(&self) -> &str {
+        &self.agent_id
+    }
+
+    pub fn connection_id(&self) -> &str {
+        &self.connection_id
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSessionSummary {
+    pub agent_id: String,
+    pub connected: bool,
+    pub connection_id: String,
+    pub connected_at_ms: u64,
+    pub last_session_seen_at_ms: u64,
+    pub capabilities: Vec<String>,
+    pub queue_depth: usize,
+    pub queue_capacity: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSessionReplacement {
+    pub agent_id: String,
+    pub old_connection_id: String,
+    pub new_connection_id: String,
+    pub close_reason: AgentSessionCloseReason,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AgentSessionRegisterOutcome {
+    pub replaced: Option<AgentSessionReplacement>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSessionEnded {
+    pub agent_id: String,
+    pub connection_id: String,
+    pub close_reason: AgentSessionCloseReason,
+}
+
+#[derive(Default)]
+pub struct AgentSessionRegistry {
+    sessions: BTreeMap<String, AgentSessionHandle>,
+}
+
+impl AgentSessionRegistry {
+    pub fn register(&mut self, handle: AgentSessionHandle) -> AgentSessionRegisterOutcome {
+        let replaced = self
+            .sessions
+            .insert(handle.agent_id.clone(), handle.clone());
+        let replacement = replaced.map(|old| {
+            let _ = old
+                .outbound_sender
+                .try_send(AgentSessionOutboundMessage::Close {
+                    reason: AgentSessionCloseReason::ReplacedByNewSession,
+                });
+            AgentSessionReplacement {
+                agent_id: handle.agent_id.clone(),
+                old_connection_id: old.connection_id,
+                new_connection_id: handle.connection_id.clone(),
+                close_reason: AgentSessionCloseReason::ReplacedByNewSession,
+            }
+        });
+
+        AgentSessionRegisterOutcome {
+            replaced: replacement,
+        }
+    }
+
+    pub fn get(&self, agent_id: &str) -> Option<AgentSessionHandle> {
+        self.sessions.get(agent_id).cloned()
+    }
+
+    pub fn has_active_session(&self, agent_id: &str) -> bool {
+        self.sessions.contains_key(agent_id)
+    }
+
+    pub fn try_send(
+        &self,
+        agent_id: &str,
+        message: fleet_protocol::WireMessage,
+    ) -> Result<(), AgentSessionSendError> {
+        let Some(handle) = self.sessions.get(agent_id) else {
+            return Err(AgentSessionSendError::NotConnected);
+        };
+        handle
+            .outbound_sender
+            .try_send(AgentSessionOutboundMessage::Wire(Box::new(message)))
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => AgentSessionSendError::QueueFull,
+                mpsc::error::TrySendError::Closed(_) => AgentSessionSendError::Closed,
+            })
+    }
+
+    pub fn mark_seen(&mut self, agent_id: &str, connection_id: &str, seen_at: SystemTime) -> bool {
+        let Some(handle) = self.sessions.get_mut(agent_id) else {
+            return false;
+        };
+        if handle.connection_id != connection_id {
+            return false;
+        }
+        handle.last_seen_at = seen_at;
+        true
+    }
+
+    pub fn unregister(
+        &mut self,
+        agent_id: &str,
+        connection_id: &str,
+        close_reason: AgentSessionCloseReason,
+    ) -> Option<AgentSessionEnded> {
+        let should_remove = self
+            .sessions
+            .get(agent_id)
+            .map(|handle| handle.connection_id == connection_id)
+            .unwrap_or(false);
+        if !should_remove {
+            return None;
+        }
+        let removed = self.sessions.remove(agent_id)?;
+        Some(AgentSessionEnded {
+            agent_id: removed.agent_id,
+            connection_id: removed.connection_id,
+            close_reason,
+        })
+    }
+
+    pub fn close(
+        &mut self,
+        agent_id: &str,
+        close_reason: AgentSessionCloseReason,
+    ) -> Option<AgentSessionEnded> {
+        let removed = self.sessions.remove(agent_id)?;
+        let _ = removed
+            .outbound_sender
+            .try_send(AgentSessionOutboundMessage::Close {
+                reason: close_reason,
+            });
+        Some(AgentSessionEnded {
+            agent_id: removed.agent_id,
+            connection_id: removed.connection_id,
+            close_reason,
+        })
+    }
+
+    pub fn snapshot(&self) -> Vec<AgentSessionSummary> {
+        self.sessions
+            .values()
+            .map(AgentSessionSummary::from_handle)
+            .collect()
+    }
+}
+
+impl AgentSessionSummary {
+    fn from_handle(handle: &AgentSessionHandle) -> Self {
+        let queue_capacity = handle
+            .queue_capacity
+            .unwrap_or_else(|| handle.outbound_sender.max_capacity());
+        let queue_depth = queue_capacity.saturating_sub(handle.outbound_sender.capacity());
+        Self {
+            agent_id: handle.agent_id.clone(),
+            connected: true,
+            connection_id: handle.connection_id.clone(),
+            connected_at_ms: system_time_to_millis(handle.connected_at),
+            last_session_seen_at_ms: system_time_to_millis(handle.last_seen_at),
+            capabilities: handle.capabilities.clone(),
+            queue_depth,
+            queue_capacity: Some(queue_capacity),
+        }
+    }
+}
+
+struct RegisteredAgentSessionGuard {
+    sessions: Arc<Mutex<AgentSessionRegistry>>,
+    agent_id: String,
+    connection_id: String,
+}
+
+impl RegisteredAgentSessionGuard {
+    fn new(
+        sessions: Arc<Mutex<AgentSessionRegistry>>,
+        agent_id: String,
+        connection_id: String,
+    ) -> Self {
+        Self {
+            sessions,
+            agent_id,
+            connection_id,
+        }
+    }
+}
+
+impl Drop for RegisteredAgentSessionGuard {
+    fn drop(&mut self) {
+        if let Ok(mut sessions) = self.sessions.lock() {
+            sessions.unregister(
+                &self.agent_id,
+                &self.connection_id,
+                AgentSessionCloseReason::HandlerEnded,
+            );
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -256,11 +563,26 @@ pub struct CreateRunbookJobResponse {
 pub struct JobSummaryResponse {
     pub id: String,
     pub status: String,
+    pub dispatch_state: String,
     pub risk: String,
     pub command_program: Option<String>,
     pub command_args: Vec<String>,
     pub target_count: usize,
+    pub target_agent_ids: Vec<String>,
+    pub target_agents: Vec<JobTargetSummaryResponse>,
+    pub target_connected: bool,
     pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+    pub expires_at_ms: Option<u64>,
+    pub last_error: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobTargetSummaryResponse {
+    pub agent_id: String,
+    pub status: String,
+    pub connected: bool,
+    pub revoked: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -283,6 +605,7 @@ pub struct AgentResponse {
     pub id: String,
     pub name: String,
     pub status: String,
+    pub connected: bool,
     pub revoked: bool,
     pub fingerprint: String,
     pub labels: Vec<AgentLabelResponse>,
@@ -485,6 +808,7 @@ where
             external_url: config.external_url.clone(),
             tls_enabled: config.tls_cert_path.is_some(),
         }),
+        sessions: Arc::new(Mutex::new(AgentSessionRegistry::default())),
     };
     let app = Router::new()
         .route("/api/agents/ws", get(axum_agent_websocket))
@@ -616,7 +940,13 @@ async fn axum_http_fallback(
             ))
         })
         .and_then(|store| {
-            route_request_with_identity(&request, &store, &state.identity, &state.metadata)
+            route_request_with_identity_and_sessions(
+                &request,
+                &store,
+                &state.identity,
+                &state.metadata,
+                Some(&state.sessions),
+            )
         });
 
     match result {
@@ -705,62 +1035,208 @@ async fn handle_agent_websocket_axum(
     );
     send_axum_wire_message(&mut socket, &accepted).await?;
 
-    let heartbeat = read_axum_wire_message(&mut socket).await?;
-    if let fleet_protocol::WirePayload::Heartbeat {
-        agent_id: heartbeat_agent_id,
-        ..
-    } = heartbeat.payload
-        && heartbeat_agent_id == agent_id
-    {
-        let assignment = {
-            let store = lock_store(&state)?;
-            store.mark_agent_online(&agent_id, SystemTime::now())?;
-            pending_task_assignment_message(&store, &agent_id)?
-        };
-        let dispatched = assignment.is_some();
-        if let Some(message) = assignment {
-            send_axum_wire_message(&mut socket, &message).await?;
-        }
-        read_task_data_until_close_axum(&mut socket, &state, &agent_id, !dispatched).await?;
-        let _ = socket.send(AxumWsMessage::Close(None)).await;
-    } else {
+    let (writer, mut reader) = socket.split();
+    let connection_id = fleet_core::generate_prefixed_ulid("conn")
+        .map_err(|error| ControllerError::Json(error.to_string()))?;
+    let (outbound_sender, outbound_receiver) = mpsc::channel(AGENT_SESSION_OUTBOUND_QUEUE_CAPACITY);
+    let mut write_task = tokio::spawn(agent_session_write_loop(writer, outbound_receiver));
+    let register_outcome = {
+        let mut sessions = lock_sessions(&state)?;
+        sessions.register(AgentSessionHandle::new(
+            agent_id.clone(),
+            connection_id.clone(),
+            SystemTime::now(),
+            vec!["persistent_session".to_owned(), "split_writer".to_owned()],
+            outbound_sender.clone(),
+            Some(AGENT_SESSION_OUTBOUND_QUEUE_CAPACITY),
+        ))
+    };
+    if let Some(replacement) = register_outcome.replaced {
         let store = lock_store(&state)?;
-        audit_security(&store, "websocket_invalid_heartbeat", &agent_id)?;
+        audit_agent_session_replaced(&store, &replacement)?;
+    }
+    let _session_guard = RegisteredAgentSessionGuard::new(
+        state.sessions.clone(),
+        agent_id.clone(),
+        connection_id.clone(),
+    );
+    {
+        let store = lock_store(&state)?;
+        store.mark_agent_online(&agent_id, SystemTime::now())?;
+        audit_agent_session_started(&store, &agent_id, &connection_id)?;
+    }
+    dispatch_pending_assignments_for_agent(&state, &agent_id, 1)?;
+
+    let read_loop =
+        read_authenticated_agent_session_loop(&mut reader, &state, &agent_id, &connection_id);
+    tokio::pin!(read_loop);
+
+    let close_reason = tokio::select! {
+        read_result = &mut read_loop => {
+            let close_reason = close_reason_from_session_read_result(&read_result);
+            let _ = outbound_sender.try_send(AgentSessionOutboundMessage::Close {
+                reason: close_reason,
+            });
+            match (&mut write_task).await {
+                Ok(Ok(writer_reason)) => {
+                    if close_reason == AgentSessionCloseReason::NormalShutdown {
+                        writer_reason
+                    } else {
+                        close_reason
+                    }
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(error = %error, "agent_session_writer_failed");
+                    AgentSessionCloseReason::WriteFailure
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "agent_session_writer_join_failed");
+                    AgentSessionCloseReason::WriteFailure
+                }
+            }
+        }
+        writer_result = &mut write_task => {
+            match writer_result {
+                Ok(Ok(reason)) => reason,
+                Ok(Err(error)) => {
+                    tracing::warn!(error = %error, "agent_session_writer_failed");
+                    AgentSessionCloseReason::WriteFailure
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "agent_session_writer_join_failed");
+                    AgentSessionCloseReason::WriteFailure
+                }
+            }
+        }
+    };
+
+    if let Some(ended) = {
+        let mut sessions = lock_sessions(&state)?;
+        sessions.unregister(&agent_id, &connection_id, close_reason)
+    } {
+        tracing::debug!(
+            agent_id = %ended.agent_id,
+            connection_id = %ended.connection_id,
+            close_reason = %ended.close_reason.as_str(),
+            "agent_session_ended"
+        );
+        let store = lock_store(&state)?;
+        audit_agent_session_ended(&store, &ended)?;
     }
 
     Ok(())
 }
 
 async fn read_task_data_until_close_axum(
-    socket: &mut WebSocket,
+    socket: &mut SplitStream<WebSocket>,
     state: &ControllerAppState,
     agent_id: &str,
+    connection_id: &str,
     stop_after_idle: bool,
-) -> Result<(), ControllerError> {
+) -> Result<AgentSessionCloseReason, ControllerError> {
     loop {
         let read_result = if stop_after_idle {
-            match tokio::time::timeout(Duration::from_millis(75), read_axum_wire_message(socket))
-                .await
+            match tokio::time::timeout(
+                HEARTBEAT_BOUND_IDLE_CLOSE_AFTER,
+                read_axum_wire_message_from_stream(socket),
+            )
+            .await
             {
                 Ok(result) => result,
-                Err(_) => return Ok(()),
+                Err(_) => return Ok(AgentSessionCloseReason::IdleTimeout),
             }
         } else {
-            read_axum_wire_message(socket).await
+            read_axum_wire_message_from_stream(socket).await
         };
         let message = match read_result {
             Ok(message) => message,
-            Err(ControllerError::Json(error)) if error == "websocket closed" => return Ok(()),
+            Err(ControllerError::Json(error)) if error == "websocket closed" => {
+                return Ok(AgentSessionCloseReason::NormalShutdown);
+            }
             Err(error) => return Err(error),
         };
+        {
+            let mut sessions = lock_sessions(state)?;
+            sessions.mark_seen(agent_id, connection_id, SystemTime::now());
+        }
         let done = {
             let store = lock_store(state)?;
             handle_agent_task_data_message(&store, agent_id, message)?
         };
         if done {
-            return Ok(());
+            return Ok(AgentSessionCloseReason::NormalShutdown);
         }
     }
+}
+
+async fn read_authenticated_agent_session_loop(
+    reader: &mut SplitStream<WebSocket>,
+    state: &ControllerAppState,
+    agent_id: &str,
+    connection_id: &str,
+) -> Result<AgentSessionCloseReason, ControllerError> {
+    let heartbeat = read_axum_wire_message_from_stream(reader).await?;
+    if let fleet_protocol::WirePayload::Heartbeat {
+        agent_id: heartbeat_agent_id,
+        ..
+    } = heartbeat.payload
+        && heartbeat_agent_id == agent_id
+    {
+        {
+            let mut sessions = lock_sessions(state)?;
+            sessions.mark_seen(agent_id, connection_id, SystemTime::now());
+        }
+        {
+            let store = lock_store(state)?;
+            store.mark_agent_online(agent_id, SystemTime::now())?;
+        }
+        read_task_data_until_close_axum(reader, state, agent_id, connection_id, false).await
+    } else {
+        let store = lock_store(state)?;
+        audit_security(&store, "websocket_invalid_heartbeat", agent_id)?;
+        Ok(AgentSessionCloseReason::ProtocolError)
+    }
+}
+
+fn close_reason_from_session_read_result(
+    result: &Result<AgentSessionCloseReason, ControllerError>,
+) -> AgentSessionCloseReason {
+    match result {
+        Ok(reason) => *reason,
+        Err(ControllerError::Store(_)) => AgentSessionCloseReason::StoreError,
+        Err(ControllerError::Json(error)) if error.contains("outbound queue is full") => {
+            AgentSessionCloseReason::WriteQueueOverflow
+        }
+        Err(ControllerError::Json(_)) | Err(ControllerError::Protocol(_)) => {
+            AgentSessionCloseReason::ProtocolError
+        }
+        Err(ControllerError::Io(_)) | Err(ControllerError::Tls(_)) => {
+            AgentSessionCloseReason::WriteFailure
+        }
+    }
+}
+
+async fn agent_session_write_loop(
+    mut writer: SplitSink<WebSocket, AxumWsMessage>,
+    mut outbound_receiver: mpsc::Receiver<AgentSessionOutboundMessage>,
+) -> Result<AgentSessionCloseReason, ControllerError> {
+    while let Some(message) = outbound_receiver.recv().await {
+        match message {
+            AgentSessionOutboundMessage::Wire(message) => {
+                writer
+                    .send(AxumWsMessage::Text(
+                        fleet_protocol::encode_message(&message)?.into(),
+                    ))
+                    .await
+                    .map_err(|error| ControllerError::Json(error.to_string()))?;
+            }
+            AgentSessionOutboundMessage::Close { reason } => {
+                let _ = writer.send(AxumWsMessage::Close(None)).await;
+                return Ok(reason);
+            }
+        }
+    }
+    Ok(AgentSessionCloseReason::NormalShutdown)
 }
 
 async fn read_axum_wire_message(
@@ -768,6 +1244,25 @@ async fn read_axum_wire_message(
 ) -> Result<fleet_protocol::WireMessage, ControllerError> {
     loop {
         let Some(message) = socket.recv().await else {
+            return Err(ControllerError::Json("websocket closed".to_owned()));
+        };
+        match message.map_err(|error| ControllerError::Json(error.to_string()))? {
+            AxumWsMessage::Text(body) => {
+                return fleet_protocol::decode_message(&body).map_err(ControllerError::from);
+            }
+            AxumWsMessage::Close(_) => {
+                return Err(ControllerError::Json("websocket closed".to_owned()));
+            }
+            AxumWsMessage::Binary(_) | AxumWsMessage::Ping(_) | AxumWsMessage::Pong(_) => {}
+        }
+    }
+}
+
+async fn read_axum_wire_message_from_stream(
+    socket: &mut SplitStream<WebSocket>,
+) -> Result<fleet_protocol::WireMessage, ControllerError> {
+    loop {
+        let Some(message) = socket.next().await else {
             return Err(ControllerError::Json("websocket closed".to_owned()));
         };
         match message.map_err(|error| ControllerError::Json(error.to_string()))? {
@@ -794,93 +1289,121 @@ async fn send_axum_wire_message(
         .map_err(|error| ControllerError::Json(error.to_string()))
 }
 
-fn pending_task_assignment_message(
+struct ControllerPendingAssignmentDispatcher<'a> {
+    sessions: &'a Arc<Mutex<AgentSessionRegistry>>,
+}
+
+impl PendingAssignmentDispatcher for ControllerPendingAssignmentDispatcher<'_> {
+    type Error = ControllerError;
+
+    fn has_active_session(&self, agent_id: &AgentId) -> bool {
+        self.sessions
+            .lock()
+            .map(|sessions| sessions.has_active_session(agent_id.as_str()))
+            .unwrap_or(false)
+    }
+
+    fn dispatch(&mut self, assignment: &PendingTaskAssignment) -> Result<(), Self::Error> {
+        let message = pending_task_assignment_to_wire_message(assignment)?;
+        self.sessions
+            .lock()
+            .map_err(|_| {
+                ControllerError::Store(fleet_store::StoreError::Domain(
+                    "session registry lock poisoned".to_owned(),
+                ))
+            })?
+            .try_send(assignment.envelope.target_agent_id.as_str(), message)
+            .map_err(|error| ControllerError::Json(error.to_string()))
+    }
+}
+
+fn dispatch_pending_assignments_for_created_job(
     store: &SqliteStore,
+    sessions: &Arc<Mutex<AgentSessionRegistry>>,
+    job_id: &str,
+) -> Result<DispatchPendingAssignmentsOutput, ControllerError> {
+    let job_id =
+        JobId::new(job_id.to_owned()).map_err(|error| ControllerError::Json(error.to_string()))?;
+    dispatch_pending_assignments(store, sessions, None, Some(job_id), 100)
+}
+
+fn dispatch_pending_assignments_for_agent(
+    state: &ControllerAppState,
     agent_id: &str,
-) -> Result<Option<fleet_protocol::WireMessage>, ControllerError> {
-    if let Some(assignment) = store
-        .list_pending_command_assignments_for_agent(agent_id)?
-        .into_iter()
-        .next()
-    {
-        store.update_job_status(assignment.envelope.job_id.as_str(), JobStatus::Running)?;
-        audit_job(
-            store,
-            "job_started",
-            assignment.envelope.job_id.as_str(),
-            AuditValue::Plain(format!("agent_id={agent_id}")),
-        )?;
-        return Ok(Some(fleet_protocol::WireMessage::new(
-            fleet_core::generate_prefixed_ulid("msg")
-                .map_err(|error| ControllerError::Json(error.to_string()))?,
-            assignment.envelope.task_id.as_str().to_owned(),
-            Some(agent_id.to_owned()),
-            epoch_millis() as u64,
-            fleet_protocol::WirePayload::TaskAssignment {
-                envelope: task_envelope_to_wire(&assignment.envelope),
-                task: command_task_to_wire(&assignment.command),
-            },
-        )));
-    }
+    limit: usize,
+) -> Result<DispatchPendingAssignmentsOutput, ControllerError> {
+    let agent_id = AgentId::new(agent_id.to_owned())
+        .map_err(|error| ControllerError::Json(error.to_string()))?;
+    let store = lock_store(state)?;
+    dispatch_pending_assignments(&store, &state.sessions, Some(agent_id), None, limit)
+}
 
-    if let Some(assignment) = store
-        .list_pending_runbook_assignments_for_agent(agent_id)?
-        .into_iter()
-        .next()
-    {
-        store.update_job_status(assignment.envelope.job_id.as_str(), JobStatus::Running)?;
-        audit_job(
-            store,
-            "runbook_job_started",
-            assignment.envelope.job_id.as_str(),
-            AuditValue::Plain(format!("agent_id={agent_id}")),
-        )?;
-        return Ok(Some(fleet_protocol::WireMessage::new(
-            fleet_core::generate_prefixed_ulid("msg")
-                .map_err(|error| ControllerError::Json(error.to_string()))?,
-            assignment.envelope.task_id.as_str().to_owned(),
-            Some(agent_id.to_owned()),
-            epoch_millis() as u64,
-            fleet_protocol::WirePayload::TaskAssignment {
-                envelope: task_envelope_to_wire(&assignment.envelope),
-                task: fleet_protocol::TaskWire::RunbookExecution(
-                    fleet_protocol::RunbookExecutionTaskWire {
-                        runbook_document: assignment.runbook.runbook_document().to_owned(),
-                        timeout_ms: assignment.runbook.timeout().as_millis() as u64,
-                        confirmed_high_risk: true,
-                    },
-                ),
-            },
-        )));
-    }
+fn dispatch_pending_assignments(
+    store: &SqliteStore,
+    sessions: &Arc<Mutex<AgentSessionRegistry>>,
+    agent_id: Option<AgentId>,
+    job_id: Option<JobId>,
+    limit: usize,
+) -> Result<DispatchPendingAssignmentsOutput, ControllerError> {
+    let started_at = Instant::now();
+    let agent_id_label = agent_id
+        .as_ref()
+        .map(|agent_id| agent_id.as_str().to_owned())
+        .unwrap_or_default();
+    let job_id_label = job_id
+        .as_ref()
+        .map(|job_id| job_id.as_str().to_owned())
+        .unwrap_or_default();
+    let mut repo = ControllerJobRepository { store };
+    let mut dispatcher = ControllerPendingAssignmentDispatcher { sessions };
+    let mut audit = ControllerAuditWriter { store };
+    let output = DispatchPendingAssignments::execute(
+        &mut repo,
+        &mut dispatcher,
+        &mut audit,
+        DispatchPendingAssignmentsInput {
+            agent_id,
+            job_id,
+            now: SystemTime::now(),
+            limit,
+        },
+    )
+    .map_err(|error| match error {
+        fleet_application::DispatchPendingAssignmentsError::Repository(error)
+        | fleet_application::DispatchPendingAssignmentsError::Audit(error) => {
+            ControllerError::Store(error)
+        }
+    })?;
 
-    let Some(assignment) = store
-        .list_pending_drift_check_assignments_for_agent(agent_id)?
-        .into_iter()
-        .next()
-    else {
-        return Ok(None);
-    };
-    store.update_job_status(assignment.envelope.job_id.as_str(), JobStatus::Running)?;
-    audit_job(
-        store,
-        "drift_check_job_started",
-        assignment.envelope.job_id.as_str(),
-        AuditValue::Plain(format!("agent_id={agent_id}")),
-    )?;
-    Ok(Some(fleet_protocol::WireMessage::new(
+    tracing::info!(
+        job_id = %job_id_label,
+        agent_id = %agent_id_label,
+        dispatched_count = output.dispatched_count,
+        queued_count = output.queued_count,
+        failed_count = output.failed_count,
+        skipped_expired_count = output.skipped_expired_count,
+        skipped_disabled_count = output.skipped_disabled_count,
+        dispatch_latency_ms = started_at.elapsed().as_millis(),
+        "task_dispatch_checked"
+    );
+
+    Ok(output)
+}
+
+fn pending_task_assignment_to_wire_message(
+    assignment: &PendingTaskAssignment,
+) -> Result<fleet_protocol::WireMessage, ControllerError> {
+    Ok(fleet_protocol::WireMessage::new(
         fleet_core::generate_prefixed_ulid("msg")
             .map_err(|error| ControllerError::Json(error.to_string()))?,
         assignment.envelope.task_id.as_str().to_owned(),
-        Some(agent_id.to_owned()),
+        Some(assignment.envelope.target_agent_id.as_str().to_owned()),
         epoch_millis() as u64,
         fleet_protocol::WirePayload::TaskAssignment {
             envelope: task_envelope_to_wire(&assignment.envelope),
-            task: fleet_protocol::TaskWire::DriftCheck(fleet_protocol::DriftCheckTaskWire {
-                policy_document: assignment.drift_check.policy_document().to_owned(),
-            }),
+            task: task_kind_to_wire(&assignment.task),
         },
-    )))
+    ))
 }
 
 fn lock_store(
@@ -891,6 +1414,90 @@ fn lock_store(
             "store lock poisoned".to_owned(),
         ))
     })
+}
+
+fn lock_sessions(
+    state: &ControllerAppState,
+) -> Result<std::sync::MutexGuard<'_, AgentSessionRegistry>, ControllerError> {
+    state.sessions.lock().map_err(|_| {
+        ControllerError::Store(fleet_store::StoreError::Domain(
+            "session registry lock poisoned".to_owned(),
+        ))
+    })
+}
+
+fn audit_agent_session_replaced(
+    store: &SqliteStore,
+    replacement: &AgentSessionReplacement,
+) -> Result<(), ControllerError> {
+    store.write_audit_event(AuditEvent {
+        category: AuditCategory::Agent,
+        action: "agent_session_replaced".to_owned(),
+        actor: AuditActor::new("controller"),
+        target: AuditTarget::new(replacement.agent_id.clone()),
+        value: AuditValue::Plain(format!(
+            "old_connection_id={},new_connection_id={},close_reason={}",
+            replacement.old_connection_id,
+            replacement.new_connection_id,
+            replacement.close_reason.as_str()
+        )),
+        occurred_at: SystemTime::now(),
+    })?;
+    Ok(())
+}
+
+fn audit_agent_session_started(
+    store: &SqliteStore,
+    agent_id: &str,
+    connection_id: &str,
+) -> Result<(), ControllerError> {
+    store.write_audit_event(AuditEvent {
+        category: AuditCategory::Agent,
+        action: "agent_session_started".to_owned(),
+        actor: AuditActor::new("controller"),
+        target: AuditTarget::new(agent_id),
+        value: AuditValue::Plain(format!("connection_id={connection_id}")),
+        occurred_at: SystemTime::now(),
+    })?;
+    Ok(())
+}
+
+fn audit_agent_session_ended(
+    store: &SqliteStore,
+    ended: &AgentSessionEnded,
+) -> Result<(), ControllerError> {
+    store.write_audit_event(AuditEvent {
+        category: AuditCategory::Agent,
+        action: "agent_session_ended".to_owned(),
+        actor: AuditActor::new("controller"),
+        target: AuditTarget::new(ended.agent_id.clone()),
+        value: AuditValue::Plain(format!(
+            "connection_id={},close_reason={}",
+            ended.connection_id,
+            ended.close_reason.as_str()
+        )),
+        occurred_at: SystemTime::now(),
+    })?;
+    Ok(())
+}
+
+fn audit_agent_session_revoked_closed(
+    store: &SqliteStore,
+    ended: &AgentSessionEnded,
+) -> Result<(), ControllerError> {
+    store.write_audit_event(AuditEvent {
+        category: AuditCategory::Agent,
+        action: "agent_session_revoked_closed".to_owned(),
+        actor: AuditActor::new("controller"),
+        target: AuditTarget::new(ended.agent_id.clone()),
+        value: AuditValue::Plain(format!(
+            "connection_id={},close_reason={}",
+            ended.connection_id,
+            ended.close_reason.as_str()
+        )),
+        occurred_at: SystemTime::now(),
+    })?;
+    Ok(())
 }
 
 fn raw_http_request_from_axum(method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> String {
@@ -977,6 +1584,18 @@ fn validate_agent_ws_hello(
     fingerprint: &str,
 ) -> Result<Option<String>, ControllerError> {
     let Some((public_key, stored_fingerprint)) = store.find_agent_identity(agent_id)? else {
+        if store
+            .find_agent_by_id(agent_id)?
+            .is_some_and(|agent| agent.status() == AgentStatus::Disabled)
+        {
+            audit_security_with_value(
+                store,
+                "agent_session_auth_failed",
+                agent_id,
+                AuditValue::Plain("reason=revoked".to_owned()),
+            )?;
+            return Ok(None);
+        }
         audit_security(store, "websocket_unknown_agent", agent_id)?;
         return Ok(None);
     };
@@ -1011,13 +1630,20 @@ fn handle_agent_task_data_message(
             stream,
             sequence,
             data,
-        } => store.append_job_output_chunk_record(&JobOutputChunk {
-            job_id,
-            agent_id: agent_id.to_owned(),
-            stream: output_stream_from_wire(stream),
-            sequence,
-            body: data,
-        })?,
+        } => {
+            let stream = output_stream_from_wire(stream);
+            append_agent_output_chunk(
+                store,
+                agent_id,
+                JobOutputChunk {
+                    job_id,
+                    agent_id: agent_id.to_owned(),
+                    stream,
+                    sequence,
+                    body: data,
+                },
+            )?;
+        }
         fleet_protocol::WirePayload::TaskResult {
             job_id,
             task_id: _,
@@ -1039,7 +1665,6 @@ fn handle_agent_task_data_message(
                 &job_id,
                 AuditValue::Plain(format!("agent_id={agent_id},exit_code={exit_code}")),
             )?;
-            return Ok(true);
         }
         fleet_protocol::WirePayload::SecurityEvent {
             agent_id: event_agent_id,
@@ -1056,7 +1681,6 @@ fn handle_agent_task_data_message(
                     AuditValue::Plain(format!("detail={detail}")),
                 )?;
             }
-            return Ok(true);
         }
         fleet_protocol::WirePayload::FactsSnapshot {
             agent_id: event_agent_id,
@@ -1128,6 +1752,35 @@ fn handle_agent_task_data_message(
     Ok(false)
 }
 
+fn append_agent_output_chunk(
+    store: &SqliteStore,
+    agent_id: &str,
+    chunk: JobOutputChunk,
+) -> Result<(), ControllerError> {
+    match store.append_job_output_chunk_record(&chunk) {
+        Ok(()) => Ok(()),
+        Err(fleet_store::StoreError::ConstraintViolation(_)) => {
+            audit_security_with_value(
+                store,
+                "websocket_output_chunk_conflict",
+                agent_id,
+                AuditValue::Plain(format!(
+                    "job_id={},stream={},sequence={},reason=duplicate_body_mismatch",
+                    chunk.job_id,
+                    job_output_stream_to_str(chunk.stream),
+                    chunk.sequence
+                )),
+            )?;
+            Err(ControllerError::Protocol(
+                fleet_protocol::ProtocolError::Json(
+                    "duplicate output chunk body mismatch".to_owned(),
+                ),
+            ))
+        }
+        Err(error) => Err(ControllerError::Store(error)),
+    }
+}
+
 fn task_envelope_to_wire(envelope: &TaskEnvelope) -> fleet_protocol::SignedTaskEnvelopeWire {
     fleet_protocol::SignedTaskEnvelopeWire {
         job_id: envelope.job_id.as_str().to_owned(),
@@ -1142,6 +1795,24 @@ fn task_envelope_to_wire(envelope: &TaskEnvelope) -> fleet_protocol::SignedTaskE
             .as_ref()
             .map(|signature| signature.as_str().to_owned())
             .unwrap_or_default(),
+    }
+}
+
+fn task_kind_to_wire(task: &fleet_domain::TaskKind) -> fleet_protocol::TaskWire {
+    match task {
+        fleet_domain::TaskKind::Command(command) => command_task_to_wire(command),
+        fleet_domain::TaskKind::DriftCheck(drift_check) => {
+            fleet_protocol::TaskWire::DriftCheck(fleet_protocol::DriftCheckTaskWire {
+                policy_document: drift_check.policy_document().to_owned(),
+            })
+        }
+        fleet_domain::TaskKind::RunbookExecution(runbook) => {
+            fleet_protocol::TaskWire::RunbookExecution(fleet_protocol::RunbookExecutionTaskWire {
+                runbook_document: runbook.runbook_document().to_owned(),
+                timeout_ms: runbook.timeout().as_millis() as u64,
+                confirmed_high_risk: true,
+            })
+        }
     }
 }
 
@@ -1254,11 +1925,22 @@ fn route_request(request: &str, store: &SqliteStore) -> Result<String, Controlle
     )
 }
 
+#[cfg(test)]
 fn route_request_with_identity(
     request: &str,
     store: &SqliteStore,
     identity: &ControllerIdentity,
     metadata: &ControllerRuntimeMetadata,
+) -> Result<String, ControllerError> {
+    route_request_with_identity_and_sessions(request, store, identity, metadata, None)
+}
+
+fn route_request_with_identity_and_sessions(
+    request: &str,
+    store: &SqliteStore,
+    identity: &ControllerIdentity,
+    metadata: &ControllerRuntimeMetadata,
+    sessions: Option<&Arc<Mutex<AgentSessionRegistry>>>,
 ) -> Result<String, ControllerError> {
     let Some(request_line) = request.lines().next() else {
         return Ok(response(400, "text/plain", "bad request\n"));
@@ -1356,7 +2038,20 @@ fn route_request_with_identity(
         }
         ("POST", "/api/jobs/command") => {
             match create_command_job(request_body(request), store, identity) {
-                Ok(body) => Ok(response(201, "application/json", &format!("{body}\n"))),
+                Ok(output) => {
+                    if let Some(sessions) = sessions {
+                        dispatch_pending_assignments_for_created_job(
+                            store,
+                            sessions,
+                            &output.job_id,
+                        )?;
+                    }
+                    Ok(response(
+                        201,
+                        "application/json",
+                        &format!("{}\n", output.body),
+                    ))
+                }
                 Err(CreateCommandJobHttpError::BadRequest(message)) => Ok(response(
                     400,
                     "application/json",
@@ -1372,7 +2067,20 @@ fn route_request_with_identity(
         }
         ("POST", "/api/jobs/drift-check") => {
             match create_drift_check_job(request_body(request), store, identity) {
-                Ok(body) => Ok(response(201, "application/json", &format!("{body}\n"))),
+                Ok(output) => {
+                    if let Some(sessions) = sessions {
+                        dispatch_pending_assignments_for_created_job(
+                            store,
+                            sessions,
+                            &output.job_id,
+                        )?;
+                    }
+                    Ok(response(
+                        201,
+                        "application/json",
+                        &format!("{}\n", output.body),
+                    ))
+                }
                 Err(CreateCommandJobHttpError::BadRequest(message)) => Ok(response(
                     400,
                     "application/json",
@@ -1388,7 +2096,20 @@ fn route_request_with_identity(
         }
         ("POST", "/api/jobs/runbook") => {
             match create_runbook_job(request_body(request), store, identity) {
-                Ok(body) => Ok(response(201, "application/json", &format!("{body}\n"))),
+                Ok(output) => {
+                    if let Some(sessions) = sessions {
+                        dispatch_pending_assignments_for_created_job(
+                            store,
+                            sessions,
+                            &output.job_id,
+                        )?;
+                    }
+                    Ok(response(
+                        201,
+                        "application/json",
+                        &format!("{}\n", output.body),
+                    ))
+                }
                 Err(CreateCommandJobHttpError::BadRequest(message)) => Ok(response(
                     400,
                     "application/json",
@@ -1403,7 +2124,7 @@ fn route_request_with_identity(
             }
         }
         ("GET", "/api/jobs") => {
-            let body = list_jobs(store)?;
+            let body = list_jobs(store, sessions)?;
             Ok(response(200, "application/json", &format!("{body}\n")))
         }
         ("GET", path) if path.starts_with("/api/jobs/") && path.ends_with("/output") => {
@@ -1414,8 +2135,19 @@ fn route_request_with_identity(
             let body = list_job_output(job_id, store)?;
             Ok(response(200, "application/json", &format!("{body}\n")))
         }
+        ("GET", path) if path.starts_with("/api/jobs/") => {
+            let job_id = path.trim_start_matches("/api/jobs/").trim_end_matches('/');
+            match get_job(job_id, store, sessions)? {
+                Some(body) => Ok(response(200, "application/json", &format!("{body}\n"))),
+                None => Ok(response(
+                    404,
+                    "application/json",
+                    "{\"error\":\"not_found\"}\n",
+                )),
+            }
+        }
         ("GET", "/api/agents") => {
-            let body = list_agents(store)?;
+            let body = list_agents(store, sessions)?;
             Ok(response(200, "application/json", &format!("{body}\n")))
         }
         ("GET", "/api/audit") => {
@@ -1502,7 +2234,7 @@ fn route_request_with_identity(
                 .trim_start_matches("/api/agents/")
                 .trim_end_matches("/revoke-key")
                 .trim_end_matches('/');
-            match revoke_agent_key(agent_id, store) {
+            match revoke_agent_key(agent_id, store, sessions) {
                 Ok(Some(body)) => Ok(response(200, "application/json", &format!("{body}\n"))),
                 Ok(None) => Ok(response(
                     404,
@@ -1521,7 +2253,7 @@ fn route_request_with_identity(
         }
         ("GET", path) if path.starts_with("/api/agents/") && path != "/api/agents/ws" => {
             let agent_id = path.trim_start_matches("/api/agents/");
-            match get_agent(agent_id, store)? {
+            match get_agent(agent_id, store, sessions)? {
                 Some(body) => Ok(response(200, "application/json", &format!("{body}\n"))),
                 None => Ok(response(
                     404,
@@ -1535,7 +2267,7 @@ fn route_request_with_identity(
                 .trim_start_matches("/api/agents/")
                 .trim_end_matches("/labels")
                 .trim_end_matches('/');
-            match update_agent_labels(agent_id, request_body(request), store) {
+            match update_agent_labels(agent_id, request_body(request), store, sessions) {
                 Ok(Some(body)) => Ok(response(200, "application/json", &format!("{body}\n"))),
                 Ok(None) => Ok(response(
                     404,
@@ -1707,6 +2439,12 @@ enum CreateCommandJobHttpError {
     Internal(ControllerError),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CreateJobHttpOutput {
+    job_id: String,
+    body: String,
+}
+
 fn create_enrollment_token(body: &str, store: &SqliteStore) -> Result<String, ControllerError> {
     let request = parse_create_enrollment_token_request(body)?;
     if request.max_uses == 0 {
@@ -1805,7 +2543,7 @@ fn create_command_job(
     body: &str,
     store: &SqliteStore,
     identity: &ControllerIdentity,
-) -> Result<String, CreateCommandJobHttpError> {
+) -> Result<CreateJobHttpOutput, CreateCommandJobHttpError> {
     let request: CreateCommandJobRequest = serde_json::from_str(body)
         .map_err(|error| CreateCommandJobHttpError::BadRequest(error.to_string()))?;
     let issued_at = SystemTime::now();
@@ -1838,19 +2576,22 @@ fn create_command_job(
 
     let output = CreateCommandJob::execute(&mut job_repo, &mut audit_writer, &mut signer, input)
         .map_err(map_create_command_job_error)?;
-    serde_json::to_string(&CreateCommandJobResponse {
-        job_id,
+    let body = serde_json::to_string(&CreateCommandJobResponse {
+        job_id: job_id.clone(),
         target_count: output.targets.len(),
         assignment_count: output.envelopes.len(),
     })
-    .map_err(|error| CreateCommandJobHttpError::Internal(ControllerError::Json(error.to_string())))
+    .map_err(|error| {
+        CreateCommandJobHttpError::Internal(ControllerError::Json(error.to_string()))
+    })?;
+    Ok(CreateJobHttpOutput { job_id, body })
 }
 
 fn create_drift_check_job(
     body: &str,
     store: &SqliteStore,
     identity: &ControllerIdentity,
-) -> Result<String, CreateCommandJobHttpError> {
+) -> Result<CreateJobHttpOutput, CreateCommandJobHttpError> {
     let request: CreateDriftCheckJobRequest = serde_json::from_str(body)
         .map_err(|error| CreateCommandJobHttpError::BadRequest(error.to_string()))?;
     fleet_domain::parse_policy_document(&request.policy_document)
@@ -1883,19 +2624,22 @@ fn create_drift_check_job(
 
     let output = CreateDriftCheckJob::execute(&mut job_repo, &mut audit_writer, &mut signer, input)
         .map_err(map_create_drift_check_job_error)?;
-    serde_json::to_string(&CreateDriftCheckJobResponse {
-        job_id,
+    let body = serde_json::to_string(&CreateDriftCheckJobResponse {
+        job_id: job_id.clone(),
         target_count: output.targets.len(),
         assignment_count: output.envelopes.len(),
     })
-    .map_err(|error| CreateCommandJobHttpError::Internal(ControllerError::Json(error.to_string())))
+    .map_err(|error| {
+        CreateCommandJobHttpError::Internal(ControllerError::Json(error.to_string()))
+    })?;
+    Ok(CreateJobHttpOutput { job_id, body })
 }
 
 fn create_runbook_job(
     body: &str,
     store: &SqliteStore,
     identity: &ControllerIdentity,
-) -> Result<String, CreateCommandJobHttpError> {
+) -> Result<CreateJobHttpOutput, CreateCommandJobHttpError> {
     let request: CreateRunbookJobRequest = serde_json::from_str(body)
         .map_err(|error| CreateCommandJobHttpError::BadRequest(error.to_string()))?;
     fleet_domain::parse_runbook_document(&request.runbook_document)
@@ -1929,12 +2673,15 @@ fn create_runbook_job(
 
     let output = CreateRunbookJob::execute(&mut job_repo, &mut audit_writer, &mut signer, input)
         .map_err(map_create_runbook_job_error)?;
-    serde_json::to_string(&CreateRunbookJobResponse {
-        job_id,
+    let body = serde_json::to_string(&CreateRunbookJobResponse {
+        job_id: job_id.clone(),
         target_count: output.targets.len(),
         assignment_count: output.envelopes.len(),
     })
-    .map_err(|error| CreateCommandJobHttpError::Internal(ControllerError::Json(error.to_string())))
+    .map_err(|error| {
+        CreateCommandJobHttpError::Internal(ControllerError::Json(error.to_string()))
+    })?;
+    Ok(CreateJobHttpOutput { job_id, body })
 }
 
 fn resolve_command_targets(
@@ -2050,24 +2797,33 @@ fn job_output_stream_to_str(stream: JobOutputStream) -> &'static str {
     }
 }
 
-fn list_agents(store: &SqliteStore) -> Result<String, ControllerError> {
+fn list_agents(
+    store: &SqliteStore,
+    sessions: Option<&Arc<Mutex<AgentSessionRegistry>>>,
+) -> Result<String, ControllerError> {
     mark_stale_agents_offline_for_inventory(store)?;
     let repo = ControllerAgentInventoryRepository { store };
+    let connected_agent_ids = connected_agent_ids(sessions);
     let agents = ListInventoryAgents::execute(&repo)?
         .iter()
-        .map(|agent| agent_to_response_with_latest_facts(agent, store))
+        .map(|agent| agent_to_response_with_latest_facts(agent, store, &connected_agent_ids))
         .collect::<Result<Vec<_>, _>>()?;
     serde_json::to_string(&agents).map_err(|error| ControllerError::Json(error.to_string()))
 }
 
-fn get_agent(agent_id: &str, store: &SqliteStore) -> Result<Option<String>, ControllerError> {
+fn get_agent(
+    agent_id: &str,
+    store: &SqliteStore,
+    sessions: Option<&Arc<Mutex<AgentSessionRegistry>>>,
+) -> Result<Option<String>, ControllerError> {
     mark_stale_agents_offline_for_inventory(store)?;
     let agent_id = AgentId::new(agent_id).map_err(|error| ControllerError::Store(error.into()))?;
     let repo = ControllerAgentInventoryRepository { store };
     let Some(agent) = GetInventoryAgent::execute(&repo, agent_id)? else {
         return Ok(None);
     };
-    let response = agent_to_response_with_latest_facts(&agent, store)?;
+    let connected_agent_ids = connected_agent_ids(sessions);
+    let response = agent_to_response_with_latest_facts(&agent, store, &connected_agent_ids)?;
     serde_json::to_string(&response)
         .map(Some)
         .map_err(|error| ControllerError::Json(error.to_string()))
@@ -2089,6 +2845,7 @@ fn update_agent_labels(
     agent_id: &str,
     body: &str,
     store: &SqliteStore,
+    sessions: Option<&Arc<Mutex<AgentSessionRegistry>>>,
 ) -> Result<Option<String>, ControllerError> {
     let request: UpdateAgentLabelsRequest =
         serde_json::from_str(body).map_err(|error| ControllerError::Json(error.to_string()))?;
@@ -2116,7 +2873,8 @@ fn update_agent_labels(
     else {
         return Ok(None);
     };
-    let response = agent_to_response_with_latest_facts(&agent, store)?;
+    let connected_agent_ids = connected_agent_ids(sessions);
+    let response = agent_to_response_with_latest_facts(&agent, store, &connected_agent_ids)?;
     serde_json::to_string(&response)
         .map(Some)
         .map_err(|error| ControllerError::Json(error.to_string()))
@@ -2125,6 +2883,7 @@ fn update_agent_labels(
 fn revoke_agent_key(
     agent_id: &str,
     store: &SqliteStore,
+    sessions: Option<&Arc<Mutex<AgentSessionRegistry>>>,
 ) -> Result<Option<String>, ControllerError> {
     let mut repo = ControllerAgentInventoryRepository { store };
     let mut audit = ControllerAuditWriter { store };
@@ -2141,7 +2900,21 @@ fn revoke_agent_key(
     else {
         return Ok(None);
     };
-    let response = agent_to_response_with_latest_facts(&agent, store)?;
+    if let Some(sessions) = sessions {
+        let ended = {
+            let mut sessions = sessions.lock().map_err(|_| {
+                ControllerError::Store(fleet_store::StoreError::Domain(
+                    "session registry lock poisoned".to_owned(),
+                ))
+            })?;
+            sessions.close(agent_id, AgentSessionCloseReason::Revoked)
+        };
+        if let Some(ended) = ended {
+            audit_agent_session_revoked_closed(store, &ended)?;
+        }
+    }
+    let connected_agent_ids = connected_agent_ids(sessions);
+    let response = agent_to_response_with_latest_facts(&agent, store, &connected_agent_ids)?;
     serde_json::to_string(&response)
         .map(Some)
         .map_err(|error| ControllerError::Json(error.to_string()))
@@ -2199,22 +2972,114 @@ fn list_facts_snapshots(
         .map_err(|error| ControllerError::Json(error.to_string()))
 }
 
-fn list_jobs(store: &SqliteStore) -> Result<String, ControllerError> {
+fn list_jobs(
+    store: &SqliteStore,
+    sessions: Option<&Arc<Mutex<AgentSessionRegistry>>>,
+) -> Result<String, ControllerError> {
     let repo = ControllerJobQueryRepository { store };
     let jobs = ListJobSummaries::execute(&repo, 50)?;
+    let connected_agent_ids = connected_agent_ids(sessions);
     let response = jobs
         .into_iter()
-        .map(|job| JobSummaryResponse {
-            id: job.id,
-            status: job.status,
-            risk: job.risk,
-            command_program: job.command_program,
-            command_args: job.command_args,
-            target_count: job.target_count,
-            created_at_ms: system_time_to_millis(job.created_at),
-        })
+        .map(|job| job_summary_response(job, &connected_agent_ids))
         .collect::<Vec<_>>();
     serde_json::to_string(&response).map_err(|error| ControllerError::Json(error.to_string()))
+}
+
+fn get_job(
+    job_id: &str,
+    store: &SqliteStore,
+    sessions: Option<&Arc<Mutex<AgentSessionRegistry>>>,
+) -> Result<Option<String>, ControllerError> {
+    let repo = ControllerJobQueryRepository { store };
+    let Some(job) = GetJobSummary::execute(&repo, job_id)? else {
+        return Ok(None);
+    };
+    let connected_agent_ids = connected_agent_ids(sessions);
+    serde_json::to_string(&job_summary_response(job, &connected_agent_ids))
+        .map(Some)
+        .map_err(|error| ControllerError::Json(error.to_string()))
+}
+
+fn connected_agent_ids(
+    sessions: Option<&Arc<Mutex<AgentSessionRegistry>>>,
+) -> std::collections::BTreeSet<String> {
+    sessions
+        .and_then(|sessions| sessions.lock().ok())
+        .map(|sessions| {
+            sessions
+                .snapshot()
+                .into_iter()
+                .map(|summary| summary.agent_id)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn job_summary_response(
+    job: fleet_application::JobSummaryRecord,
+    connected_agent_ids: &std::collections::BTreeSet<String>,
+) -> JobSummaryResponse {
+    let target_agents = job
+        .target_agents
+        .iter()
+        .map(|target| JobTargetSummaryResponse {
+            connected: connected_agent_ids.contains(&target.agent_id),
+            agent_id: target.agent_id.clone(),
+            status: agent_status_for_job_target(
+                &target.status,
+                connected_agent_ids.contains(&target.agent_id),
+            ),
+            revoked: target.status == "disabled",
+        })
+        .collect::<Vec<_>>();
+    let target_agent_ids = target_agents
+        .iter()
+        .map(|target| target.agent_id.clone())
+        .collect::<Vec<_>>();
+    let target_connected = target_agents.iter().any(|target| target.connected);
+    let created_at_ms = system_time_to_millis(job.created_at);
+    let dispatch_state = job_dispatch_state(&job.status, target_connected);
+    JobSummaryResponse {
+        id: job.id,
+        status: job.status,
+        dispatch_state,
+        risk: job.risk,
+        command_program: job.command_program,
+        command_args: job.command_args,
+        target_count: job.target_count,
+        target_agent_ids,
+        target_agents,
+        target_connected,
+        created_at_ms,
+        updated_at_ms: created_at_ms,
+        expires_at_ms: job.expires_at.map(system_time_to_millis),
+        last_error: String::new(),
+    }
+}
+
+fn job_dispatch_state(status: &str, target_connected: bool) -> String {
+    match status {
+        "queued" if target_connected => "created",
+        "queued" => "queued",
+        "running" => "delivered",
+        "success" => "completed",
+        "failed" => "failed",
+        "expired" => "expired",
+        "canceled" => "rejected",
+        value => value,
+    }
+    .to_owned()
+}
+
+fn agent_status_for_job_target(status: &str, connected: bool) -> String {
+    if status == "disabled" {
+        "offline".to_owned()
+    } else if connected && matches!(status, "pending" | "offline" | "unknown") {
+        "online".to_owned()
+    } else {
+        status.to_owned()
+    }
 }
 
 fn facts_payload_is_degraded(body: &str) -> bool {
@@ -2373,11 +3238,16 @@ struct AgentFactsSummary {
 fn agent_to_response_with_latest_facts(
     agent: &Agent,
     store: &SqliteStore,
+    connected_agent_ids: &std::collections::BTreeSet<String>,
 ) -> Result<AgentResponse, ControllerError> {
     let summary = store
         .latest_facts_snapshot(agent.id().as_str())?
         .and_then(|record| agent_facts_summary(&record.body));
-    Ok(agent_to_response(agent, summary.as_ref()))
+    Ok(agent_to_response(
+        agent,
+        summary.as_ref(),
+        connected_agent_ids,
+    ))
 }
 
 fn agent_facts_summary(body: &str) -> Option<AgentFactsSummary> {
@@ -2402,13 +3272,19 @@ fn agent_system_time_ms_from_body(value: &serde_json::Value) -> Option<u64> {
         .and_then(serde_json::Value::as_u64)
 }
 
-fn agent_to_response(agent: &Agent, facts: Option<&AgentFactsSummary>) -> AgentResponse {
+fn agent_to_response(
+    agent: &Agent,
+    facts: Option<&AgentFactsSummary>,
+    connected_agent_ids: &std::collections::BTreeSet<String>,
+) -> AgentResponse {
     let last_seen_at = agent.last_seen_at();
     let revoked = agent.status() == AgentStatus::Disabled;
+    let connected = !revoked && connected_agent_ids.contains(agent.id().as_str());
     AgentResponse {
         id: agent.id().as_str().to_owned(),
         name: agent.name().as_str().to_owned(),
-        status: agent_status_for_inventory(agent.status()).to_owned(),
+        status: agent_status_for_inventory(agent.status(), connected, last_seen_at).to_owned(),
+        connected,
         revoked,
         fingerprint: agent.identity().fingerprint.as_str().to_owned(),
         labels: agent
@@ -2427,12 +3303,31 @@ fn agent_to_response(agent: &Agent, facts: Option<&AgentFactsSummary>) -> AgentR
     }
 }
 
-fn agent_status_for_inventory(status: AgentStatus) -> &'static str {
+fn agent_status_for_inventory(
+    status: AgentStatus,
+    connected: bool,
+    last_seen_at: Option<SystemTime>,
+) -> &'static str {
     if status == AgentStatus::Disabled {
         "offline"
+    } else if connected {
+        "online"
+    } else if recently_seen(last_seen_at) {
+        "reconnecting"
     } else {
         agent_status_to_str(status)
     }
+}
+
+fn recently_seen(last_seen_at: Option<SystemTime>) -> bool {
+    last_seen_at
+        .map(|last_seen_at| {
+            SystemTime::now()
+                .duration_since(last_seen_at)
+                .unwrap_or_default()
+                <= AGENT_RECENTLY_SEEN_AFTER
+        })
+        .unwrap_or(false)
 }
 
 fn system_time_age_seconds(value: SystemTime) -> u64 {
@@ -2917,9 +3812,45 @@ impl JobQueryRepository for ControllerJobQueryRepository<'_> {
                 command_program: record.command_program,
                 command_args: record.command_args,
                 target_count: record.target_count,
+                target_agents: record
+                    .target_agents
+                    .into_iter()
+                    .map(|target| fleet_application::JobTargetSummaryRecord {
+                        agent_id: target.agent_id,
+                        status: target.status,
+                    })
+                    .collect(),
                 created_at: record.created_at,
+                expires_at: record.expires_at,
             })
             .collect())
+    }
+
+    fn find_job_summary(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<fleet_application::JobSummaryRecord>, Self::Error> {
+        Ok(self
+            .store
+            .find_job_summary(job_id)?
+            .map(|record| fleet_application::JobSummaryRecord {
+                id: record.id,
+                status: record.status,
+                risk: record.risk,
+                command_program: record.command_program,
+                command_args: record.command_args,
+                target_count: record.target_count,
+                target_agents: record
+                    .target_agents
+                    .into_iter()
+                    .map(|target| fleet_application::JobTargetSummaryRecord {
+                        agent_id: target.agent_id,
+                        status: target.status,
+                    })
+                    .collect(),
+                created_at: record.created_at,
+                expires_at: record.expires_at,
+            }))
     }
 }
 
@@ -2966,6 +3897,36 @@ impl RunbookJobRepository for ControllerJobRepository<'_> {
         task: &fleet_domain::RunbookExecutionTask,
     ) -> Result<(), Self::Error> {
         self.store.save_runbook_job_record(&job, task)
+    }
+}
+
+impl DispatchAssignmentRepository for ControllerJobRepository<'_> {
+    type Error = fleet_store::StoreError;
+
+    fn list_pending_assignments(
+        &self,
+        agent_id: Option<&AgentId>,
+        job_id: Option<&JobId>,
+        limit: usize,
+    ) -> Result<Vec<PendingTaskAssignment>, Self::Error> {
+        self.store
+            .list_pending_dispatch_assignments(agent_id, job_id, limit)
+    }
+
+    fn find_dispatch_agent(&self, agent_id: &AgentId) -> Result<Option<Agent>, Self::Error> {
+        self.store.find_agent_by_id(agent_id.as_str())
+    }
+
+    fn mark_job_running(&mut self, job_id: &JobId, _now: SystemTime) -> Result<(), Self::Error> {
+        self.store
+            .update_job_status(job_id.as_str(), JobStatus::Running)?;
+        Ok(())
+    }
+
+    fn mark_job_expired(&mut self, job_id: &JobId, _now: SystemTime) -> Result<(), Self::Error> {
+        self.store
+            .update_job_status(job_id.as_str(), JobStatus::Expired)?;
+        Ok(())
     }
 }
 
@@ -3350,6 +4311,398 @@ mod tests {
     use std::io::{Read, Write};
 
     #[test]
+    fn session_registry_registers_gets_and_unregisters_session() {
+        let mut registry = AgentSessionRegistry::default();
+        let (handle, _receiver) = session_handle(
+            "agent-1",
+            "conn-1",
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+            vec!["persistent_session".to_owned()],
+            Some(64),
+        );
+
+        let outcome = registry.register(handle);
+
+        assert!(outcome.replaced.is_none());
+        assert!(registry.has_active_session("agent-1"));
+        let summary = registry.snapshot();
+        assert_eq!(summary.len(), 1);
+        assert_eq!(summary[0].agent_id, "agent-1");
+        assert_eq!(summary[0].connection_id, "conn-1");
+        assert_eq!(summary[0].connected_at_ms, 1000);
+        assert_eq!(summary[0].last_session_seen_at_ms, 1000);
+        assert_eq!(summary[0].capabilities, vec!["persistent_session"]);
+        assert_eq!(summary[0].queue_capacity, Some(64));
+
+        assert_eq!(
+            registry.unregister("agent-1", "conn-1", AgentSessionCloseReason::HandlerEnded),
+            Some(AgentSessionEnded {
+                agent_id: "agent-1".to_owned(),
+                connection_id: "conn-1".to_owned(),
+                close_reason: AgentSessionCloseReason::HandlerEnded,
+            })
+        );
+        assert!(!registry.has_active_session("agent-1"));
+    }
+
+    #[test]
+    fn session_registry_duplicate_session_uses_new_session_wins() {
+        let mut registry = AgentSessionRegistry::default();
+        let (old_handle, mut old_receiver) = session_handle(
+            "agent-1",
+            "conn-old",
+            SystemTime::UNIX_EPOCH,
+            Vec::new(),
+            None,
+        );
+        let (new_handle, _new_receiver) = session_handle(
+            "agent-1",
+            "conn-new",
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+            vec!["persistent_session".to_owned()],
+            None,
+        );
+        registry.register(old_handle);
+
+        let outcome = registry.register(new_handle);
+
+        assert_eq!(
+            outcome.replaced,
+            Some(AgentSessionReplacement {
+                agent_id: "agent-1".to_owned(),
+                old_connection_id: "conn-old".to_owned(),
+                new_connection_id: "conn-new".to_owned(),
+                close_reason: AgentSessionCloseReason::ReplacedByNewSession,
+            })
+        );
+        assert_eq!(
+            old_receiver.try_recv().unwrap(),
+            AgentSessionOutboundMessage::Close {
+                reason: AgentSessionCloseReason::ReplacedByNewSession,
+            }
+        );
+        assert_eq!(registry.get("agent-1").unwrap().connection_id(), "conn-new");
+    }
+
+    #[test]
+    fn duplicate_session_replacement_is_audited() {
+        let store = SqliteStore::in_memory().unwrap();
+        let replacement = AgentSessionReplacement {
+            agent_id: "agent-1".to_owned(),
+            old_connection_id: "conn-old".to_owned(),
+            new_connection_id: "conn-new".to_owned(),
+            close_reason: AgentSessionCloseReason::ReplacedByNewSession,
+        };
+
+        audit_agent_session_replaced(&store, &replacement).unwrap();
+        let audits = store
+            .list_audit_events_by_category(AuditCategory::Agent, 10)
+            .unwrap();
+
+        assert_eq!(audits.len(), 1);
+        assert_eq!(audits[0].action, "agent_session_replaced");
+        assert!(matches!(
+            &audits[0].value,
+            AuditValue::Plain(value)
+                if value.contains("old_connection_id=conn-old")
+                    && value.contains("new_connection_id=conn-new")
+                    && value.contains("close_reason=replaced_by_new_session")
+        ));
+    }
+
+    #[test]
+    fn session_started_and_ended_are_audited_with_close_reason() {
+        let store = SqliteStore::in_memory().unwrap();
+        let ended = AgentSessionEnded {
+            agent_id: "agent-1".to_owned(),
+            connection_id: "conn-1".to_owned(),
+            close_reason: AgentSessionCloseReason::HeartbeatTimeout,
+        };
+
+        audit_agent_session_started(&store, "agent-1", "conn-1").unwrap();
+        audit_agent_session_ended(&store, &ended).unwrap();
+        let audits = store
+            .list_audit_events_by_category(AuditCategory::Agent, 10)
+            .unwrap();
+
+        assert_eq!(audits.len(), 2);
+        assert!(
+            audits
+                .iter()
+                .any(|event| event.action == "agent_session_started")
+        );
+        assert!(matches!(
+            &audits
+                .iter()
+                .find(|event| event.action == "agent_session_ended")
+                .unwrap()
+                .value,
+            AuditValue::Plain(value)
+                if value.contains("connection_id=conn-1")
+                    && value.contains("close_reason=heartbeat_timeout")
+        ));
+    }
+
+    #[test]
+    fn session_registry_stale_unregister_does_not_remove_replacement() {
+        let mut registry = AgentSessionRegistry::default();
+        let (old_handle, _old_receiver) = session_handle(
+            "agent-1",
+            "conn-old",
+            SystemTime::UNIX_EPOCH,
+            Vec::new(),
+            None,
+        );
+        let (new_handle, _new_receiver) = session_handle(
+            "agent-1",
+            "conn-new",
+            SystemTime::UNIX_EPOCH,
+            Vec::new(),
+            None,
+        );
+        registry.register(old_handle);
+        registry.register(new_handle);
+
+        let removed =
+            registry.unregister("agent-1", "conn-old", AgentSessionCloseReason::HandlerEnded);
+
+        assert!(removed.is_none());
+        assert_eq!(registry.get("agent-1").unwrap().connection_id(), "conn-new");
+    }
+
+    #[test]
+    fn session_registry_close_removes_revoked_agent_session() {
+        let mut registry = AgentSessionRegistry::default();
+        let (handle, mut receiver) = session_handle(
+            "agent-1",
+            "conn-1",
+            SystemTime::UNIX_EPOCH,
+            Vec::new(),
+            None,
+        );
+        registry.register(handle);
+
+        let ended = registry.close("agent-1", AgentSessionCloseReason::Revoked);
+
+        assert_eq!(
+            ended,
+            Some(AgentSessionEnded {
+                agent_id: "agent-1".to_owned(),
+                connection_id: "conn-1".to_owned(),
+                close_reason: AgentSessionCloseReason::Revoked,
+            })
+        );
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            AgentSessionOutboundMessage::Close {
+                reason: AgentSessionCloseReason::Revoked,
+            }
+        );
+        assert!(registry.snapshot().is_empty());
+    }
+
+    #[test]
+    fn session_registry_snapshot_order_is_deterministic() {
+        let mut registry = AgentSessionRegistry::default();
+        let (agent_b, _receiver_b) = session_handle(
+            "agent-b",
+            "conn-b",
+            SystemTime::UNIX_EPOCH,
+            Vec::new(),
+            None,
+        );
+        let (agent_a, _receiver_a) = session_handle(
+            "agent-a",
+            "conn-a",
+            SystemTime::UNIX_EPOCH,
+            Vec::new(),
+            None,
+        );
+        registry.register(agent_b);
+        registry.register(agent_a);
+
+        let agent_ids = registry
+            .snapshot()
+            .into_iter()
+            .map(|summary| summary.agent_id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(agent_ids, vec!["agent-a", "agent-b"]);
+    }
+
+    #[test]
+    fn session_registry_mark_seen_ignores_connection_id_mismatch() {
+        let mut registry = AgentSessionRegistry::default();
+        let (handle, _receiver) = session_handle(
+            "agent-1",
+            "conn-1",
+            SystemTime::UNIX_EPOCH,
+            Vec::new(),
+            None,
+        );
+        registry.register(handle);
+
+        assert!(!registry.mark_seen(
+            "agent-1",
+            "conn-stale",
+            SystemTime::UNIX_EPOCH + Duration::from_secs(10)
+        ));
+        assert!(registry.mark_seen(
+            "agent-1",
+            "conn-1",
+            SystemTime::UNIX_EPOCH + Duration::from_secs(11)
+        ));
+
+        assert_eq!(registry.snapshot()[0].last_session_seen_at_ms, 11000);
+    }
+
+    #[test]
+    fn websocket_session_outbound_channel_delivers_task_assignment() {
+        let mut registry = AgentSessionRegistry::default();
+        let (handle, mut receiver) = session_handle(
+            "agent-1",
+            "conn-1",
+            SystemTime::UNIX_EPOCH,
+            vec!["split_writer".to_owned()],
+            Some(2),
+        );
+        registry.register(handle);
+        let message = task_assignment_wire_message("agent-1");
+
+        registry.try_send("agent-1", message.clone()).unwrap();
+
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            AgentSessionOutboundMessage::Wire(Box::new(message))
+        );
+    }
+
+    #[test]
+    fn websocket_session_outbound_channel_overflow_is_reported() {
+        let mut registry = AgentSessionRegistry::default();
+        let (handle, _receiver) = session_handle(
+            "agent-1",
+            "conn-1",
+            SystemTime::UNIX_EPOCH,
+            vec!["split_writer".to_owned()],
+            Some(1),
+        );
+        registry.register(handle);
+
+        registry
+            .try_send("agent-1", task_assignment_wire_message("agent-1"))
+            .unwrap();
+        let result = registry.try_send("agent-1", task_assignment_wire_message("agent-1"));
+
+        assert_eq!(result, Err(AgentSessionSendError::QueueFull));
+        let summary = registry.snapshot();
+        assert_eq!(summary[0].queue_capacity, Some(1));
+        assert_eq!(summary[0].queue_depth, 1);
+    }
+
+    #[test]
+    fn websocket_session_write_failure_cleanup_removes_matching_session() {
+        let mut registry = AgentSessionRegistry::default();
+        let (handle, _receiver) = session_handle(
+            "agent-1",
+            "conn-1",
+            SystemTime::UNIX_EPOCH,
+            Vec::new(),
+            None,
+        );
+        registry.register(handle);
+
+        let ended = registry.unregister("agent-1", "conn-1", AgentSessionCloseReason::WriteFailure);
+
+        assert_eq!(
+            ended,
+            Some(AgentSessionEnded {
+                agent_id: "agent-1".to_owned(),
+                connection_id: "conn-1".to_owned(),
+                close_reason: AgentSessionCloseReason::WriteFailure,
+            })
+        );
+        assert!(!registry.has_active_session("agent-1"));
+    }
+
+    #[test]
+    fn session_read_failures_map_to_bounded_close_reasons() {
+        assert_eq!(
+            close_reason_from_session_read_result(&Err(ControllerError::Store(
+                fleet_store::StoreError::Domain("slow store write".to_owned()),
+            ))),
+            AgentSessionCloseReason::StoreError
+        );
+        assert_eq!(
+            close_reason_from_session_read_result(&Err(ControllerError::Json(
+                "agent session outbound queue is full".to_owned(),
+            ))),
+            AgentSessionCloseReason::WriteQueueOverflow
+        );
+        assert_eq!(
+            close_reason_from_session_read_result(&Err(ControllerError::Protocol(
+                fleet_protocol::ProtocolError::Json(
+                    "duplicate output chunk body mismatch".to_owned()
+                ),
+            ))),
+            AgentSessionCloseReason::ProtocolError
+        );
+        assert_eq!(
+            close_reason_from_session_read_result(&Ok(AgentSessionCloseReason::NormalShutdown)),
+            AgentSessionCloseReason::NormalShutdown
+        );
+    }
+
+    #[test]
+    fn agent_disconnect_does_not_fail_running_job_without_task_result() {
+        let store = SqliteStore::in_memory().unwrap();
+        save_test_agent(&store, "agent-1");
+        save_test_job(&store, "job-1");
+        store
+            .update_job_status("job-1", JobStatus::Running)
+            .unwrap();
+        let ended = AgentSessionEnded {
+            agent_id: "agent-1".to_owned(),
+            connection_id: "conn-1".to_owned(),
+            close_reason: AgentSessionCloseReason::NormalShutdown,
+        };
+
+        audit_agent_session_ended(&store, &ended).unwrap();
+
+        assert_eq!(
+            store.find_job_status_value("job-1").unwrap().unwrap(),
+            "running"
+        );
+    }
+
+    #[test]
+    fn websocket_agent_id_mismatch_payload_is_security_audit() {
+        let store = SqliteStore::in_memory().unwrap();
+        save_test_agent(&store, "agent-1");
+        let message = fleet_protocol::WireMessage::new(
+            "msg-facts",
+            "corr-facts",
+            Some("agent-2".to_owned()),
+            1,
+            fleet_protocol::WirePayload::FactsSnapshot {
+                agent_id: "agent-2".to_owned(),
+                body: "{\"os\":\"linux\"}".to_owned(),
+            },
+        );
+
+        let finished = handle_agent_task_data_message(&store, "agent-1", message).unwrap();
+        let audits = store
+            .list_audit_events_by_category(AuditCategory::Security, 10)
+            .unwrap();
+        let latest_facts = store.latest_facts_snapshot("agent-1").unwrap();
+
+        assert!(!finished);
+        assert!(latest_facts.is_none());
+        assert_eq!(audits.len(), 1);
+        assert_eq!(audits[0].action, "websocket_facts_agent_mismatch");
+    }
+
+    #[test]
     fn health_endpoint_is_public() {
         let store = SqliteStore::in_memory().unwrap();
         let response = route_request("GET /healthz HTTP/1.1\r\n\r\n", &store).unwrap();
@@ -3644,6 +4997,309 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_created_command_job_to_active_session_immediately() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .insert_admin_token_hash(&hash_token("admin-token"))
+            .unwrap();
+        save_test_agent(&store, "agent-1");
+        let (handle, mut receiver) = session_handle(
+            "agent-1",
+            "conn-1",
+            SystemTime::UNIX_EPOCH,
+            vec!["persistent_session".to_owned()],
+            Some(64),
+        );
+        let sessions = Arc::new(Mutex::new(AgentSessionRegistry::default()));
+        sessions.lock().unwrap().register(handle);
+        let request = command_job_request("job-1", "agent-1", true);
+
+        let response = route_request_with_sessions(&request, &store, &sessions).unwrap();
+        let sent = receiver
+            .try_recv()
+            .expect("task assignment should be queued");
+        let status = store.find_job_status_value("job-1").unwrap().unwrap();
+        let audits = store
+            .list_audit_events_by_category(AuditCategory::Job, 10)
+            .unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 201"));
+        assert!(matches!(
+            sent,
+            AgentSessionOutboundMessage::Wire(message)
+                if matches!(&message.payload, fleet_protocol::WirePayload::TaskAssignment { .. })
+        ));
+        assert_eq!(status, "running");
+        assert!(audits.iter().any(|event| event.action == "job_created"));
+        assert!(audits.iter().any(|event| event.action == "task_dispatched"));
+    }
+
+    #[test]
+    fn dispatch_created_runbook_and_drift_jobs_use_active_session_service() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .insert_admin_token_hash(&hash_token("admin-token"))
+            .unwrap();
+        save_test_agent(&store, "agent-runbook");
+        save_test_agent(&store, "agent-drift");
+        let (runbook_handle, mut runbook_receiver) = session_handle(
+            "agent-runbook",
+            "conn-runbook",
+            SystemTime::UNIX_EPOCH,
+            vec!["persistent_session".to_owned()],
+            Some(64),
+        );
+        let (drift_handle, mut drift_receiver) = session_handle(
+            "agent-drift",
+            "conn-drift",
+            SystemTime::UNIX_EPOCH,
+            vec!["persistent_session".to_owned()],
+            Some(64),
+        );
+        let sessions = Arc::new(Mutex::new(AgentSessionRegistry::default()));
+        {
+            let mut registry = sessions.lock().unwrap();
+            registry.register(runbook_handle);
+            registry.register(drift_handle);
+        }
+
+        let runbook_response = route_request_with_sessions(
+            &runbook_job_request("job-runbook", "agent-runbook"),
+            &store,
+            &sessions,
+        )
+        .unwrap();
+        let drift_response = route_request_with_sessions(
+            &drift_check_job_request("job-drift", "agent-drift"),
+            &store,
+            &sessions,
+        )
+        .unwrap();
+
+        assert!(runbook_response.starts_with("HTTP/1.1 201"));
+        assert!(drift_response.starts_with("HTTP/1.1 201"));
+        assert!(matches!(
+            runbook_receiver.try_recv().unwrap(),
+            AgentSessionOutboundMessage::Wire(message)
+                if matches!(
+                    &message.payload,
+                    fleet_protocol::WirePayload::TaskAssignment {
+                        task: fleet_protocol::TaskWire::RunbookExecution(_),
+                        ..
+                    }
+                )
+        ));
+        assert!(matches!(
+            drift_receiver.try_recv().unwrap(),
+            AgentSessionOutboundMessage::Wire(message)
+                if matches!(
+                    &message.payload,
+                    fleet_protocol::WirePayload::TaskAssignment {
+                        task: fleet_protocol::TaskWire::DriftCheck(_),
+                        ..
+                    }
+                )
+        ));
+        assert_eq!(
+            store.find_job_status_value("job-runbook").unwrap().unwrap(),
+            "running"
+        );
+        assert_eq!(
+            store.find_job_status_value("job-drift").unwrap().unwrap(),
+            "running"
+        );
+    }
+
+    #[test]
+    fn dispatch_created_command_job_keeps_disconnected_agent_queued() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .insert_admin_token_hash(&hash_token("admin-token"))
+            .unwrap();
+        save_test_agent(&store, "agent-1");
+        let sessions = Arc::new(Mutex::new(AgentSessionRegistry::default()));
+        let request = command_job_request("job-queued", "agent-1", true);
+
+        let response = route_request_with_sessions(&request, &store, &sessions).unwrap();
+        let status = store.find_job_status_value("job-queued").unwrap().unwrap();
+        let pending = store
+            .list_pending_dispatch_assignments(
+                Some(&AgentId::new("agent-1").unwrap()),
+                Some(&JobId::new("job-queued").unwrap()),
+                10,
+            )
+            .unwrap();
+        let audits = store
+            .list_audit_events_by_category(AuditCategory::Job, 10)
+            .unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 201"));
+        assert_eq!(status, "queued");
+        assert_eq!(pending.len(), 1);
+        assert!(!audits.iter().any(|event| event.action == "task_dispatched"));
+    }
+
+    #[test]
+    fn dispatch_failure_keeps_assignment_queued_and_audits() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .insert_admin_token_hash(&hash_token("admin-token"))
+            .unwrap();
+        save_test_agent(&store, "agent-1");
+        let (handle, _receiver) = session_handle(
+            "agent-1",
+            "conn-1",
+            SystemTime::UNIX_EPOCH,
+            vec!["persistent_session".to_owned()],
+            Some(1),
+        );
+        let sessions = Arc::new(Mutex::new(AgentSessionRegistry::default()));
+        {
+            let mut registry = sessions.lock().unwrap();
+            registry.register(handle);
+            registry
+                .try_send("agent-1", task_assignment_wire_message("agent-1"))
+                .unwrap();
+        }
+        let request = command_job_request("job-fail-dispatch", "agent-1", true);
+
+        let response = route_request_with_sessions(&request, &store, &sessions).unwrap();
+        let status = store
+            .find_job_status_value("job-fail-dispatch")
+            .unwrap()
+            .unwrap();
+        let pending = store
+            .list_pending_dispatch_assignments(
+                Some(&AgentId::new("agent-1").unwrap()),
+                Some(&JobId::new("job-fail-dispatch").unwrap()),
+                10,
+            )
+            .unwrap();
+        let audits = store
+            .list_audit_events_by_category(AuditCategory::Job, 10)
+            .unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 201"));
+        assert_eq!(status, "queued");
+        assert_eq!(pending.len(), 1);
+        assert!(audits.iter().any(|event| {
+            event.action == "task_dispatch_failed"
+                && matches!(&event.value, AuditValue::Plain(value) if value.contains("failure_reason="))
+        }));
+    }
+
+    #[test]
+    fn dispatch_reconnect_drains_one_queued_assignment_for_agent() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .insert_admin_token_hash(&hash_token("admin-token"))
+            .unwrap();
+        save_test_agent(&store, "agent-1");
+        route_request(
+            &command_job_request("job-reconnect", "agent-1", true),
+            &store,
+        )
+        .unwrap();
+        let (handle, mut receiver) = session_handle(
+            "agent-1",
+            "conn-1",
+            SystemTime::UNIX_EPOCH,
+            vec!["persistent_session".to_owned()],
+            Some(64),
+        );
+        let sessions = Arc::new(Mutex::new(AgentSessionRegistry::default()));
+        sessions.lock().unwrap().register(handle);
+
+        let output = dispatch_pending_assignments(
+            &store,
+            &sessions,
+            Some(AgentId::new("agent-1").unwrap()),
+            None,
+            1,
+        )
+        .unwrap();
+        let sent = receiver.try_recv().expect("queued assignment should drain");
+
+        assert_eq!(output.dispatched_count, 1);
+        assert!(matches!(
+            sent,
+            AgentSessionOutboundMessage::Wire(message)
+                if matches!(&message.payload, fleet_protocol::WirePayload::TaskAssignment { .. })
+        ));
+        assert_eq!(
+            store
+                .find_job_status_value("job-reconnect")
+                .unwrap()
+                .unwrap(),
+            "running"
+        );
+    }
+
+    #[test]
+    fn dispatch_skips_revoked_agent_even_with_active_session() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .insert_admin_token_hash(&hash_token("admin-token"))
+            .unwrap();
+        save_disabled_test_agent_with_labels(&store, "agent-revoked", vec![("role", "web")]);
+        let (handle, mut receiver) = session_handle(
+            "agent-revoked",
+            "conn-1",
+            SystemTime::UNIX_EPOCH,
+            vec!["persistent_session".to_owned()],
+            Some(64),
+        );
+        let sessions = Arc::new(Mutex::new(AgentSessionRegistry::default()));
+        sessions.lock().unwrap().register(handle);
+        let request = command_job_request("job-revoked", "agent-revoked", true);
+
+        let response = route_request_with_sessions(&request, &store, &sessions).unwrap();
+        let output = receiver.try_recv();
+
+        assert!(response.starts_with("HTTP/1.1 201"));
+        assert!(output.is_err());
+        assert_eq!(
+            store.find_job_status_value("job-revoked").unwrap().unwrap(),
+            "queued"
+        );
+    }
+
+    #[test]
+    fn dispatch_does_not_bypass_high_risk_confirmation() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .insert_admin_token_hash(&hash_token("admin-token"))
+            .unwrap();
+        save_test_agent(&store, "agent-1");
+        let (handle, mut receiver) = session_handle(
+            "agent-1",
+            "conn-1",
+            SystemTime::UNIX_EPOCH,
+            vec!["persistent_session".to_owned()],
+            Some(64),
+        );
+        let sessions = Arc::new(Mutex::new(AgentSessionRegistry::default()));
+        sessions.lock().unwrap().register(handle);
+
+        let response = route_request_with_sessions(
+            &command_job_request("job-needs-confirmation", "agent-1", false),
+            &store,
+            &sessions,
+        )
+        .unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 400"));
+        assert!(response.contains("high-risk task requires approval"));
+        assert!(receiver.try_recv().is_err());
+        assert!(
+            store
+                .find_job_status_value("job-needs-confirmation")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn admin_can_create_runbook_job_with_signed_assignment() {
         let store = SqliteStore::in_memory().unwrap();
         store
@@ -3911,6 +5567,87 @@ spec:
     }
 
     #[test]
+    fn duplicate_output_chunk_with_same_body_is_idempotent_at_controller_boundary() {
+        let store = SqliteStore::in_memory().unwrap();
+        save_test_agent(&store, "agent-1");
+        save_test_job(&store, "job-1");
+        let message = fleet_protocol::WireMessage::new(
+            "msg-output",
+            "corr-output",
+            Some("agent-1".to_owned()),
+            1,
+            fleet_protocol::WirePayload::OutputChunk {
+                job_id: "job-1".to_owned(),
+                task_id: "task-1".to_owned(),
+                stream: fleet_protocol::OutputStream::Stdout,
+                sequence: 0,
+                data: "ok".to_owned(),
+            },
+        );
+
+        handle_agent_task_data_message(&store, "agent-1", message.clone()).unwrap();
+        let finished = handle_agent_task_data_message(&store, "agent-1", message).unwrap();
+        let chunks = store.list_job_output_chunks("job-1", "agent-1").unwrap();
+
+        assert!(!finished);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].body, "ok");
+    }
+
+    #[test]
+    fn duplicate_output_chunk_body_mismatch_is_audited_as_protocol_conflict() {
+        let store = SqliteStore::in_memory().unwrap();
+        save_test_agent(&store, "agent-1");
+        save_test_job(&store, "job-1");
+        let first = fleet_protocol::WireMessage::new(
+            "msg-output-1",
+            "corr-output",
+            Some("agent-1".to_owned()),
+            1,
+            fleet_protocol::WirePayload::OutputChunk {
+                job_id: "job-1".to_owned(),
+                task_id: "task-1".to_owned(),
+                stream: fleet_protocol::OutputStream::Stdout,
+                sequence: 0,
+                data: "ok".to_owned(),
+            },
+        );
+        let conflicting = fleet_protocol::WireMessage::new(
+            "msg-output-2",
+            "corr-output",
+            Some("agent-1".to_owned()),
+            2,
+            fleet_protocol::WirePayload::OutputChunk {
+                job_id: "job-1".to_owned(),
+                task_id: "task-1".to_owned(),
+                stream: fleet_protocol::OutputStream::Stdout,
+                sequence: 0,
+                data: "changed".to_owned(),
+            },
+        );
+
+        handle_agent_task_data_message(&store, "agent-1", first).unwrap();
+        let result = handle_agent_task_data_message(&store, "agent-1", conflicting);
+        let chunks = store.list_job_output_chunks("job-1", "agent-1").unwrap();
+        let audits = store
+            .list_audit_events_by_category(AuditCategory::Security, 10)
+            .unwrap();
+
+        assert!(matches!(result, Err(ControllerError::Protocol(_))));
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].body, "ok");
+        assert!(audits.iter().any(|event| {
+            event.action == "websocket_output_chunk_conflict"
+                && matches!(&event.value, AuditValue::Plain(value)
+                    if value.contains("job_id=job-1")
+                        && value.contains("stream=stdout")
+                        && value.contains("sequence=0")
+                        && value.contains("reason=duplicate_body_mismatch")
+                        && !value.contains("changed"))
+        }));
+    }
+
+    #[test]
     fn admin_can_poll_job_output_chunks() {
         let store = SqliteStore::in_memory().unwrap();
         store
@@ -3958,6 +5695,49 @@ spec:
                 SystemTime::now(),
             )
             .unwrap();
+        let (handle, _receiver) = session_handle(
+            "agent-1",
+            "conn-1",
+            SystemTime::now(),
+            vec!["persistent_session".to_owned()],
+            Some(64),
+        );
+        let sessions = Arc::new(Mutex::new(AgentSessionRegistry::default()));
+        sessions.lock().unwrap().register(handle);
+
+        let response = route_request_with_sessions(
+            "GET /api/agents HTTP/1.1\r\nAuthorization: Bearer admin-token\r\n\r\n",
+            &store,
+            &sessions,
+        )
+        .unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 200"));
+        assert!(response.contains("\"id\":\"agent-1\""));
+        assert!(response.contains("\"name\":\"agent-1\""));
+        assert!(response.contains("\"status\":\"online\""));
+        assert!(response.contains("\"connected\":true"));
+        assert!(response.contains("\"revoked\":false"));
+        assert!(response.contains("\"fingerprint\""));
+        assert!(response.contains("\"hostname\":\"web-01\""));
+        assert!(response.contains("\"os\":\"linux\""));
+        assert!(response.contains("\"arch\":\"x86_64\""));
+        assert!(response.contains("\"last_seen_age_seconds\""));
+    }
+
+    #[test]
+    fn admin_agent_inventory_reports_recent_disconnected_agents_as_reconnecting() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .insert_admin_token_hash(&hash_token("admin-token"))
+            .unwrap();
+        save_test_agent(&store, "agent-reconnecting");
+        store
+            .mark_agent_online(
+                "agent-reconnecting",
+                SystemTime::now() - Duration::from_secs(5),
+            )
+            .unwrap();
 
         let response = route_request(
             "GET /api/agents HTTP/1.1\r\nAuthorization: Bearer admin-token\r\n\r\n",
@@ -3966,15 +5746,10 @@ spec:
         .unwrap();
 
         assert!(response.starts_with("HTTP/1.1 200"));
-        assert!(response.contains("\"id\":\"agent-1\""));
-        assert!(response.contains("\"name\":\"agent-1\""));
-        assert!(response.contains("\"status\":\"online\""));
+        assert!(response.contains("\"id\":\"agent-reconnecting\""));
+        assert!(response.contains("\"status\":\"reconnecting\""));
+        assert!(response.contains("\"connected\":false"));
         assert!(response.contains("\"revoked\":false"));
-        assert!(response.contains("\"fingerprint\""));
-        assert!(response.contains("\"hostname\":\"web-01\""));
-        assert!(response.contains("\"os\":\"linux\""));
-        assert!(response.contains("\"arch\":\"x86_64\""));
-        assert!(response.contains("\"last_seen_age_seconds\""));
     }
 
     #[test]
@@ -3994,6 +5769,7 @@ spec:
         assert!(response.starts_with("HTTP/1.1 200"));
         assert!(response.contains("\"id\":\"agent-revoked\""));
         assert!(response.contains("\"status\":\"offline\""));
+        assert!(response.contains("\"connected\":false"));
         assert!(response.contains("\"revoked\":true"));
     }
 
@@ -4031,6 +5807,55 @@ spec:
         );
         assert_eq!(audits.len(), 1);
         assert_eq!(audits[0].action, "agent_key_revoked");
+    }
+
+    #[test]
+    fn revoke_agent_key_closes_active_session_and_audits_reason() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .insert_admin_token_hash(&hash_token("admin-token"))
+            .unwrap();
+        save_test_agent(&store, "agent-1");
+        store
+            .mark_agent_online("agent-1", SystemTime::now())
+            .unwrap();
+        let (handle, mut receiver) = session_handle(
+            "agent-1",
+            "conn-1",
+            SystemTime::now(),
+            vec!["persistent_session".to_owned()],
+            Some(64),
+        );
+        let sessions = Arc::new(Mutex::new(AgentSessionRegistry::default()));
+        sessions.lock().unwrap().register(handle);
+
+        let response = route_request_with_sessions(
+            "POST /api/agents/agent-1/revoke-key HTTP/1.1\r\nAuthorization: Bearer admin-token\r\n\r\n",
+            &store,
+            &sessions,
+        )
+        .unwrap();
+        let audits = store
+            .list_audit_events_by_category(AuditCategory::Agent, 10)
+            .unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 200"));
+        assert!(response.contains("\"status\":\"offline\""));
+        assert!(response.contains("\"connected\":false"));
+        assert!(response.contains("\"revoked\":true"));
+        assert!(!sessions.lock().unwrap().has_active_session("agent-1"));
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            AgentSessionOutboundMessage::Close {
+                reason: AgentSessionCloseReason::Revoked,
+            }
+        );
+        assert!(
+            audits
+                .iter()
+                .any(|event| event.action == "agent_session_revoked_closed"
+                    && matches!(&event.value, AuditValue::Plain(value) if value.contains("close_reason=agent_revoked")))
+        );
     }
 
     #[test]
@@ -4206,7 +6031,7 @@ spec:
             .list_audit_events_by_category(AuditCategory::Job, 10)
             .unwrap();
 
-        assert!(finished);
+        assert!(!finished);
         assert_eq!(status, "success");
         assert_eq!(audits[0].action, "job_completed");
     }
@@ -4231,7 +6056,7 @@ spec:
             .list_audit_events_by_category(AuditCategory::Security, 10)
             .unwrap();
 
-        assert!(finished);
+        assert!(!finished);
         assert_eq!(audits.len(), 1);
         assert_eq!(audits[0].action, "task_verification_failed");
         assert!(!audits[0].contains_secret_plaintext());
@@ -4731,11 +6556,91 @@ spec:
             &store,
         )
         .unwrap();
+        let jobs: serde_json::Value =
+            serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        let job = &jobs[0];
 
         assert!(response.starts_with("HTTP/1.1 200"));
-        assert!(response.contains("\"id\":\"job-history-1\""));
-        assert!(response.contains("\"command_program\":\"uptime\""));
-        assert!(response.contains("\"target_count\":1"));
+        assert_eq!(job["id"], "job-history-1");
+        assert_eq!(job["status"], "queued");
+        assert_eq!(job["dispatch_state"], "queued");
+        assert_eq!(job["command_program"], "uptime");
+        assert_eq!(job["target_count"], 1);
+        assert_eq!(job["target_agent_ids"], serde_json::json!(["agent-1"]));
+        assert_eq!(job["target_agents"][0]["agent_id"], "agent-1");
+        assert_eq!(job["target_agents"][0]["connected"], false);
+        assert!(job["expires_at_ms"].as_u64().is_some());
+    }
+
+    #[test]
+    fn job_detail_api_includes_dispatch_and_connected_target_state() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .insert_admin_token_hash(&hash_token("admin-token"))
+            .unwrap();
+        save_test_agent(&store, "agent-1");
+        let (handle, _receiver) = session_handle(
+            "agent-1",
+            "conn-1",
+            SystemTime::UNIX_EPOCH,
+            vec!["persistent_session".to_owned()],
+            Some(64),
+        );
+        let sessions = Arc::new(Mutex::new(AgentSessionRegistry::default()));
+        sessions.lock().unwrap().register(handle);
+        route_request_with_sessions(
+            &command_job_request("job-detail-1", "agent-1", true),
+            &store,
+            &sessions,
+        )
+        .unwrap();
+
+        let response = route_request_with_sessions(
+            "GET /api/jobs/job-detail-1 HTTP/1.1\r\nAuthorization: Bearer admin-token\r\n\r\n",
+            &store,
+            &sessions,
+        )
+        .unwrap();
+        let job: serde_json::Value =
+            serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 200"));
+        assert_eq!(job["id"], "job-detail-1");
+        assert_eq!(job["status"], "running");
+        assert_eq!(job["dispatch_state"], "delivered");
+        assert_eq!(job["target_connected"], true);
+        assert_eq!(job["target_agents"][0]["connected"], true);
+        assert_eq!(job["target_agents"][0]["status"], "online");
+        assert_eq!(job["last_error"], "");
+    }
+
+    #[test]
+    fn job_status_transition_response_separates_status_and_dispatch_state() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .insert_admin_token_hash(&hash_token("admin-token"))
+            .unwrap();
+        save_test_agent(&store, "agent-1");
+        route_request(
+            &command_job_request("job-status-1", "agent-1", true),
+            &store,
+        )
+        .unwrap();
+        store
+            .update_job_status("job-status-1", JobStatus::Expired)
+            .unwrap();
+
+        let response = route_request(
+            "GET /api/jobs/job-status-1 HTTP/1.1\r\nAuthorization: Bearer admin-token\r\n\r\n",
+            &store,
+        )
+        .unwrap();
+        let job: serde_json::Value =
+            serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+
+        assert_eq!(job["status"], "expired");
+        assert_eq!(job["dispatch_state"], "expired");
+        assert_eq!(job["target_connected"], false);
     }
 
     #[test]
@@ -5377,6 +7282,25 @@ spec:
         );
     }
 
+    #[test]
+    fn revoked_agent_reconnect_is_rejected_and_audited_as_auth_failed() {
+        let store = SqliteStore::in_memory().unwrap();
+        save_disabled_test_agent_with_labels(&store, "agent-revoked", vec![("role", "web")]);
+
+        let result = validate_agent_ws_hello(&store, "agent-revoked", "fingerprint").unwrap();
+        let audits = store
+            .list_audit_events_by_category(AuditCategory::Security, 10)
+            .unwrap();
+
+        assert!(result.is_none());
+        assert_eq!(audits.len(), 1);
+        assert_eq!(audits[0].action, "agent_session_auth_failed");
+        assert!(matches!(
+            &audits[0].value,
+            AuditValue::Plain(value) if value.contains("reason=revoked")
+        ));
+    }
+
     fn agent_fixture(id: &str, name: &str, public_key: &str, fingerprint: &str) -> Agent {
         Agent::new(
             AgentId::new(id).unwrap(),
@@ -5385,6 +7309,109 @@ spec:
                 public_key: AgentPublicKey::new(public_key).unwrap(),
                 fingerprint: AgentFingerprint::new(fingerprint).unwrap(),
             },
+        )
+    }
+
+    fn route_request_with_sessions(
+        request: &str,
+        store: &SqliteStore,
+        sessions: &Arc<Mutex<AgentSessionRegistry>>,
+    ) -> Result<String, ControllerError> {
+        route_request_with_identity_and_sessions(
+            request,
+            store,
+            &ControllerIdentity::dev_insecure(),
+            &ControllerRuntimeMetadata::default(),
+            Some(sessions),
+        )
+    }
+
+    fn command_job_request(job_id: &str, agent_id: &str, confirmed_high_risk: bool) -> String {
+        let body = serde_json::to_string(&CreateCommandJobRequest {
+            job_id: job_id.to_owned(),
+            target_agent_ids: vec![agent_id.to_owned()],
+            selector: None,
+            program: "uptime".to_owned(),
+            args: Vec::new(),
+            timeout_seconds: 30,
+            confirmed_high_risk,
+            confirmed_by: "operator-1".to_owned(),
+            expires_in_seconds: 60,
+            nonce_prefix: Some(format!("nonce-{job_id}")),
+        })
+        .unwrap();
+        format!(
+            "POST /api/jobs/command HTTP/1.1\r\nAuthorization: Bearer admin-token\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    }
+
+    fn runbook_job_request(job_id: &str, agent_id: &str) -> String {
+        let body = serde_json::to_string(&CreateRunbookJobRequest {
+            job_id: job_id.to_owned(),
+            target_agent_ids: vec![agent_id.to_owned()],
+            selector: None,
+            runbook_document: r#"
+apiVersion: fleet.sponzey.dev/v1alpha1
+kind: Runbook
+metadata:
+  name: task006-runbook
+spec:
+  targets:
+    selector: role=web
+  tasks:
+    - id: nginx-package
+      package:
+        name: nginx
+        state: present
+"#
+            .to_owned(),
+            timeout_seconds: 30,
+            confirmed_high_risk: true,
+            confirmed_by: "operator-1".to_owned(),
+            expires_in_seconds: 60,
+            nonce_prefix: Some(format!("nonce-{job_id}")),
+        })
+        .unwrap();
+        format!(
+            "POST /api/jobs/runbook HTTP/1.1\r\nAuthorization: Bearer admin-token\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    }
+
+    fn drift_check_job_request(job_id: &str, agent_id: &str) -> String {
+        let body = serde_json::to_string(&CreateDriftCheckJobRequest {
+            job_id: job_id.to_owned(),
+            target_agent_ids: vec![agent_id.to_owned()],
+            selector: None,
+            policy_document: r#"
+apiVersion: fleet.sponzey.dev/v1alpha1
+kind: Policy
+metadata:
+  name: task006-policy
+spec:
+  selector:
+    matchLabels:
+      role: web
+  checks:
+    - id: nginx-service
+      service:
+        name: nginx
+        state: running
+"#
+            .to_owned(),
+            timeout_seconds: 30,
+            created_by: "operator-1".to_owned(),
+            expires_in_seconds: 60,
+            nonce_prefix: Some(format!("nonce-{job_id}")),
+        })
+        .unwrap();
+        format!(
+            "POST /api/jobs/drift-check HTTP/1.1\r\nAuthorization: Bearer admin-token\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
         )
     }
 
@@ -5398,6 +7425,58 @@ spec:
                 &key_pair.fingerprint,
             ))
             .unwrap();
+    }
+
+    fn session_handle(
+        agent_id: &str,
+        connection_id: &str,
+        connected_at: SystemTime,
+        capabilities: Vec<String>,
+        queue_capacity: Option<usize>,
+    ) -> (
+        AgentSessionHandle,
+        mpsc::Receiver<AgentSessionOutboundMessage>,
+    ) {
+        let capacity = queue_capacity.unwrap_or(AGENT_SESSION_OUTBOUND_QUEUE_CAPACITY);
+        let (sender, receiver) = mpsc::channel(capacity);
+        (
+            AgentSessionHandle::new(
+                agent_id,
+                connection_id,
+                connected_at,
+                capabilities,
+                sender,
+                queue_capacity,
+            ),
+            receiver,
+        )
+    }
+
+    fn task_assignment_wire_message(agent_id: &str) -> fleet_protocol::WireMessage {
+        fleet_protocol::WireMessage::new(
+            "msg-task",
+            "corr-task",
+            Some(agent_id.to_owned()),
+            1,
+            fleet_protocol::WirePayload::TaskAssignment {
+                envelope: fleet_protocol::SignedTaskEnvelopeWire {
+                    job_id: "job-1".to_owned(),
+                    task_id: "task-1".to_owned(),
+                    target_agent_id: agent_id.to_owned(),
+                    issued_at_ms: 1,
+                    expires_at_ms: 60_000,
+                    nonce: "nonce-1".to_owned(),
+                    payload_hash: "hash".to_owned(),
+                    signature: "sig".to_owned(),
+                },
+                task: fleet_protocol::TaskWire::Command(fleet_protocol::CommandTaskWire {
+                    program: "uptime".to_owned(),
+                    args: Vec::new(),
+                    timeout_ms: 30_000,
+                    max_output_bytes: 1024,
+                }),
+            },
+        )
     }
 
     fn save_test_agent_with_labels(store: &SqliteStore, id: &str, labels: Vec<(&str, &str)>) {

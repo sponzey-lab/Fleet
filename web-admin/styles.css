@@ -228,6 +228,14 @@ button:disabled {
   color: #687385;
 }
 
+.job-status {
+  align-self: start;
+  display: inline-flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 4px;
+}
+
 .labels,
 .agent-meta {
   grid-column: 1 / -1;
@@ -246,16 +254,30 @@ button:disabled {
 
 .status-pill.online,
 .status-pill.compliant,
-.status-pill.agent {
+.status-pill.agent,
+.status-pill.completed,
+.status-pill.success {
   background: #e5f6ea;
   color: #176c37;
 }
 
 .status-pill.offline,
 .status-pill.drifted,
-.status-pill.security {
+.status-pill.security,
+.status-pill.failed,
+.status-pill.expired,
+.status-pill.rejected,
+.status-pill.canceled {
   background: #fbeaea;
   color: #9b1c1c;
+}
+
+.status-pill.created,
+.status-pill.queued,
+.status-pill.delivered,
+.status-pill.running {
+  background: #eef4ff;
+  color: #1f4f9f;
 }
 
 .snapshot,

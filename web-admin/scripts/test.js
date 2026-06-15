@@ -9,6 +9,7 @@ const appPath = join(root, "app.js");
 const clientPath = join(root, "api-client.js");
 const schemaPath = join(root, "api.schema.json");
 const tsconfigPath = join(root, "tsconfig.json");
+const openapiPath = join(root, "..", "docs", "openapi.json");
 
 function assert(condition, message) {
   if (!condition) {
@@ -16,11 +17,20 @@ function assert(condition, message) {
   }
 }
 
+function normalizeSchemaPath(path) {
+  return String(path).replaceAll(/\{[^}]+\}/g, "{param}");
+}
+
+function findCall(path, method = "GET") {
+  return calls.find((call) => call.path === path && (call.options.method || "GET") === method);
+}
+
 const index = readFileSync(indexPath, "utf8");
 const styles = readFileSync(stylesPath, "utf8");
 const app = readFileSync(appPath, "utf8");
 const schema = JSON.parse(readFileSync(schemaPath, "utf8"));
 const tsconfig = JSON.parse(readFileSync(tsconfigPath, "utf8"));
+const openapi = JSON.parse(readFileSync(openapiPath, "utf8"));
 
 assert(index.includes("Sponzey Fleet Admin"), "index must name the admin UI");
 assert(index.includes("id=\"agents-list\""), "index must expose the agents surface");
@@ -36,6 +46,7 @@ assert(index.includes("id=\"audit-list\""), "index must expose the audit surface
 assert(index.includes("id=\"run-command-form\""), "index must expose command execution");
 assert(index.includes('value="uptime"'), "run command form must default to a safe probe command");
 assert(index.includes("id=\"job-output\""), "index must expose job output");
+assert(index.includes("Run a command or select a job"), "job output placeholder must not look like a completed empty result");
 assert(index.includes("id=\"jobs-list\""), "index must expose job history");
 assert(index.includes("id=\"enrollment-token-form\""), "index must expose enrollment token creation");
 assert(index.includes("id=\"enrollment-tokens-list\""), "index must expose enrollment token summaries");
@@ -68,6 +79,7 @@ for (const endpoint of [
   "listDrift",
   "revokeAgentKey",
   "listJobs",
+  "getJob",
   "getJobOutput",
   "listAudit",
   "listEnrollmentTokens",
@@ -82,6 +94,16 @@ for (const endpoint of [
     `API schema must include ${endpoint}`,
   );
 }
+const openapiOperations = new Set();
+for (const [path, operations] of Object.entries(openapi.paths || {})) {
+  for (const method of Object.keys(operations || {})) {
+    openapiOperations.add(`${method.toUpperCase()} ${normalizeSchemaPath(path)}`);
+  }
+}
+for (const endpoint of schema.endpoints) {
+  const key = `${endpoint.method} ${normalizeSchemaPath(endpoint.path)}`;
+  assert(openapiOperations.has(key), `OpenAPI must document ${endpoint.method} ${endpoint.path}`);
+}
 
 const {
   renderAgents,
@@ -93,6 +115,13 @@ const {
   parseCommandArgs,
   buildCommandJobRequest,
   renderJobOutput,
+  renderJobOutputWaiting,
+  renderJobOutputEmpty,
+  renderJobOutputStatus,
+  renderJobOutputAfterPolling,
+  jobStatusMessage,
+  isTerminalJob,
+  pollJobOutputOnce,
   renderJobs,
   renderEnrollmentTokens,
   renderCreatedEnrollmentToken,
@@ -127,47 +156,74 @@ const client = createApiClient({
 await client.listAgents();
 await client.getLatestFacts("agent/1");
 await client.listFacts("agent/1", { limit: 25, before: "2:10" });
+await client.getLatestMetrics("agent/1");
 await client.listMetrics("agent/1", { limit: 10 });
+await client.getLatestDrift("agent/1");
 await client.listDrift("agent/1", { before: "2:9" });
 await client.revokeAgentKey("agent/1");
+await client.listJobs();
+await client.getJob("job/1");
+await client.getJobOutput("job/1");
+await client.listAudit();
 await client.listEnrollmentTokens();
 await client.createEnrollmentToken({ labels: "role=web", max_uses: 1, expires_in_seconds: 60 });
 await client.revokeEnrollmentToken("et/1");
 await client.createCommandJob({ job_id: "job-1" });
+await client.createDriftCheckJob({ job_id: "job-drift-1" });
 await client.createRunbookJob({ job_id: "job-runbook-1" });
-assert(calls[0].path === "/api/agents", "client must call agents endpoint");
+assert(findCall("/api/agents"), "client must call agents endpoint");
 assert(
-  calls[1].path === "/api/agents/agent%2F1/facts/latest",
+  findCall("/api/agents/agent%2F1/facts/latest"),
   "client must encode agent ids in paths",
 );
 assert(
-  calls[2].path === "/api/agents/agent%2F1/facts?limit=25&before=2%3A10",
+  findCall("/api/agents/agent%2F1/facts?limit=25&before=2%3A10"),
   "client must encode paged facts query",
 );
 assert(
-  calls[3].path === "/api/agents/agent%2F1/metrics?limit=10",
+  findCall("/api/agents/agent%2F1/metrics/latest"),
+  "client must encode latest metrics paths",
+);
+assert(
+  findCall("/api/agents/agent%2F1/metrics?limit=10"),
   "client must encode paged metrics query",
 );
 assert(
-  calls[4].path === "/api/agents/agent%2F1/drift?before=2%3A9",
+  findCall("/api/agents/agent%2F1/drift/latest"),
+  "client must encode latest drift paths",
+);
+assert(
+  findCall("/api/agents/agent%2F1/drift?before=2%3A9"),
   "client must encode paged drift query",
 );
 assert(
-  calls[5].path === "/api/agents/agent%2F1/revoke-key",
+  findCall("/api/agents/agent%2F1/revoke-key", "POST"),
   "client must encode agent ids in key revocation paths",
 );
-assert(calls[5].options.method === "POST", "client must POST agent key revocation");
-assert(calls[6].path === "/api/enrollment-tokens", "client must call token list endpoint");
-assert(calls[7].path === "/api/enrollment-tokens", "client must call token create endpoint");
-assert(calls[7].options.method === "POST", "client must POST token creation");
-assert(calls[8].path === "/api/enrollment-tokens/et%2F1", "client must encode token ids in paths");
-assert(calls[8].options.method === "DELETE", "client must DELETE token revocation");
-assert(calls[9].path === "/api/jobs/command", "client must call command job endpoint");
-assert(calls[9].options.method === "POST", "client must POST command jobs");
-assert(calls[10].path === "/api/jobs/runbook", "client must call runbook job endpoint");
-assert(calls[7].options.method === "POST", "client must POST runbook jobs");
 assert(
-  calls[6].options.headers.Authorization === "Bearer admin-token",
+  findCall("/api/agents/agent%2F1/revoke-key", "POST").options.method === "POST",
+  "client must POST agent key revocation",
+);
+assert(findCall("/api/jobs"), "client must call jobs list endpoint");
+assert(findCall("/api/jobs/job%2F1"), "client must call job detail endpoint");
+assert(findCall("/api/jobs/job%2F1/output"), "client must call job output endpoint");
+assert(findCall("/api/audit"), "client must call audit endpoint");
+assert(findCall("/api/enrollment-tokens"), "client must call token list endpoint");
+assert(findCall("/api/enrollment-tokens", "POST"), "client must call token create endpoint");
+assert(findCall("/api/enrollment-tokens", "POST").options.method === "POST", "client must POST token creation");
+assert(findCall("/api/enrollment-tokens/et%2F1", "DELETE"), "client must encode token ids in paths");
+assert(
+  findCall("/api/enrollment-tokens/et%2F1", "DELETE").options.method === "DELETE",
+  "client must DELETE token revocation",
+);
+assert(findCall("/api/jobs/command", "POST"), "client must call command job endpoint");
+assert(findCall("/api/jobs/command", "POST").options.method === "POST", "client must POST command jobs");
+assert(findCall("/api/jobs/drift-check", "POST"), "client must call drift check job endpoint");
+assert(findCall("/api/jobs/drift-check", "POST").options.method === "POST", "client must POST drift check jobs");
+assert(findCall("/api/jobs/runbook", "POST"), "client must call runbook job endpoint");
+assert(findCall("/api/jobs/runbook", "POST").options.method === "POST", "client must POST runbook jobs");
+assert(
+  findCall("/api/enrollment-tokens").options.headers.Authorization === "Bearer admin-token",
   "client must attach bearer token",
 );
 
@@ -231,6 +287,7 @@ const agentsHtml = renderAgents([
     status: "online",
     revoked: false,
     labels: [{ key: "role", value: "web" }],
+    connected: true,
     hostname: "web-01.local",
     os: "linux",
     arch: "x86_64",
@@ -240,6 +297,7 @@ const agentsHtml = renderAgents([
 assert(agentsHtml.includes("web-01"), "agents renderer must include agent name");
 assert(agentsHtml.includes("role=web"), "agents renderer must include labels");
 assert(agentsHtml.includes("linux/x86_64"), "agents renderer must include platform summary");
+assert(agentsHtml.includes("session connected"), "agents renderer must include session state");
 assert(agentsHtml.includes("last seen 5s ago"), "agents renderer must include last seen age");
 
 const revokedAgentHtml = renderAgents([
@@ -286,14 +344,23 @@ const factsInventoryHtml = renderFactsInventory({
     hostname: "agent-01",
     cpu: { logical_count: 8 },
     memory: { total_kb: 16 * 1024 * 1024, module_count_known: true, module_count: 2 },
-    disk: { root_total_kb: 100 * 1024 * 1024, root_filesystem: "/dev/root" },
+    disk: {
+      device_count: 2,
+      mount_count: 4,
+      root_total_kb: 100 * 1024 * 1024,
+      root_filesystem: "/dev/root",
+      root_fs_type: "ext4",
+    },
     network: { interfaces: ["lo", "eth0"] },
   },
 });
 assert(factsInventoryHtml.includes("Memory total"), "facts inventory must show static memory capacity");
 assert(factsInventoryHtml.includes("16.0 GiB"), "facts inventory must format memory capacity");
 assert(factsInventoryHtml.includes("Memory modules"), "facts inventory must show memory module count");
+assert(factsInventoryHtml.includes("Disk devices"), "facts inventory must show disk device count");
+assert(factsInventoryHtml.includes("Mounts"), "facts inventory must show mount count");
 assert(factsInventoryHtml.includes("Root disk total"), "facts inventory must show static disk capacity");
+assert(factsInventoryHtml.includes("Root FS type"), "facts inventory must show root filesystem type");
 assert(!factsInventoryHtml.includes("used_percent"), "facts inventory must not render usage fields");
 assert(formatKilobytes(1536) === "1.5 MiB", "kilobyte formatter must scale capacity values");
 assert(
@@ -356,10 +423,21 @@ const auditHtml = renderAudit([
 ]);
 assert(auditHtml.includes("invalid_signature"), "audit renderer must include event action");
 const jobsHtml = renderJobs([
-  { id: "job-1", status: "success", risk: "high", command_program: "uptime", command_args: ["-a"], target_count: 1 },
+  {
+    id: "job-1",
+    status: "running",
+    dispatch_state: "delivered",
+    risk: "high",
+    command_program: "uptime",
+    command_args: ["-a"],
+    target_count: 1,
+    target_agents: [{ agent_id: "agent-1", status: "online", connected: true, revoked: false }],
+  },
 ]);
 assert(jobsHtml.includes("job-1"), "job renderer must include job id");
 assert(jobsHtml.includes("uptime -a"), "job renderer must include command summary");
+assert(jobsHtml.includes("delivered"), "job renderer must include controller dispatch state");
+assert(jobsHtml.includes("1 target(s), 1 connected"), "job renderer must use API target connection state");
 const tokenRequest = buildEnrollmentTokenRequest({
   labels: "role=web",
   maxUses: "2",
@@ -419,11 +497,88 @@ try {
 }
 assert(confirmationFailed, "run command form must require high-risk confirmation");
 const output = renderJobOutput([
-  { agent_id: "agent-1", stream: "stdout", data: "ok\n" },
-  { agent_id: "agent-1", stream: "stderr", data: "warn\n" },
-]);
-assert(output.includes("[agent-1 stdout] ok"), "job output renderer must prefix stdout");
-assert(output.includes("[agent-1 stderr] warn"), "job output renderer must prefix stderr");
+  { agent_id: "agent-1", stream: "stdout", sequence: 0, data: "ok\n" },
+  { agent_id: "agent-1", stream: "stderr", sequence: 1, data: "warn\n" },
+], { jobId: "job-1", job: { status: "running", dispatch_state: "delivered" } });
+assert(output.includes("Job: job-1"), "job output renderer must show the selected job id");
+assert(output.includes("Dispatch: delivered"), "job output renderer must show dispatch state");
+assert(output.includes("Output chunks: 2"), "job output renderer must show chunk count");
+assert(output.includes("[agent-1 stdout #0]"), "job output renderer must prefix stdout with sequence");
+assert(output.includes("ok"), "job output renderer must include stdout body");
+assert(output.includes("[agent-1 stderr #1]"), "job output renderer must prefix stderr with sequence");
+assert(output.includes("warn"), "job output renderer must include stderr body");
+const waitingOutput = renderJobOutputWaiting({ jobId: "job-1", attempt: 2, maxAttempts: 10 });
+assert(waitingOutput.includes("Job created. Checking dispatch state."), "created job output must use explicit created wording");
+assert(waitingOutput.includes("Polling job output (2/10)."), "waiting output must show polling progress");
+assert(!waitingOutput.includes("No job output"), "waiting output must not look like a completed empty result");
+const queuedOutput = renderJobOutputStatus(
+  {
+    id: "job-queued-1",
+    status: "queued",
+    dispatch_state: "queued",
+    target_agents: [{ agent_id: "agent-1", status: "offline", connected: false, revoked: false }],
+  },
+  { jobId: "job-queued-1", attempt: 1, maxAttempts: 3 },
+);
+assert(queuedOutput.includes("Queued until agent reconnects."), "queued output must explain offline queueing");
+assert(!queuedOutput.includes("No job output"), "queued output must not render completed empty wording");
+const runningOutput = renderJobOutputStatus(
+  { id: "job-running-1", status: "running", dispatch_state: "delivered", target_agents: [] },
+  { jobId: "job-running-1" },
+);
+assert(runningOutput.includes("Running on agent. Waiting for output."), "running output must explain delivery");
+const emptyOutput = renderJobOutputEmpty({ jobId: "job-1", maxAttempts: 10 });
+assert(emptyOutput.includes("Completed with no output."), "completed empty output must be explicit");
+assert(isTerminalJob({ status: "success", dispatch_state: "completed" }), "completed jobs must be terminal");
+assert(
+  !isTerminalJob({ status: "queued", dispatch_state: "queued" }),
+  "queued jobs must not be terminal",
+);
+assert(
+  jobStatusMessage({ status: "expired", dispatch_state: "expired", last_error: "deadline exceeded" }).includes(
+    "Create a new job",
+  ),
+  "expired output must include next action",
+);
+assert(
+  jobStatusMessage({ status: "canceled", dispatch_state: "rejected", last_error: "confirmation missing" }).includes(
+    "Review confirmation",
+  ),
+  "rejected output must include next action",
+);
+const completedNoOutput = renderJobOutputAfterPolling({
+  jobId: "job-complete-1",
+  job: { id: "job-complete-1", status: "success", dispatch_state: "completed", target_agents: [] },
+  chunks: [],
+});
+assert(
+  completedNoOutput.includes("Completed with no output."),
+  "completed jobs without chunks must not look pending",
+);
+const pendingNoOutput = renderJobOutputAfterPolling({
+  jobId: "job-pending-1",
+  job: { id: "job-pending-1", status: "queued", dispatch_state: "queued", target_agents: [] },
+  chunks: [],
+});
+assert(
+  pendingNoOutput.includes("Queued until agent reconnects."),
+  "pending jobs without chunks must stay pending",
+);
+assert(!pendingNoOutput.includes("Completed with no output."), "pending jobs must not show completed no-output text");
+const singlePoll = await pollJobOutputOnce(
+  {
+    getJob: async () => ({
+      id: "job-poll-1",
+      status: "running",
+      dispatch_state: "delivered",
+      target_agents: [],
+    }),
+    getJobOutput: async () => [],
+  },
+  "job-poll-1",
+);
+assert(singlePoll.text.includes("Running on agent. Waiting for output."), "single poll must combine job detail and output");
+assert(!singlePoll.terminal, "single poll must keep running jobs non-terminal");
 
 console.log("web-admin smoke tests passed");
 

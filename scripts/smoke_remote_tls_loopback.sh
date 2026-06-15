@@ -26,10 +26,16 @@ CERT="$WORK_DIR/tls-cert.pem"
 KEY="$WORK_DIR/tls-key.pem"
 OPENSSL_CONFIG="$WORK_DIR/openssl.cnf"
 CONTROLLER_LOG="$WORK_DIR/controller.log"
+AGENT_LOG="$WORK_DIR/agent.log"
 CONTROLLER_PID=""
+AGENT_PID=""
 CLEANED=""
 
 cleanup() {
+  if [ -n "$AGENT_PID" ] && kill -0 "$AGENT_PID" 2>/dev/null; then
+    kill "$AGENT_PID" 2>/dev/null || true
+    wait "$AGENT_PID" 2>/dev/null || true
+  fi
   if [ -n "$CONTROLLER_PID" ] && kill -0 "$CONTROLLER_PID" 2>/dev/null; then
     kill "$CONTROLLER_PID" 2>/dev/null || true
     wait "$CONTROLLER_PID" 2>/dev/null || true
@@ -75,7 +81,8 @@ openssl req \
   -extensions v3_req >/dev/null 2>&1
 chmod 600 "$KEY"
 
-"$BIN" controller init --data-dir "$WORK_DIR" >/dev/null
+INIT_OUTPUT="$("$BIN" controller init --data-dir "$WORK_DIR")"
+ADMIN_TOKEN="$(printf '%s\n' "$INIT_OUTPUT" | sed -n 's/^admin token: //p')"
 "$BIN" controller start \
   --host 127.0.0.1 \
   --port "$PORT" \
@@ -108,11 +115,34 @@ TOKEN="$("$BIN" enroll-token create --data-dir "$WORK_DIR" --labels role=web,env
   --token "$TOKEN" \
   --name web-tls-01 \
   --labels role=web,env=tls
-"$BIN" agent start --data-dir "$WORK_DIR" --once
+"$BIN" agent start --data-dir "$WORK_DIR" --once >"$AGENT_LOG" 2>&1 &
+AGENT_PID="$!"
+
+i=0
+AGENTS_API=""
+while [ "$i" -lt 100 ]; do
+  AGENTS_API="$(curl --cacert "$CERT" -fsS -H "Authorization: Bearer $ADMIN_TOKEN" "https://localhost:$PORT/api/agents" 2>/dev/null || true)"
+  case "$AGENTS_API" in
+    *'"id":"agent-web-tls-01"'*'"status":"online"'*) break ;;
+    *'"id":"agent-web-tls-01"'*'"status":"degraded"'*) break ;;
+  esac
+  i=$((i + 1))
+  sleep 0.05
+done
+
+if [ "$i" -eq 100 ]; then
+  cat "$CONTROLLER_LOG" >&2 || true
+  cat "$AGENT_LOG" >&2 || true
+  echo "TLS agent connection smoke failed: $AGENTS_API" >&2
+  exit 1
+fi
 
 kill "$CONTROLLER_PID" 2>/dev/null || true
 wait "$CONTROLLER_PID" 2>/dev/null || true
 CONTROLLER_PID=""
+kill "$AGENT_PID" 2>/dev/null || true
+wait "$AGENT_PID" 2>/dev/null || true
+AGENT_PID=""
 if [ "${SPONZEY_KEEP_SMOKE:-0}" != "1" ]; then
   rm -rf "$WORK_DIR"
   CLEANED="1"

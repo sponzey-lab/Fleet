@@ -10,6 +10,7 @@
     { "name": "listDrift", "method": "GET", "path": "/api/agents/{agent_id}/drift" },
     { "name": "revokeAgentKey", "method": "POST", "path": "/api/agents/{agent_id}/revoke-key" },
     { "name": "listJobs", "method": "GET", "path": "/api/jobs" },
+    { "name": "getJob", "method": "GET", "path": "/api/jobs/{job_id}" },
     { "name": "getJobOutput", "method": "GET", "path": "/api/jobs/{job_id}/output" },
     { "name": "listAudit", "method": "GET", "path": "/api/audit" },
     { "name": "listEnrollmentTokens", "method": "GET", "path": "/api/enrollment-tokens" },

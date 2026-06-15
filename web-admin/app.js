@@ -10,6 +10,10 @@ const state = {
 
 const TELEMETRY_WINDOW_MS = 5 * 60 * 1000;
 const TELEMETRY_PAGE_LIMIT = 120;
+const JOB_OUTPUT_POLL_ATTEMPTS = 45;
+const JOB_OUTPUT_POLL_INTERVAL_MS = 1000;
+const TERMINAL_DISPATCH_STATES = new Set(["completed", "failed", "expired", "rejected"]);
+const TERMINAL_JOB_STATUSES = new Set(["success", "failed", "expired", "canceled"]);
 
 const api = createApiClient({
   tokenProvider: () => state.token,
@@ -67,7 +71,8 @@ export function renderAgents(agents, selectedAgentId = "") {
         typeof agent.last_seen_age_seconds === "number"
           ? `last seen ${agent.last_seen_age_seconds}s ago`
           : "";
-      const meta = [agent.hostname, platform, age].filter(Boolean).join(" · ");
+      const session = agent.connected ? "session connected" : "session disconnected";
+      const meta = [agent.hostname, platform, session, age].filter(Boolean).join(" · ");
       const selectedClass = agent.id === selectedAgentId ? " selected" : "";
       const status = agent.revoked ? "offline" : agent.status || "unknown";
       const revokedBadge = agent.revoked
@@ -121,8 +126,11 @@ export function renderFactsInventory(snapshot, missingText = "No facts snapshot.
         ? "unknown"
         : formatOptional(body?.memory?.module_count),
     ],
+    ["Disk devices", formatOptional(body?.disk?.device_count)],
+    ["Mounts", formatOptional(body?.disk?.mount_count)],
     ["Root disk total", formatKilobytes(body?.disk?.root_total_kb)],
     ["Root filesystem", body?.disk?.root_filesystem],
+    ["Root FS type", body?.disk?.root_fs_type],
     [
       "Network interfaces",
       Array.isArray(body?.network?.interfaces)
@@ -376,14 +384,24 @@ export function renderJobs(jobs) {
   return jobs
     .map((job) => {
       const command = [job.command_program, ...(job.command_args || [])].filter(Boolean).join(" ");
+      const dispatchState = job.dispatch_state || job.status || "unknown";
+      const targets = Array.isArray(job.target_agents) ? job.target_agents : [];
+      const connectedCount = targets.filter((target) => target?.connected).length;
+      const targetSummary =
+        targets.length > 0
+          ? `${targets.length} target(s), ${connectedCount} connected`
+          : `${job.target_count ?? 0} target(s)`;
       return `
         <button class="job-row" type="button" data-job-id="${escapeHtml(job.id)}">
           <span>
             <strong>${escapeHtml(job.id)}</strong>
             <small>${escapeHtml(command || "non-command job")}</small>
           </span>
-          <span class="status-pill ${escapeHtml(job.status || "unknown")}">${escapeHtml(job.status || "unknown")}</span>
-          <small>${escapeHtml(job.target_count ?? 0)} target(s)</small>
+          <span class="job-status">
+            <span class="status-pill ${escapeHtml(job.status || "unknown")}">${escapeHtml(job.status || "unknown")}</span>
+            <span class="status-pill ${escapeHtml(dispatchState)}">${escapeHtml(dispatchState)}</span>
+          </span>
+          <small>${escapeHtml(targetSummary)}</small>
         </button>
       `;
     })
@@ -480,16 +498,124 @@ export function buildCommandJobRequest({ agentId, program, args, confirmed }) {
   };
 }
 
-export function renderJobOutput(chunks) {
+export function renderJobOutput(chunks, { jobId = "", job = null } = {}) {
   if (!Array.isArray(chunks) || chunks.length === 0) {
-    return "No job output.";
+    return renderJobOutputStatus(job || { id: jobId, status: "success", dispatch_state: "completed" }, {
+      jobId,
+    });
   }
-  return chunks
-    .map((chunk) => {
-      const prefix = `${chunk.agent_id || "agent"} ${chunk.stream || "stdout"}`;
-      return `[${prefix}] ${chunk.data || ""}`;
+  const lines = [];
+  if (jobId) {
+    lines.push(`Job: ${jobId}`);
+  }
+  if (job) {
+    lines.push(`Status: ${job.status || "unknown"}`);
+    lines.push(`Dispatch: ${job.dispatch_state || "unknown"}`);
+  }
+  lines.push(`Output chunks: ${chunks.length}`, "");
+  for (const chunk of chunks) {
+    const sequence = Number.isFinite(chunk?.sequence) ? ` #${chunk.sequence}` : "";
+    const prefix = `[${chunk?.agent_id || "agent"} ${chunk?.stream || "stdout"}${sequence}]`;
+    const data = String(chunk?.data ?? "");
+    if (data.includes("\n")) {
+      lines.push(prefix, data.replace(/\n$/, ""));
+    } else {
+      lines.push(`${prefix} ${data}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+export function renderJobOutputWaiting({ jobId = "", attempt = 0, maxAttempts = JOB_OUTPUT_POLL_ATTEMPTS } = {}) {
+  return renderJobOutputStatus(
+    { id: jobId, status: "queued", dispatch_state: "created", target_agents: [] },
+    { jobId, attempt, maxAttempts },
+  );
+}
+
+export function renderJobOutputStatus(
+  job,
+  { jobId = "", attempt = 0, maxAttempts = JOB_OUTPUT_POLL_ATTEMPTS, paused = false } = {},
+) {
+  const resolvedJobId = job?.id || jobId;
+  const lines = [];
+  if (resolvedJobId) {
+    lines.push(`Job: ${resolvedJobId}`);
+  }
+  const progress = attempt > 0 ? ` (${attempt}/${maxAttempts})` : "";
+  lines.push(`Status: ${job?.status || "unknown"}`);
+  lines.push(`Dispatch: ${job?.dispatch_state || "unknown"}`);
+  lines.push(jobStatusMessage(job));
+  const targetSummary = jobTargetSummary(job);
+  if (targetSummary) {
+    lines.push(`Targets: ${targetSummary}`);
+  }
+  const expiresAt = formatUnixMillis(job?.expires_at_ms);
+  if (expiresAt) {
+    lines.push(`Expires at: ${expiresAt}`);
+  }
+  if (!isTerminalJob(job)) {
+    lines.push(`Polling job output${progress}.`);
+  }
+  if (paused) {
+    lines.push("Polling paused. Refresh or select the job again to continue.");
+  }
+  return lines.join("\n");
+}
+
+export function renderJobOutputEmpty({ jobId = "", maxAttempts = JOB_OUTPUT_POLL_ATTEMPTS } = {}) {
+  return renderJobOutputStatus(
+    { id: jobId, status: "success", dispatch_state: "completed", target_agents: [] },
+    { jobId, maxAttempts },
+  );
+}
+
+export function jobStatusMessage(job) {
+  const status = String(job?.status || "").toLowerCase();
+  const dispatchState = String(job?.dispatch_state || "").toLowerCase();
+  const reason = job?.last_error ? ` Reason: ${job.last_error}` : "";
+  if (dispatchState === "created") {
+    return "Job created. Checking dispatch state.";
+  }
+  if (dispatchState === "queued") {
+    return `Queued until agent reconnects.${reason}`;
+  }
+  if (dispatchState === "delivered" || dispatchState === "running" || status === "running") {
+    return `Running on agent. Waiting for output.${reason}`;
+  }
+  if (dispatchState === "completed" || status === "success") {
+    return "Completed with no output.";
+  }
+  if (dispatchState === "expired" || status === "expired") {
+    return `Expired before delivery or completion.${reason} Create a new job after the agent reconnects.`;
+  }
+  if (dispatchState === "rejected" || status === "canceled") {
+    return `Rejected by controller policy.${reason} Review confirmation, target state, or audit entries before retrying.`;
+  }
+  if (dispatchState === "failed" || status === "failed") {
+    return `Failed on agent.${reason} Review job output or audit entries before retrying.`;
+  }
+  return `Job state is ${dispatchState || status || "unknown"}. Refresh jobs or check controller logs.`;
+}
+
+export function isTerminalJob(job) {
+  const status = String(job?.status || "").toLowerCase();
+  const dispatchState = String(job?.dispatch_state || "").toLowerCase();
+  return TERMINAL_JOB_STATUSES.has(status) || TERMINAL_DISPATCH_STATES.has(dispatchState);
+}
+
+function jobTargetSummary(job) {
+  const targets = Array.isArray(job?.target_agents) ? job.target_agents : [];
+  if (targets.length === 0) {
+    return "";
+  }
+  return targets
+    .map((target) => {
+      const connected = target?.connected ? "connected" : "disconnected";
+      const revoked = target?.revoked ? ", revoked" : "";
+      return `${target?.agent_id || "agent"} ${target?.status || "unknown"} ${connected}${revoked}`;
     })
-    .join("");
+    .join("; ");
 }
 
 export function formatApiError(path, status) {
@@ -707,20 +833,82 @@ async function submitCommand(form) {
   });
   const response = await api.createCommandJob(request);
   state.lastJobId = response.job_id;
-  document.querySelector("#job-output").textContent = "Job queued. Waiting for output...";
+  document.querySelector("#job-output").textContent = renderJobOutputStatus(
+    {
+      id: response.job_id,
+      status: "queued",
+      dispatch_state: "created",
+      target_count: response.target_count,
+      target_agents: [],
+    },
+    { jobId: response.job_id },
+  );
   setStatus(`Created ${response.job_id} for ${response.target_count} target.`, "ok");
   await pollJobOutput(response.job_id);
 }
 
 async function pollJobOutput(jobId) {
-  for (let attempt = 0; attempt < 10; attempt += 1) {
-    const chunks = await api.getJobOutput(jobId);
-    document.querySelector("#job-output").textContent = renderJobOutput(chunks);
+  const outputElement = document.querySelector("#job-output");
+  for (let attempt = 1; attempt <= JOB_OUTPUT_POLL_ATTEMPTS; attempt += 1) {
+    const [job, chunks] = await Promise.all([api.getJob(jobId), api.getJobOutput(jobId)]);
     if (Array.isArray(chunks) && chunks.length > 0) {
-      return;
+      outputElement.textContent = renderJobOutput(chunks, { jobId, job });
+      if (isTerminalJob(job)) {
+        return;
+      }
+    } else {
+      outputElement.textContent = renderJobOutputStatus(job || { id: jobId }, {
+        jobId,
+        attempt,
+        maxAttempts: JOB_OUTPUT_POLL_ATTEMPTS,
+      });
+      if (isTerminalJob(job)) {
+        return;
+      }
     }
-    await new Promise((resolve) => setTimeout(resolve, 1000));
+    if (attempt < JOB_OUTPUT_POLL_ATTEMPTS) {
+      await new Promise((resolve) => setTimeout(resolve, JOB_OUTPUT_POLL_INTERVAL_MS));
+    }
   }
+  const [job, chunks] = await Promise.all([api.getJob(jobId), api.getJobOutput(jobId)]);
+  outputElement.textContent =
+    Array.isArray(chunks) && chunks.length > 0
+      ? renderJobOutput(chunks, { jobId, job })
+      : renderJobOutputStatus(job || { id: jobId }, {
+          jobId,
+          attempt: JOB_OUTPUT_POLL_ATTEMPTS,
+          maxAttempts: JOB_OUTPUT_POLL_ATTEMPTS,
+          paused: !isTerminalJob(job),
+        });
+}
+
+export async function pollJobOutputOnce(apiClient, jobId) {
+  const [job, chunks] = await Promise.all([apiClient.getJob(jobId), apiClient.getJobOutput(jobId)]);
+  if (Array.isArray(chunks) && chunks.length > 0) {
+    return {
+      text: renderJobOutput(chunks, { jobId, job }),
+      terminal: isTerminalJob(job),
+    };
+  }
+  return {
+    text: renderJobOutputStatus(job || { id: jobId }, {
+      jobId,
+      attempt: 1,
+      maxAttempts: 1,
+    }),
+    terminal: isTerminalJob(job),
+  };
+}
+
+export function renderJobOutputAfterPolling({ job = null, chunks = [], jobId = "" } = {}) {
+  if (Array.isArray(chunks) && chunks.length > 0) {
+    return renderJobOutput(chunks, { jobId, job });
+  }
+  return renderJobOutputStatus(job || { id: jobId }, {
+    jobId,
+    attempt: JOB_OUTPUT_POLL_ATTEMPTS,
+    maxAttempts: JOB_OUTPUT_POLL_ATTEMPTS,
+  });
 }
 
 function boot() {
