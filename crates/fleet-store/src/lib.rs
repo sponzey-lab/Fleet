@@ -178,6 +178,13 @@ pub struct DriftReportPageRecord {
     pub cursor: SnapshotPageCursor,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentLogChunkRecord {
+    pub agent_id: String,
+    pub line: String,
+    pub collected_at: SystemTime,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetentionCleanupSummary {
     pub job_output_chunks: usize,
@@ -655,6 +662,45 @@ impl SqliteStore {
         )?;
         statement
             .query_map(params![agent_id, limit], row_to_drift_report_page_record)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn insert_agent_log_chunk(
+        &self,
+        agent_id: &str,
+        line: &str,
+        collected_at: SystemTime,
+    ) -> Result<(), StoreError> {
+        self.connection.execute(
+            "INSERT INTO agent_log_chunks (agent_id, line, collected_at)
+             VALUES (?1, ?2, ?3)",
+            params![agent_id, line, system_time_to_unix_secs(collected_at)],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_agent_log_chunks(
+        &self,
+        agent_id: &str,
+        limit: usize,
+    ) -> Result<Vec<AgentLogChunkRecord>, StoreError> {
+        let limit = limit.clamp(1, 500) as i64;
+        let mut statement = self.connection.prepare(
+            "SELECT agent_id, line, collected_at
+             FROM agent_log_chunks
+             WHERE agent_id = ?1
+             ORDER BY collected_at DESC, id DESC
+             LIMIT ?2",
+        )?;
+        statement
+            .query_map(params![agent_id, limit], |row| {
+                Ok(AgentLogChunkRecord {
+                    agent_id: row.get(0)?,
+                    line: row.get(1)?,
+                    collected_at: unix_secs_to_system_time(row.get(2)?),
+                })
+            })?
             .collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::from)
     }
@@ -2227,6 +2273,13 @@ CREATE TABLE IF NOT EXISTS drift_reports (
     actual TEXT NOT NULL,
     checked_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS agent_log_chunks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    line TEXT NOT NULL,
+    collected_at INTEGER NOT NULL
+);
 "#;
 
 #[cfg(test)]
@@ -2297,6 +2350,12 @@ mod tests {
         );
         assert!(store.has_column("facts_snapshots", "body").unwrap());
         assert!(store.has_column("facts_snapshots", "collected_at").unwrap());
+        assert!(store.has_column("agent_log_chunks", "line").unwrap());
+        assert!(
+            store
+                .has_column("agent_log_chunks", "collected_at")
+                .unwrap()
+        );
         assert!(store.has_column("agents", "labels").unwrap());
         assert!(store.has_column("agents", "status").unwrap());
     }
@@ -2548,6 +2607,36 @@ mod tests {
 
         assert_eq!(snapshot.agent_id, "a1");
         assert_eq!(snapshot.body, "{\"os\":\"macos\"}");
+    }
+
+    #[test]
+    fn stores_agent_log_chunks() {
+        let store = SqliteStore::in_memory().unwrap();
+        store.save_agent(agent()).unwrap();
+        store
+            .insert_agent_log_chunk(
+                "a1",
+                "level=info event=agent_heartbeat_completed",
+                SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+            )
+            .unwrap();
+        store
+            .insert_agent_log_chunk(
+                "a1",
+                "level=info event=agent_heartbeat_completed sequence=2",
+                SystemTime::UNIX_EPOCH + Duration::from_secs(2),
+            )
+            .unwrap();
+
+        let chunks = store.list_agent_log_chunks("a1", 10).unwrap();
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].agent_id, "a1");
+        assert!(chunks[0].line.contains("sequence=2"));
+        assert_eq!(
+            chunks[0].collected_at,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(2)
+        );
     }
 
     #[test]

@@ -33,6 +33,13 @@ Important terms:
 | Enrollment token | Created by `sponzey enroll-token create`. Use it once when registering an agent.                          |
 | Controller URL   | Address agents use to reach the controller. The setup flow is the same whether the URL is local or HTTPS. |
 
+Facts and metrics mean different things:
+
+| Data    | Meaning                                                                                           |
+| ------- | ------------------------------------------------------------------------------------------------- |
+| Facts   | Mostly stable inventory, such as OS, architecture, hostname, CPU core count, memory total/modules, disk capacity, and network interfaces. |
+| Metrics | Time-series usage telemetry, such as CPU usage, memory usage, disk usage, process count, and service failure counts. |
+
 ## Install
 
 ```bash
@@ -43,8 +50,9 @@ sponzey --help
 If `sponzey` is not found after installation, your npm global bin directory is
 not in `PATH`. The installer creates the npm global `sponzey` launcher when it
 can, and also tries to create a PATH-visible launcher in a safe writable bin
-directory such as `/usr/local/bin`. If your shell still cannot find `sponzey`,
-check the npm bin directory with:
+directory such as `/usr/local/bin`. The installer does not silently edit shell
+profile files. If your shell still cannot find `sponzey`, check the npm bin
+directory with:
 
 ```bash
 echo "$(npm prefix -g)/bin"
@@ -217,6 +225,11 @@ Refresh Web Admin. The agent should appear in the agent list.
 the network is unavailable, it keeps retrying by default. Use `--once` for a
 single smoke check, or `--max-reconnect-attempts <N>` when you explicitly want
 the process to exit after repeated connection failures.
+
+By default, the agent also uploads product-safe operational log chunks every
+30 seconds. These are agent status events, not raw system log files. Change the
+interval with `--log-upload-interval-seconds <SECONDS>`, or disable this upload
+with `--disable-log-upload`.
 
 ## HTTPS Preparation
 

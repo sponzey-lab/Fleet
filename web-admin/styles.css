@@ -272,6 +272,105 @@ button:disabled {
   white-space: pre-wrap;
 }
 
+.chart-set {
+  margin-bottom: 12px;
+}
+
+.inventory-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.inventory-card {
+  min-width: 0;
+  border: 1px solid #e3e8f0;
+  border-radius: 6px;
+  background: #f8fafc;
+  padding: 10px;
+}
+
+.inventory-card small {
+  display: block;
+  color: #687385;
+  font-size: 11px;
+  line-height: 1.3;
+}
+
+.inventory-card strong {
+  display: block;
+  margin-top: 4px;
+  color: #172033;
+  font-size: 13px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.chart-window {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+  color: #4b5568;
+  font-size: 12px;
+}
+
+.chart-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.chart-card {
+  border: 1px solid #e3e8f0;
+  border-radius: 6px;
+  background: #f8fafc;
+  padding: 10px;
+  min-width: 0;
+}
+
+.chart-card-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+  font-size: 12px;
+  color: #4b5568;
+}
+
+.chart-card-heading strong {
+  color: #172033;
+}
+
+.sparkline {
+  display: block;
+  width: 100%;
+  height: 72px;
+}
+
+.sparkline-axis {
+  stroke: #d8dee9;
+  stroke-width: 1;
+}
+
+.sparkline-line {
+  fill: none;
+  stroke: #1f6feb;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 3;
+}
+
+.chart-empty {
+  display: grid;
+  min-height: 72px;
+  place-items: center;
+  color: #687385;
+  font-size: 12px;
+}
+
 .drift-summary {
   display: flex;
   align-items: center;
@@ -429,6 +528,8 @@ code {
   .topbar,
   .layout,
   .diff-grid,
+  .inventory-grid,
+  .chart-grid,
   .audit-row,
   .run-form,
   .token-form,

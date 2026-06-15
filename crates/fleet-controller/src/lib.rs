@@ -53,6 +53,7 @@ const ADMIN_API_SCHEMA_JSON: &str = include_str!("../../../web-admin/api.schema.
 const OPENAPI_JSON: &str = include_str!("../../../docs/openapi.json");
 const SWAGGER_UI_HTML: &str = include_str!("../../../docs/swagger-ui.html");
 const AGENT_OFFLINE_AFTER: Duration = Duration::from_secs(90);
+const AGENT_LOG_CHUNK_MAX_BYTES: usize = 4096;
 
 #[derive(Debug, Clone)]
 pub struct ControllerServerConfig {
@@ -443,37 +444,6 @@ where
     let store = SqliteStore::open(db_path)?;
     let identity = load_controller_identity(&config.data_dir)?;
 
-    tracing::info!(
-        bind_addr = %format!("{}:{}", config.host, config.port),
-        external_url = %config.external_url.as_deref().unwrap_or(""),
-        tls_enabled = config.tls_cert_path.is_some(),
-        controller_fingerprint = %identity.fingerprint,
-        "controller_started"
-    );
-    let insecure_http_target = insecure_http_transport_target(&config);
-    if let Some(target) = &insecure_http_target {
-        tracing::warn!(
-            transport_target = %target,
-            "insecure_http_transport_enabled"
-        );
-        audit_insecure_http_transport_enabled(&store, target)?;
-    }
-    println!("controller listening on {}:{}", config.host, config.port);
-    if let Some(external_url) = &config.external_url {
-        println!("controller external url: {external_url}");
-    }
-    if config.tls_cert_path.is_some() {
-        println!("controller transport: https");
-    }
-    if let Some(target) = &insecure_http_target {
-        eprintln!(
-            "{}",
-            fleet_core::format_warning_message(format!(
-                "insecure HTTP controller URL enabled: {target}; HTTP is test-only and not encrypted; use HTTPS for product or production environments"
-            ))
-        );
-    }
-
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -494,6 +464,20 @@ async fn run_axum_controller_server<F>(
 where
     F: Fn() -> bool + Send + Sync + 'static,
 {
+    let bind_addr = format!("{}:{}", config.host, config.port);
+    let listener = tokio::net::TcpListener::bind(&bind_addr)
+        .await
+        .map_err(|error| controller_bind_error(&bind_addr, error))?;
+    let tls_acceptor = match (&config.tls_cert_path, &config.tls_key_path) {
+        (Some(cert_path), Some(key_path)) => Some(build_tls_acceptor(cert_path, key_path)?),
+        _ => None,
+    };
+    let insecure_http_target = insecure_http_transport_target(&config);
+    if let Some(target) = &insecure_http_target {
+        audit_insecure_http_transport_enabled(&store, target)?;
+    }
+    announce_controller_started(&config, &identity, insecure_http_target.as_deref());
+
     let state = ControllerAppState {
         store: Arc::new(Mutex::new(store)),
         identity: Arc::new(identity),
@@ -506,15 +490,9 @@ where
         .route("/api/agents/ws", get(axum_agent_websocket))
         .fallback(axum_http_fallback)
         .with_state(state);
-    let listener = tokio::net::TcpListener::bind(format!("{}:{}", config.host, config.port))
-        .await
-        .map_err(ControllerError::Io)?;
 
-    if let (Some(cert_path), Some(key_path)) = (&config.tls_cert_path, &config.tls_key_path) {
-        let listener = TlsControllerListener {
-            listener,
-            acceptor: build_tls_acceptor(cert_path, key_path)?,
-        };
+    if let Some(acceptor) = tls_acceptor {
+        let listener = TlsControllerListener { listener, acceptor };
         axum::serve(listener, app)
             .with_graceful_shutdown(async move {
                 while !should_shutdown() {
@@ -536,6 +514,50 @@ where
 
     tracing::info!("controller_stopped");
     Ok(())
+}
+
+fn announce_controller_started(
+    config: &ControllerServerConfig,
+    identity: &ControllerIdentity,
+    insecure_http_target: Option<&str>,
+) {
+    tracing::info!(
+        bind_addr = %format!("{}:{}", config.host, config.port),
+        external_url = %config.external_url.as_deref().unwrap_or(""),
+        tls_enabled = config.tls_cert_path.is_some(),
+        controller_fingerprint = %identity.fingerprint,
+        "controller_started"
+    );
+    if let Some(target) = insecure_http_target {
+        tracing::warn!(
+            transport_target = %target,
+            "insecure_http_transport_enabled"
+        );
+    }
+    println!("controller listening on {}:{}", config.host, config.port);
+    if let Some(external_url) = &config.external_url {
+        println!("controller external url: {external_url}");
+    }
+    if config.tls_cert_path.is_some() {
+        println!("controller transport: https");
+    }
+    if let Some(target) = insecure_http_target {
+        eprintln!(
+            "{}",
+            fleet_core::format_warning_message(format!(
+                "insecure HTTP controller URL enabled: {target}; HTTP is test-only and not encrypted; use HTTPS for product or production environments"
+            ))
+        );
+    }
+}
+
+fn controller_bind_error(bind_addr: &str, error: std::io::Error) -> ControllerError {
+    ControllerError::Io(std::io::Error::new(
+        error.kind(),
+        format!(
+            "failed to bind controller listener on {bind_addr}: {error}. Make sure --host is an IP address assigned to this machine, or use --host 0.0.0.0 and set --external-url to a reachable IP/DNS name."
+        ),
+    ))
 }
 
 struct TlsControllerListener {
@@ -713,11 +735,20 @@ async fn read_task_data_until_close_axum(
     socket: &mut WebSocket,
     state: &ControllerAppState,
     agent_id: &str,
-    stop_after_first_message: bool,
+    stop_after_idle: bool,
 ) -> Result<(), ControllerError> {
-    let mut handled_messages = 0usize;
     loop {
-        let message = match read_axum_wire_message(socket).await {
+        let read_result = if stop_after_idle {
+            match tokio::time::timeout(Duration::from_millis(75), read_axum_wire_message(socket))
+                .await
+            {
+                Ok(result) => result,
+                Err(_) => return Ok(()),
+            }
+        } else {
+            read_axum_wire_message(socket).await
+        };
+        let message = match read_result {
             Ok(message) => message,
             Err(ControllerError::Json(error)) if error == "websocket closed" => return Ok(()),
             Err(error) => return Err(error),
@@ -726,8 +757,7 @@ async fn read_task_data_until_close_axum(
             let store = lock_store(state)?;
             handle_agent_task_data_message(&store, agent_id, message)?
         };
-        handled_messages += 1;
-        if done || (stop_after_first_message && handled_messages >= 2) {
+        if done {
             return Ok(());
         }
     }
@@ -1051,6 +1081,20 @@ fn handle_agent_task_data_message(
                 store.insert_metrics_snapshot(agent_id, &body, agent_message_time)?;
             }
         }
+        fleet_protocol::WirePayload::LogChunk {
+            agent_id: event_agent_id,
+            line,
+        } => {
+            if event_agent_id != agent_id {
+                audit_security(store, "websocket_log_agent_mismatch", agent_id)?;
+            } else {
+                store.insert_agent_log_chunk(
+                    agent_id,
+                    &sanitize_agent_log_line(&line),
+                    agent_message_time,
+                )?;
+            }
+        }
         fleet_protocol::WirePayload::DriftReport {
             agent_id: event_agent_id,
             status,
@@ -1115,6 +1159,18 @@ fn output_stream_from_wire(stream: fleet_protocol::OutputStream) -> JobOutputStr
         fleet_protocol::OutputStream::Stdout => JobOutputStream::Stdout,
         fleet_protocol::OutputStream::Stderr => JobOutputStream::Stderr,
     }
+}
+
+fn sanitize_agent_log_line(line: &str) -> String {
+    let redacted = fleet_core::redact_secret(line);
+    if redacted.len() <= AGENT_LOG_CHUNK_MAX_BYTES {
+        return redacted;
+    }
+    let mut end = AGENT_LOG_CHUNK_MAX_BYTES;
+    while !redacted.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...[truncated]", &redacted[..end])
 }
 
 fn audit_security(store: &SqliteStore, action: &str, target: &str) -> Result<(), ControllerError> {
@@ -4259,6 +4315,34 @@ spec:
     }
 
     #[test]
+    fn log_chunk_message_is_stored_and_redacted() {
+        let store = SqliteStore::in_memory().unwrap();
+        save_test_agent(&store, "agent-1");
+        let message = fleet_protocol::WireMessage::new(
+            "msg-log",
+            "corr-log",
+            Some("agent-1".to_owned()),
+            1000,
+            fleet_protocol::WirePayload::LogChunk {
+                agent_id: "agent-1".to_owned(),
+                line: "level=info event=agent_heartbeat_completed token=secret".to_owned(),
+            },
+        );
+
+        let finished = handle_agent_task_data_message(&store, "agent-1", message).unwrap();
+        let chunks = store.list_agent_log_chunks("agent-1", 10).unwrap();
+
+        assert!(!finished);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(
+            chunks[0].collected_at,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1)
+        );
+        assert!(chunks[0].line.contains("agent_heartbeat_completed"));
+        assert!(!chunks[0].line.contains("secret"));
+    }
+
+    #[test]
     fn drift_report_message_is_stored_and_audited() {
         let store = SqliteStore::in_memory().unwrap();
         save_test_agent(&store, "agent-1");
@@ -5008,6 +5092,23 @@ spec:
         };
 
         assert_eq!(insecure_http_transport_target(&config), None);
+    }
+
+    #[test]
+    fn controller_bind_error_explains_unassigned_host() {
+        let error = controller_bind_error(
+            "192.168.20.19:7700",
+            std::io::Error::new(
+                std::io::ErrorKind::AddrNotAvailable,
+                "address not available",
+            ),
+        );
+
+        let message = error.to_string();
+        assert!(message.contains("failed to bind controller listener on 192.168.20.19:7700"));
+        assert!(message.contains("--host is an IP address assigned to this machine"));
+        assert!(message.contains("--host 0.0.0.0"));
+        assert!(message.contains("--external-url"));
     }
 
     #[test]

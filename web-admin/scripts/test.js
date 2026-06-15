@@ -26,7 +26,10 @@ assert(index.includes("Sponzey Fleet Admin"), "index must name the admin UI");
 assert(index.includes("id=\"agents-list\""), "index must expose the agents surface");
 assert(index.includes("id=\"revoke-agent-key\""), "index must expose agent key revocation");
 assert(index.includes(">Revoke Agent</button>"), "index must label agent revocation by agent");
+assert(index.includes("id=\"refresh-telemetry\""), "index must expose selected agent telemetry refresh");
+assert(index.includes("id=\"facts-chart\""), "index must expose facts trend charts");
 assert(index.includes("id=\"facts-panel\""), "index must expose the facts surface");
+assert(index.includes("id=\"metrics-chart\""), "index must expose metrics trend charts");
 assert(index.includes("id=\"metrics-panel\""), "index must expose the metrics surface");
 assert(index.includes("id=\"drift-panel\""), "index must expose the drift surface");
 assert(index.includes("id=\"audit-list\""), "index must expose the audit surface");
@@ -44,8 +47,11 @@ assert(!index.includes("localStorage"), "UI must not store tokens in localStorag
 assert(!index.includes("runtime config"), "UI must not expose runtime config mutation");
 assert(styles.includes(".layout"), "styles must include the admin layout");
 assert(styles.includes(".snapshot-time"), "styles must include snapshot time metadata");
+assert(styles.includes(".chart-grid"), "styles must include telemetry chart grid");
+assert(styles.includes(".sparkline"), "styles must include telemetry sparkline styling");
 assert(app.includes("./api-client.js"), "app must use the shared API client");
 assert(app.includes("handleAgentsListClick"), "app must use delegated agent selection handling");
+assert(app.includes("TELEMETRY_PAGE_LIMIT"), "app must fetch bounded telemetry history pages");
 assert(
   !app.includes('querySelectorAll("[data-agent-id]")'),
   "app must not attach per-render agent button handlers",
@@ -80,6 +86,7 @@ for (const endpoint of [
 const {
   renderAgents,
   renderSnapshot,
+  renderFactsInventory,
   renderDrift,
   renderAudit,
   formatApiError,
@@ -91,6 +98,11 @@ const {
   renderCreatedEnrollmentToken,
   buildEnrollmentTokenRequest,
   formatUnixMillis,
+  renderTelemetryCharts,
+  recentSnapshots,
+  snapshotTimeMs,
+  formatKilobytes,
+  memoryUsedPercent,
 } = await import(appPath);
 const { API_SCHEMA_VERSION, createApiClient, normalizeAdminToken } = await import(clientPath);
 assert(API_SCHEMA_VERSION === schema.schema_version, "API client and schema versions must match");
@@ -252,7 +264,7 @@ const factsText = renderSnapshot(
   {
     collected_at_ms: 1000,
     agent_system_time_ms: 2000,
-    body: { system_time_ms: 2000, os: "linux", disk: { usage_available: true } },
+    body: { system_time_ms: 2000, os: "linux", disk: { root_capacity_known: true } },
   },
   "",
 );
@@ -263,6 +275,69 @@ assert(
   formatUnixMillis(2000) === "1970-01-01T00:00:02.000Z (2000 ms)",
   "time formatter must render epoch millis as ISO text",
 );
+assert(
+  snapshotTimeMs({ agent_system_time_ms: 3000, collected_at_ms: 2000, body: { system_time_ms: 1000 } }) === 3000,
+  "snapshot time must prefer agent system time",
+);
+const factsInventoryHtml = renderFactsInventory({
+  body: {
+    os: "linux",
+    arch: "x64",
+    hostname: "agent-01",
+    cpu: { logical_count: 8 },
+    memory: { total_kb: 16 * 1024 * 1024, module_count_known: true, module_count: 2 },
+    disk: { root_total_kb: 100 * 1024 * 1024, root_filesystem: "/dev/root" },
+    network: { interfaces: ["lo", "eth0"] },
+  },
+});
+assert(factsInventoryHtml.includes("Memory total"), "facts inventory must show static memory capacity");
+assert(factsInventoryHtml.includes("16.0 GiB"), "facts inventory must format memory capacity");
+assert(factsInventoryHtml.includes("Memory modules"), "facts inventory must show memory module count");
+assert(factsInventoryHtml.includes("Root disk total"), "facts inventory must show static disk capacity");
+assert(!factsInventoryHtml.includes("used_percent"), "facts inventory must not render usage fields");
+assert(formatKilobytes(1536) === "1.5 MiB", "kilobyte formatter must scale capacity values");
+assert(
+  memoryUsedPercent({ memory: { used_kb: 25, total_kb: 100 } }) === 25,
+  "memory usage helper must calculate usage percent",
+);
+const recent = recentSnapshots(
+  [
+    { agent_system_time_ms: 0, body: { memory: { used_kb: 1, total_kb: 2 } } },
+    { agent_system_time_ms: 180_000, body: { memory: { used_kb: 1, total_kb: 2 } } },
+    { agent_system_time_ms: 420_000, body: { memory: { used_kb: 1, total_kb: 2 } } },
+  ],
+  300_000,
+);
+assert(recent.length === 2, "recent snapshot filter must keep only the latest five minute window");
+const chartHtml = renderTelemetryCharts(
+  [
+    {
+      agent_system_time_ms: 1000,
+      body: {
+        cpu: { usage_percent: 20 },
+        memory: { used_kb: 50, total_kb: 100 },
+        disk: { used_percent: 30 },
+      },
+    },
+    {
+      agent_system_time_ms: 2000,
+      body: {
+        cpu: { usage_percent: 25 },
+        memory: { used_kb: 60, total_kb: 100 },
+        disk: { used_percent: 40 },
+      },
+    },
+  ],
+  [
+    { label: "CPU used", unit: "%", read: (body) => body.cpu.usage_percent },
+    { label: "Memory used", unit: "%", read: (body) => (body.memory.used_kb / body.memory.total_kb) * 100 },
+    { label: "Disk used", unit: "%", read: (body) => body.disk.used_percent },
+  ],
+);
+assert(chartHtml.includes("Last 5 minutes"), "telemetry chart must label the five minute window");
+assert(chartHtml.includes("CPU used"), "telemetry chart must include CPU usage");
+assert(chartHtml.includes("Memory used"), "telemetry chart must include memory usage");
+assert(chartHtml.includes("<svg"), "telemetry chart must render SVG sparklines");
 
 const driftHtml = renderDrift({
   policy_name: "nginx-running",

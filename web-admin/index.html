@@ -62,16 +62,21 @@
         <article class="panel">
           <div class="panel-heading">
             <h2>Facts</h2>
-            <span class="muted">Latest snapshot</span>
+            <div class="panel-actions">
+              <span class="muted">Latest inventory</span>
+              <button id="refresh-telemetry" type="button" disabled>Refresh telemetry</button>
+            </div>
           </div>
+          <div id="facts-chart" class="chart-set empty">Select an agent.</div>
           <pre id="facts-panel" class="snapshot">Select an agent.</pre>
         </article>
 
         <article class="panel">
           <div class="panel-heading">
             <h2>Metrics</h2>
-            <span class="muted">Latest snapshot</span>
+            <span class="muted">Usage + 5 minute trend</span>
           </div>
+          <div id="metrics-chart" class="chart-set empty">Select an agent.</div>
           <pre id="metrics-panel" class="snapshot">Select an agent.</pre>
         </article>
 

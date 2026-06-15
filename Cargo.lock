@@ -434,18 +434,18 @@ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
 name = "fleet-agent"
-version = "0.1.11"
+version = "0.1.12"
 
 [[package]]
 name = "fleet-application"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "fleet-domain",
 ]
 
 [[package]]
 name = "fleet-cli"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "clap",
  "fleet-controller",
@@ -463,7 +463,7 @@ dependencies = [
 
 [[package]]
 name = "fleet-controller"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "axum",
  "fleet-application",
@@ -484,7 +484,7 @@ dependencies = [
 
 [[package]]
 name = "fleet-core"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "ed25519-dalek",
  "getrandom 0.2.17",
@@ -495,11 +495,11 @@ dependencies = [
 
 [[package]]
 name = "fleet-domain"
-version = "0.1.11"
+version = "0.1.12"
 
 [[package]]
 name = "fleet-protocol"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "fleet-domain",
  "serde",
@@ -508,7 +508,7 @@ dependencies = [
 
 [[package]]
 name = "fleet-runner"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "fleet-domain",
  "sha2",
@@ -516,7 +516,7 @@ dependencies = [
 
 [[package]]
 name = "fleet-store"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "fleet-application",
  "fleet-domain",

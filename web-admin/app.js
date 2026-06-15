@@ -8,10 +8,41 @@ const state = {
   createdEnrollmentToken: null,
 };
 
+const TELEMETRY_WINDOW_MS = 5 * 60 * 1000;
+const TELEMETRY_PAGE_LIMIT = 120;
+
 const api = createApiClient({
   tokenProvider: () => state.token,
   formatError: formatApiError,
 });
+
+const METRICS_CHARTS = [
+  {
+    label: "CPU used",
+    unit: "%",
+    read: (body) => asNumber(body?.cpu?.usage_percent),
+  },
+  {
+    label: "Memory used",
+    unit: "%",
+    read: (body) => memoryUsedPercent(body),
+  },
+  {
+    label: "Disk used",
+    unit: "%",
+    read: (body) => diskUsedPercent(body),
+  },
+  {
+    label: "Processes",
+    unit: "",
+    read: (body) => asNumber(body?.process?.count),
+  },
+  {
+    label: "Failed units",
+    unit: "",
+    read: (body) => asNumber(body?.service?.failed_units_count),
+  },
+];
 
 export function escapeHtml(value) {
   return String(value ?? "")
@@ -74,6 +105,47 @@ export function renderSnapshot(snapshot, missingText) {
   return header.length > 0 ? `${header.join("\n")}\n\n${body}` : body;
 }
 
+export function renderFactsInventory(snapshot, missingText = "No facts snapshot.") {
+  if (!snapshot || !snapshot.body) {
+    return `<div class="empty">${escapeHtml(missingText)}</div>`;
+  }
+  const body = snapshot.body;
+  const rows = [
+    ["OS", [body.os, body.arch].filter(Boolean).join("/")],
+    ["Hostname", body.hostname],
+    ["CPU logical cores", body?.cpu?.logical_count],
+    ["Memory total", formatKilobytes(body?.memory?.total_kb)],
+    [
+      "Memory modules",
+      body?.memory?.module_count_known === false
+        ? "unknown"
+        : formatOptional(body?.memory?.module_count),
+    ],
+    ["Root disk total", formatKilobytes(body?.disk?.root_total_kb)],
+    ["Root filesystem", body?.disk?.root_filesystem],
+    [
+      "Network interfaces",
+      Array.isArray(body?.network?.interfaces)
+        ? String(body.network.interfaces.length)
+        : "unknown",
+    ],
+  ];
+  return `
+    <div class="inventory-grid">
+      ${rows
+        .map(
+          ([label, value]) => `
+            <div class="inventory-card">
+              <small>${escapeHtml(label)}</small>
+              <strong>${escapeHtml(formatOptional(value))}</strong>
+            </div>
+          `,
+        )
+        .join("")}
+    </div>
+  `;
+}
+
 export function renderDrift(report) {
   if (!report) {
     return '<div class="empty">No drift report.</div>';
@@ -111,6 +183,172 @@ export function formatUnixMillis(value) {
     return "";
   }
   return `${date.toISOString()} (${value} ms)`;
+}
+
+export function asNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+export function percent(part, total) {
+  const partNumber = asNumber(part);
+  const totalNumber = asNumber(total);
+  if (partNumber === null || totalNumber === null || totalNumber <= 0) {
+    return null;
+  }
+  return (partNumber / totalNumber) * 100;
+}
+
+export function diskUsedPercent(body) {
+  const direct = asNumber(body?.disk?.used_percent);
+  if (direct !== null) {
+    return direct;
+  }
+  const used = asNumber(body?.disk?.used_kb);
+  const total = asNumber(body?.disk?.total_kb);
+  if (used === null || total === null || total <= 0) {
+    return null;
+  }
+  return (used / total) * 100;
+}
+
+export function memoryUsedPercent(body) {
+  const direct = asNumber(body?.memory?.used_percent);
+  if (direct !== null) {
+    return direct;
+  }
+  return percent(body?.memory?.used_kb, body?.memory?.total_kb);
+}
+
+export function formatKilobytes(value) {
+  const kilobytes = asNumber(value);
+  if (kilobytes === null) {
+    return "unknown";
+  }
+  if (kilobytes >= 1024 * 1024) {
+    return `${(kilobytes / 1024 / 1024).toFixed(1)} GiB`;
+  }
+  if (kilobytes >= 1024) {
+    return `${(kilobytes / 1024).toFixed(1)} MiB`;
+  }
+  return `${kilobytes} KiB`;
+}
+
+function formatOptional(value) {
+  return value === null || value === undefined || value === "" ? "unknown" : String(value);
+}
+
+export function snapshotTimeMs(snapshot) {
+  return (
+    asNumber(snapshot?.agent_system_time_ms) ??
+    asNumber(snapshot?.collected_at_ms) ??
+    asNumber(snapshot?.checked_at_ms) ??
+    asNumber(snapshot?.body?.system_time_ms)
+  );
+}
+
+export function recentSnapshots(snapshots, windowMs = TELEMETRY_WINDOW_MS) {
+  const rows = (Array.isArray(snapshots) ? snapshots : [])
+    .map((snapshot) => ({ snapshot, time: snapshotTimeMs(snapshot) }))
+    .filter((row) => row.time !== null)
+    .sort((left, right) => left.time - right.time);
+  if (rows.length === 0) {
+    return [];
+  }
+  const newest = rows[rows.length - 1].time;
+  const cutoff = newest - windowMs;
+  return rows.filter((row) => row.time >= cutoff).map((row) => row.snapshot);
+}
+
+export function renderTelemetryCharts(snapshots, definitions, emptyText = "No recent telemetry snapshots.") {
+  const recent = recentSnapshots(snapshots);
+  if (recent.length === 0) {
+    return `<div class="empty">${escapeHtml(emptyText)}</div>`;
+  }
+  const first = snapshotTimeMs(recent[0]);
+  const last = snapshotTimeMs(recent[recent.length - 1]);
+  const range = [formatClock(first), formatClock(last)].filter(Boolean).join(" - ");
+  const cards = definitions
+    .map((definition) => renderChartCard(recent, definition))
+    .join("");
+  return `
+    <div class="chart-window">
+      <strong>Last 5 minutes</strong>
+      <small>${escapeHtml(range || `${recent.length} sample(s)`)}</small>
+    </div>
+    <div class="chart-grid">${cards}</div>
+  `;
+}
+
+function renderChartCard(snapshots, definition) {
+  const series = snapshots
+    .map((snapshot) => ({
+      time: snapshotTimeMs(snapshot),
+      value: definition.read(snapshot.body || {}),
+    }))
+    .filter((point) => point.time !== null && point.value !== null);
+  const latest = series.length > 0 ? series[series.length - 1].value : null;
+  const latestLabel = latest === null ? "No samples" : formatMetricValue(latest, definition.unit);
+  return `
+    <article class="chart-card">
+      <div class="chart-card-heading">
+        <span>${escapeHtml(definition.label)}</span>
+        <strong>${escapeHtml(latestLabel)}</strong>
+      </div>
+      ${renderSparkline(series)}
+    </article>
+  `;
+}
+
+function renderSparkline(series) {
+  if (series.length === 0) {
+    return '<div class="chart-empty">No samples</div>';
+  }
+  const width = 300;
+  const height = 96;
+  const padX = 10;
+  const padY = 14;
+  const values = series.map((point) => point.value);
+  let min = Math.min(...values);
+  let max = Math.max(...values);
+  if (min === max) {
+    min -= 1;
+    max += 1;
+  }
+  const points = series
+    .map((point, index) => {
+      const x =
+        series.length === 1 ? width / 2 : padX + (index * (width - padX * 2)) / (series.length - 1);
+      const ratio = (point.value - min) / (max - min);
+      const y = height - padY - ratio * (height - padY * 2);
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    })
+    .join(" ");
+  return `
+    <svg class="sparkline" viewBox="0 0 ${width} ${height}" role="img" aria-label="Telemetry trend">
+      <line class="sparkline-axis" x1="${padX}" y1="${height - padY}" x2="${width - padX}" y2="${height - padY}"></line>
+      <polyline class="sparkline-line" points="${points}"></polyline>
+    </svg>
+  `;
+}
+
+function formatMetricValue(value, unit) {
+  if (unit === "%") {
+    return `${value.toFixed(1)}%`;
+  }
+  return Number.isInteger(value) ? String(value) : value.toFixed(1);
+}
+
+function formatClock(value) {
+  const number = asNumber(value);
+  if (number === null) {
+    return "";
+  }
+  const date = new Date(number);
+  if (Number.isNaN(date.getTime())) {
+    return "";
+  }
+  return date.toISOString().slice(11, 19);
 }
 
 export function renderAudit(events) {
@@ -314,11 +552,14 @@ function selectedAgent() {
 
 function syncAgentActions() {
   const revokeButton = document.querySelector("#revoke-agent-key");
-  if (!revokeButton) {
-    return;
-  }
+  const refreshButton = document.querySelector("#refresh-telemetry");
   const agent = selectedAgent();
-  revokeButton.disabled = !agent || Boolean(agent.revoked);
+  if (revokeButton) {
+    revokeButton.disabled = !agent || Boolean(agent.revoked);
+  }
+  if (refreshButton) {
+    refreshButton.disabled = !agent;
+  }
 }
 
 async function refreshSelectedAgent() {
@@ -326,10 +567,11 @@ async function refreshSelectedAgent() {
   if (!agentId) {
     return;
   }
-  const [facts, metrics, drift] = await Promise.all([
+  const [facts, metrics, drift, metricsHistory] = await Promise.all([
     readOptionalAgentData("facts", () => api.getLatestFacts(agentId)),
     readOptionalAgentData("metrics", () => api.getLatestMetrics(agentId)),
     readOptionalAgentData("drift", () => api.getLatestDrift(agentId)),
+    readOptionalAgentData("metrics history", () => api.listMetrics(agentId, { limit: TELEMETRY_PAGE_LIMIT })),
   ]);
   document.querySelector("#facts-panel").textContent = renderSnapshot(
     facts.value,
@@ -339,9 +581,19 @@ async function refreshSelectedAgent() {
     metrics.value,
     metrics.error || "No metrics snapshot.",
   );
+  document.querySelector("#facts-chart").innerHTML = facts.error
+    ? `<div class="empty">${escapeHtml(facts.error)}</div>`
+    : renderFactsInventory(facts.value, "No facts snapshot.");
+  document.querySelector("#metrics-chart").innerHTML = metricsHistory.error
+    ? `<div class="empty">${escapeHtml(metricsHistory.error)}</div>`
+    : renderTelemetryCharts(snapshotItems(metricsHistory.value), METRICS_CHARTS, "No metrics snapshots in the recent window.");
   document.querySelector("#drift-panel").innerHTML = drift.error
     ? `<div class="empty">${escapeHtml(drift.error)}</div>`
     : renderDrift(drift.value);
+}
+
+function snapshotItems(page) {
+  return Array.isArray(page?.items) ? page.items : [];
 }
 
 async function readOptionalAgentData(label, load) {
@@ -494,6 +746,20 @@ function boot() {
   }
   document.querySelector("#revoke-agent-key")?.addEventListener("click", () => {
     revokeSelectedAgentKey().catch((error) => setStatus(error.message, "error"));
+  });
+  document.querySelector("#refresh-telemetry")?.addEventListener("click", () => {
+    try {
+      syncAdminTokenFromInput({ requireToken: true });
+      if (!state.selectedAgentId) {
+        throw new Error("Select an agent before refreshing telemetry.");
+      }
+      setStatus(`Refreshing telemetry for ${state.selectedAgentId}...`);
+      refreshSelectedAgent()
+        .then(() => setStatus(`Refreshed telemetry for ${state.selectedAgentId}.`, "ok"))
+        .catch((error) => setStatus(error.message, "error"));
+    } catch (error) {
+      setStatus(error.message, "error");
+    }
   });
   const enrollmentForm = document.querySelector("#enrollment-token-form");
   if (enrollmentForm) {

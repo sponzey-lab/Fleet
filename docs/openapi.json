@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Sponzey Fleet Controller API",
-    "version": "0.1.11",
+    "version": "0.1.12",
     "summary": "REST API for the Sponzey Fleet controller.",
     "description": "Sponzey Fleet exposes controller APIs for agent enrollment, inventory, job dispatch, snapshots, drift reports, and audit events. HTTP transport is supported only for local or short-lived tests. Use HTTPS for product, production, shared, or long-running environments because HTTP does not provide confidentiality or integrity."
   },
@@ -208,7 +208,11 @@
             "description": "System time reported by the agent when it produced this snapshot.",
             "example": 1710000000000
           },
-          "body": { "type": "object", "additionalProperties": true }
+          "body": {
+            "type": "object",
+            "description": "Stable inventory payload. Facts should include relatively stable system characteristics such as OS, architecture, hostname, CPU logical count, total memory, memory module count when discoverable, root disk capacity, and network interface names. Facts should not include current CPU, memory, or disk usage.",
+            "additionalProperties": true
+          }
         },
         "additionalProperties": false
       },
@@ -223,7 +227,11 @@
             "description": "System time reported by the agent when it produced this snapshot.",
             "example": 1710000000000
           },
-          "body": { "type": "object", "additionalProperties": true },
+          "body": {
+            "type": "object",
+            "description": "Stable inventory payload. Facts should include relatively stable system characteristics such as OS, architecture, hostname, CPU logical count, total memory, memory module count when discoverable, root disk capacity, and network interface names. Facts should not include current CPU, memory, or disk usage.",
+            "additionalProperties": true
+          },
           "cursor": { "type": "string", "example": "1710000000:42" }
         },
         "additionalProperties": false
@@ -255,7 +263,11 @@
             "description": "System time reported by the agent when it produced this snapshot.",
             "example": 1710000000000
           },
-          "body": { "type": "object", "additionalProperties": true }
+          "body": {
+            "type": "object",
+            "description": "Usage telemetry payload. Metrics should include time-varying values such as CPU usage percent, memory used/available/used percent, disk used/available/used percent, process count, and service failure counts.",
+            "additionalProperties": true
+          }
         },
         "additionalProperties": false
       },
@@ -270,7 +282,11 @@
             "description": "System time reported by the agent when it produced this snapshot.",
             "example": 1710000000000
           },
-          "body": { "type": "object", "additionalProperties": true },
+          "body": {
+            "type": "object",
+            "description": "Usage telemetry payload. Metrics should include time-varying values such as CPU usage percent, memory used/available/used percent, disk used/available/used percent, process count, and service failure counts.",
+            "additionalProperties": true
+          },
           "cursor": { "type": "string", "example": "1710000000:42" }
         },
         "additionalProperties": false

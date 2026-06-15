@@ -491,18 +491,18 @@ Authorization: Bearer <admin-token>
     },
     "memory": {
       "total_kb": 16384256,
-      "available_kb": 8123456
+      "module_count_known": true,
+      "module_count": 2,
+      "module_count_source": "linux_dmi_type17"
     },
     "network": {
       "interfaces": ["lo", "eth0"]
     },
     "disk": {
       "root_mount_known": true,
-      "usage_available": true,
-      "total_kb": 52428800,
-      "used_kb": 18432000,
-      "available_kb": 33996800,
-      "used_percent": 35
+      "root_capacity_known": true,
+      "root_filesystem": "/dev/root",
+      "root_total_kb": 52428800
     },
     "degraded": {
       "status": false,
@@ -512,7 +512,7 @@ Authorization: Bearer <admin-token>
 }
 ```
 
-MVP의 agent facts snapshot은 heartbeat session에서 전송된다. `collected_at_ms`는 controller가 저장한 snapshot 시각이며, 신규 agent message에서는 agent가 보낸 message timestamp를 기준으로 한다. `agent_system_time_ms`는 해당 snapshot을 만든 agent 시스템 기준 시각이다. Facts/metrics payload 내부의 `body.system_time_ms`도 동일한 agent 시스템 시각을 담는다. 현재 수집 범위는 OS, architecture, platform family, hostname, CPU logical count, Linux `/proc/meminfo` 기반 memory, Linux `/proc/net/dev` 기반 network interface, root disk usage다. Facts payload의 `degraded.status=true`는 controller에서 agent 상태 `degraded`로 반영된다.
+Agent facts snapshot은 heartbeat session에서 전송된다. `collected_at_ms`는 controller가 저장한 snapshot 시각이며, 신규 agent message에서는 agent가 보낸 message timestamp를 기준으로 한다. `agent_system_time_ms`는 해당 snapshot을 만든 agent 시스템 기준 시각이다. Facts/metrics payload 내부의 `body.system_time_ms`도 동일한 agent 시스템 시각을 담는다. Facts는 OS, architecture, platform family, hostname, CPU logical count, memory total/module count, Linux `/proc/net/dev` 기반 network interface, root disk capacity 같은 비교적 변하지 않는 inventory만 담는다. 현재 메모리 사용량, 디스크 사용량, CPU 사용률은 facts가 아니라 metrics에 담는다. Facts payload의 `degraded.status=true`는 controller에서 agent 상태 `degraded`로 반영된다.
 
 ### Facts Snapshot Pages
 
@@ -561,11 +561,15 @@ Authorization: Bearer <admin-token>
   "body": {
     "system_time_ms": 1710000000000,
     "cpu": {
-      "logical_count": 4
+      "logical_count": 4,
+      "usage_percent": 18.4
     },
     "memory": {
+      "usage_available": true,
       "total_kb": 16384256,
-      "available_kb": 8123456
+      "used_kb": 8260800,
+      "available_kb": 8123456,
+      "used_percent": 50
     },
     "process": {
       "pid": 1234,
@@ -587,7 +591,7 @@ Authorization: Bearer <admin-token>
 }
 ```
 
-Metrics snapshot도 heartbeat session에서 전송된다. `collected_at_ms`는 저장된 snapshot 시각이고, `agent_system_time_ms`는 agent가 metrics를 만든 시스템 시각이다. MVP는 lightweight snapshot만 저장하며 time-series observability platform으로 확장하지 않는다. `service.status_available=false`는 systemd가 없거나 조회가 불가능한 환경을 의미하며, collector 실패로 process를 중단하지 않는다. Retention cleanup은 `sponzey retention cleanup`으로 명시적으로 실행한다.
+Metrics snapshot도 heartbeat session에서 전송된다. `collected_at_ms`는 저장된 snapshot 시각이고, `agent_system_time_ms`는 agent가 metrics를 만든 시스템 시각이다. Metrics는 CPU 사용률, 메모리 사용량/사용률, 디스크 사용량/사용률, process count, service failure count처럼 시간에 따라 변하는 사용량 telemetry를 담는다. MVP는 lightweight snapshot만 저장하며 time-series observability platform으로 확장하지 않는다. `service.status_available=false`는 systemd가 없거나 조회가 불가능한 환경을 의미하며, collector 실패로 process를 중단하지 않는다. Retention cleanup은 `sponzey retention cleanup`으로 명시적으로 실행한다.
 
 ### Metrics Snapshot Pages
 

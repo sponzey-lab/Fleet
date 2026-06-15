@@ -32,6 +32,13 @@ Controller 하나에 agent 여러 대가 붙습니다.
 | Enrollment token | `sponzey enroll-token create`가 출력합니다. agent를 등록할 때 한 번 씁니다.   |
 | Controller URL   | agent가 controller에 접속할 주소입니다. URL이 로컬이든 HTTPS든 설정 순서는 같습니다.   |
 
+Facts와 Metrics는 서로 다른 데이터입니다.
+
+| 데이터     | 뜻                                                                 |
+| ------- | ----------------------------------------------------------------- |
+| Facts   | 거의 변하지 않는 인벤토리입니다. OS, 아키텍처, hostname, CPU 코어 수, 메모리 총량/모듈 수, 디스크 총 용량, 네트워크 인터페이스 등을 담습니다. |
+| Metrics | 시간에 따라 변하는 사용량입니다. CPU 사용률, 메모리 사용량, 디스크 사용량, 프로세스 수, 실패한 서비스 수 등을 담습니다. |
+
 ## 설치
 
 ```bash
@@ -42,8 +49,9 @@ sponzey --help
 설치 후 `sponzey` 명령을 찾지 못하면 npm global bin 경로가 `PATH`에
 없는 상태입니다. 설치 스크립트는 가능한 경우 npm global `sponzey`
 launcher를 만들고, `/usr/local/bin`처럼 안전하고 쓰기 가능한 `PATH`
-안의 bin 디렉토리에도 launcher 생성을 시도합니다. 그래도 shell이
-`sponzey`를 찾지 못하면 먼저 npm bin 경로를 확인합니다.
+안의 bin 디렉토리에도 launcher 생성을 시도합니다. 설치 스크립트가 shell
+profile 파일을 조용히 수정하지는 않습니다. 그래도 shell이 `sponzey`를
+찾지 못하면 먼저 npm bin 경로를 확인합니다.
 
 ```bash
 echo "$(npm prefix -g)/bin"
@@ -213,6 +221,11 @@ Web Admin을 새로고침하면 agent 목록에 나타납니다.
 꺼져 있거나 네트워크가 끊겨도 기본적으로 계속 재시도합니다. 한 번만
 확인하려면 `--once`를 쓰고, 반복 접속 실패 후 명시적으로 종료시키고 싶을
 때만 `--max-reconnect-attempts <N>`을 사용합니다.
+
+기본적으로 agent는 30초마다 product-safe 운영 로그 조각도 올립니다. 이는
+agent 상태 이벤트이며, raw system log 파일을 자동 업로드하는 기능은
+아닙니다. 주기는 `--log-upload-interval-seconds <SECONDS>`로 바꾸고,
+업로드를 끄려면 `--disable-log-upload`을 사용합니다.
 
 ## HTTPS 준비
 

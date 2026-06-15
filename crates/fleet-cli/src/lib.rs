@@ -2,6 +2,7 @@ use clap::{Args, Parser, Subcommand};
 use fleet_core::{
     LogProfile, format_error_message, format_warning_message, init_logging, redact_secret,
 };
+use std::error::Error as StdError;
 use std::fmt::{Display, Formatter};
 use std::fs::{self, OpenOptions};
 use std::io::{BufReader, Read, Write};
@@ -12,7 +13,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::thread::JoinHandle;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio_rustls::rustls::{ClientConfig as RustlsClientConfig, RootCertStore};
 use tungstenite::client::IntoClientRequest;
@@ -177,7 +178,7 @@ pub enum AgentSubcommand {
     },
     #[command(
         about = "Start the enrolled local agent",
-        long_about = "Start the enrolled local agent heartbeat and task loop.\n\nThe agent reads its local identity from <data-dir>/agent/agent.conf, verifies the pinned controller fingerprint during heartbeat, sends facts and metrics, and receives controller-signed tasks. Connection failures are retried indefinitely by default. The agent must be enrolled before this command can run.",
+        long_about = "Start the enrolled local agent heartbeat and task loop.\n\nThe agent reads its local identity from <data-dir>/agent/agent.conf, verifies the pinned controller fingerprint during heartbeat, sends facts, metrics, and product-safe agent operational logs, and receives controller-signed tasks. Connection failures are retried indefinitely by default. The agent must be enrolled before this command can run.",
         after_help = "Examples:\n  sponzey agent start --data-dir .sponzey\n  sponzey agent start --data-dir /var/lib/sponzey-fleet\n  sponzey agent start --data-dir .sponzey --once\n\nLocal development flow:\n  sponzey controller init --data-dir .sponzey\n  sponzey enroll-token create --data-dir .sponzey --labels role=web,env=dev\n  sponzey agent init --data-dir .sponzey --url http://127.0.0.1:7700 --token <token> --name web-01 --labels role=web,env=dev\n  sponzey agent start --data-dir .sponzey"
     )]
     Start {
@@ -198,6 +199,14 @@ pub enum AgentSubcommand {
             help = "Seconds between heartbeats in continuous mode"
         )]
         heartbeat_interval_seconds: u64,
+        #[arg(long, help = "Disable periodic product-safe agent log upload")]
+        disable_log_upload: bool,
+        #[arg(
+            long,
+            default_value_t = 30,
+            help = "Seconds between product-safe agent log uploads"
+        )]
+        log_upload_interval_seconds: u64,
         #[arg(
             long,
             default_value_t = 0,
@@ -726,6 +735,8 @@ fn execute_agent(command: AgentCommand) -> Result<(), CliError> {
             data_dir,
             once,
             heartbeat_interval_seconds,
+            disable_log_upload,
+            log_upload_interval_seconds,
             max_reconnect_attempts,
         } => {
             let path = agent_dir(&data_dir).join("agent.conf");
@@ -735,6 +746,12 @@ fn execute_agent(command: AgentCommand) -> Result<(), CliError> {
                     "agent is not enrolled",
                 )));
             }
+            if log_upload_interval_seconds == 0 {
+                return Err(CliError::Http(
+                    "log upload interval must be at least 1 second; use --disable-log-upload to turn it off"
+                        .to_owned(),
+                ));
+            }
             let config = read_agent_config(&path)?;
             warn_if_insecure_http_url(&config.url);
             run_agent_heartbeat_loop(
@@ -742,6 +759,10 @@ fn execute_agent(command: AgentCommand) -> Result<(), CliError> {
                 AgentHeartbeatOptions {
                     once,
                     heartbeat_interval: Duration::from_secs(heartbeat_interval_seconds),
+                    log_upload: AgentLogUploadOptions {
+                        enabled: !disable_log_upload,
+                        interval: Duration::from_secs(log_upload_interval_seconds),
+                    },
                     max_reconnect_attempts,
                 },
             )?;
@@ -1268,9 +1289,9 @@ fn execute_demo(command: DemoCommand) -> Result<(), CliError> {
     wait_for_controller_health(port)?;
     let controller_url = format!("http://127.0.0.1:{port}");
     let agent_config = enroll_demo_agent(&data_dir, &controller_url, &enroll_token)?;
-    run_agent_heartbeat_once(&agent_config)?;
+    run_agent_heartbeat_once(&agent_config, true)?;
     create_demo_command_job(port, &admin_token)?;
-    run_agent_heartbeat_once(&agent_config)?;
+    run_agent_heartbeat_once(&agent_config, true)?;
     let output = http_get(port, "/api/jobs/job-demo-1/output", Some(&admin_token))?;
     if !output.contains("\"data\":\"demo-ok\"") {
         return Err(CliError::Http(format!(
@@ -1863,12 +1884,19 @@ fn enroll_agent_via_controller(
 ) -> Result<fleet_controller::EnrollAgentResponse, CliError> {
     let body = serde_json::to_string(request).map_err(|error| CliError::Http(error.to_string()))?;
     let endpoint = parse_controller_url(url)?;
+    let enroll_url = endpoint.api_url("/api/agents/enroll");
     let response = reqwest_client(tls_ca_cert)?
-        .post(endpoint.api_url("/api/agents/enroll"))
+        .post(&enroll_url)
         .header("content-type", "application/json")
         .body(body)
         .send()
-        .map_err(|error| CliError::Http(error.to_string()))?;
+        .map_err(|error| {
+            CliError::Http(http_request_error_message(
+                "agent enrollment",
+                &enroll_url,
+                &error,
+            ))
+        })?;
     let status = response.status();
     if status.as_u16() != 201 {
         return Err(CliError::Http(format!(
@@ -1887,10 +1915,17 @@ fn controller_identity_via_controller(
     tls_ca_cert: Option<&Path>,
 ) -> Result<fleet_controller::ControllerIdentityResponse, CliError> {
     let endpoint = parse_controller_url(url)?;
+    let identity_url = endpoint.api_url("/api/controller/identity");
     let response = reqwest_client(tls_ca_cert)?
-        .get(endpoint.api_url("/api/controller/identity"))
+        .get(&identity_url)
         .send()
-        .map_err(|error| CliError::Http(error.to_string()))?;
+        .map_err(|error| {
+            CliError::Http(http_request_error_message(
+                "controller identity request",
+                &identity_url,
+                &error,
+            ))
+        })?;
     let status = response.status();
     if status.as_u16() != 200 {
         return Err(CliError::Http(format!(
@@ -1902,6 +1937,23 @@ fn controller_identity_via_controller(
     response
         .json()
         .map_err(|error| CliError::Http(error.to_string()))
+}
+
+fn http_request_error_message(action: &str, url: &str, error: &dyn StdError) -> String {
+    let mut message = format!("{action} failed for {url}: {error}");
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let cause_message = cause.to_string();
+        if !cause_message.is_empty() && !message.contains(&cause_message) {
+            message.push_str(": ");
+            message.push_str(&cause_message);
+        }
+        source = cause.source();
+    }
+    message.push_str(
+        ". Check that the controller is running, the URL host/port are reachable from this agent, the controller is bound to a reachable host such as 0.0.0.0 for remote tests, and any firewall allows the port.",
+    );
+    message
 }
 
 fn reqwest_client(tls_ca_cert: Option<&Path>) -> Result<reqwest::blocking::Client, CliError> {
@@ -2144,7 +2196,14 @@ struct LocalAgentConfig {
 struct AgentHeartbeatOptions {
     once: bool,
     heartbeat_interval: Duration,
+    log_upload: AgentLogUploadOptions,
     max_reconnect_attempts: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AgentLogUploadOptions {
+    enabled: bool,
+    interval: Duration,
 }
 
 fn read_agent_config(path: &Path) -> Result<LocalAgentConfig, CliError> {
@@ -2213,7 +2272,7 @@ fn run_agent_heartbeat_loop(
 ) -> Result<(), CliError> {
     run_agent_heartbeat_loop_with(
         options,
-        || run_agent_heartbeat_once(config),
+        |upload_log| run_agent_heartbeat_once(config, upload_log),
         std::thread::sleep,
     )
 }
@@ -2224,18 +2283,25 @@ fn run_agent_heartbeat_loop_with<F, S>(
     mut sleep: S,
 ) -> Result<(), CliError>
 where
-    F: FnMut() -> Result<(), CliError>,
+    F: FnMut(bool) -> Result<(), CliError>,
     S: FnMut(Duration),
 {
     let mut reconnect_attempts = 0;
+    let mut elapsed_since_log_upload = options.log_upload.interval;
     loop {
-        match heartbeat_once() {
+        let upload_log = should_upload_agent_log(options.log_upload, elapsed_since_log_upload);
+        match heartbeat_once(upload_log) {
             Ok(()) => {
                 reconnect_attempts = 0;
                 println!("agent heartbeat sent");
                 if options.once {
                     return Ok(());
                 }
+                elapsed_since_log_upload = if upload_log {
+                    Duration::ZERO
+                } else {
+                    elapsed_since_log_upload.saturating_add(options.heartbeat_interval)
+                };
                 sleep(options.heartbeat_interval);
             }
             Err(error) => {
@@ -2256,11 +2322,18 @@ where
     }
 }
 
+fn should_upload_agent_log(options: AgentLogUploadOptions, elapsed: Duration) -> bool {
+    options.enabled && elapsed >= options.interval
+}
+
 fn reconnect_backoff(attempt: u32) -> Duration {
     Duration::from_secs(2_u64.saturating_pow(attempt.min(5)))
 }
 
-fn run_agent_heartbeat_once(config: &LocalAgentConfig) -> Result<(), CliError> {
+fn run_agent_heartbeat_once(
+    config: &LocalAgentConfig,
+    upload_agent_log: bool,
+) -> Result<(), CliError> {
     let identity = controller_identity_via_controller(&config.url, config.tls_ca_cert.as_deref())?;
     validate_pinned_controller_identity(config, &identity)?;
     let endpoint = parse_controller_url(&config.url)?;
@@ -2332,6 +2405,14 @@ fn run_agent_heartbeat_once(config: &LocalAgentConfig) -> Result<(), CliError> {
 
     send_facts_snapshot(&mut socket, config, &correlation_id)?;
     send_metrics_snapshot(&mut socket, config, &correlation_id)?;
+    if upload_agent_log {
+        send_agent_log_chunk(
+            &mut socket,
+            config,
+            &correlation_id,
+            &agent_operational_log_line(config),
+        )?;
+    }
     read_and_handle_task_assignment(
         &mut socket,
         config,
@@ -2340,6 +2421,38 @@ fn run_agent_heartbeat_once(config: &LocalAgentConfig) -> Result<(), CliError> {
     )?;
 
     Ok(())
+}
+
+fn send_agent_log_chunk(
+    socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
+    config: &LocalAgentConfig,
+    correlation_id: &str,
+    line: &str,
+) -> Result<(), CliError> {
+    let message = fleet_protocol::WireMessage::new(
+        prefixed_ulid("msg")?,
+        correlation_id.to_owned(),
+        Some(config.agent_id.clone()),
+        epoch_millis() as u64,
+        fleet_protocol::WirePayload::LogChunk {
+            agent_id: config.agent_id.clone(),
+            line: redact_and_truncate_log_line(line),
+        },
+    );
+    socket
+        .send(Message::Text(
+            fleet_protocol::encode_message(&message)
+                .map_err(|error| CliError::Http(error.to_string()))?,
+        ))
+        .map_err(|error| CliError::Http(error.to_string()))?;
+    Ok(())
+}
+
+fn agent_operational_log_line(config: &LocalAgentConfig) -> String {
+    format!(
+        "level=info event=agent_heartbeat_completed agent_id={} status=online",
+        config.agent_id
+    )
 }
 
 fn send_facts_snapshot(
@@ -2400,16 +2513,20 @@ fn collect_local_facts() -> serde_json::Value {
         .as_deref()
         .map(linux_network_interfaces)
         .unwrap_or_default();
-    let disk_usage = collect_root_disk_usage();
+    let memory_total_kb = meminfo
+        .as_deref()
+        .and_then(|body| linux_meminfo_kb(body, "MemTotal"));
+    let memory_modules = collect_memory_module_inventory();
+    let root_disk = collect_root_disk_usage();
     let mut degraded_signals = Vec::new();
-    if meminfo.is_none() {
+    if memory_total_kb.is_none() {
         degraded_signals.push("memory_facts_unavailable");
     }
     if network_body.is_none() {
         degraded_signals.push("network_facts_unavailable");
     }
-    if disk_usage.is_none() {
-        degraded_signals.push("disk_usage_unavailable");
+    if root_disk.is_none() {
+        degraded_signals.push("disk_inventory_unavailable");
     }
 
     serde_json::json!({
@@ -2429,18 +2546,18 @@ fn collect_local_facts() -> serde_json::Value {
                 .unwrap_or(0),
         },
         "memory": {
-            "total_kb": meminfo.as_deref().and_then(|body| linux_meminfo_kb(body, "MemTotal")),
-            "available_kb": meminfo.as_deref().and_then(|body| linux_meminfo_kb(body, "MemAvailable")),
+            "total_kb": memory_total_kb,
+            "module_count_known": memory_modules.is_some(),
+            "module_count": memory_modules.as_ref().map(|inventory| inventory.count),
+            "module_count_source": memory_modules.as_ref().map(|inventory| inventory.source),
         },
         "disk": {
             "root_mount_known": read_optional_trimmed("/proc/mounts")
                 .map(|body| body.lines().any(|line| line.split_whitespace().nth(1) == Some("/")))
                 .unwrap_or(false),
-            "usage_available": disk_usage.is_some(),
-            "total_kb": disk_usage.as_ref().map(|usage| usage.total_kb),
-            "used_kb": disk_usage.as_ref().map(|usage| usage.used_kb),
-            "available_kb": disk_usage.as_ref().map(|usage| usage.available_kb),
-            "used_percent": disk_usage.as_ref().map(|usage| usage.used_percent),
+            "root_capacity_known": root_disk.is_some(),
+            "root_filesystem": root_disk.as_ref().map(|usage| usage.filesystem.as_str()),
+            "root_total_kb": root_disk.as_ref().map(|usage| usage.total_kb),
         },
         "network": {
             "interfaces": network_interfaces,
@@ -2455,6 +2572,8 @@ fn collect_local_facts() -> serde_json::Value {
 fn collect_local_metrics() -> serde_json::Value {
     let system_time_ms = epoch_millis() as u64;
     let meminfo = read_optional_trimmed("/proc/meminfo");
+    let memory_usage = meminfo.as_deref().and_then(memory_usage_from_meminfo);
+    let cpu_usage_percent = collect_cpu_usage_percent();
     let disk_usage = collect_root_disk_usage();
     let service_summary = collect_systemd_service_summary();
 
@@ -2464,13 +2583,18 @@ fn collect_local_metrics() -> serde_json::Value {
             "logical_count": std::thread::available_parallelism()
                 .map(|value| value.get())
                 .unwrap_or(0),
+            "usage_percent": cpu_usage_percent,
         },
         "memory": {
-            "total_kb": meminfo.as_deref().and_then(|body| linux_meminfo_kb(body, "MemTotal")),
-            "available_kb": meminfo.as_deref().and_then(|body| linux_meminfo_kb(body, "MemAvailable")),
+            "usage_available": memory_usage.is_some(),
+            "total_kb": memory_usage.as_ref().map(|usage| usage.total_kb),
+            "used_kb": memory_usage.as_ref().map(|usage| usage.used_kb),
+            "available_kb": memory_usage.as_ref().map(|usage| usage.available_kb),
+            "used_percent": memory_usage.as_ref().map(|usage| usage.used_percent),
         },
         "disk": {
             "usage_available": disk_usage.is_some(),
+            "filesystem": disk_usage.as_ref().map(|usage| usage.filesystem.as_str()),
             "total_kb": disk_usage.as_ref().map(|usage| usage.total_kb),
             "used_kb": disk_usage.as_ref().map(|usage| usage.used_kb),
             "available_kb": disk_usage.as_ref().map(|usage| usage.available_kb),
@@ -2490,6 +2614,7 @@ fn collect_local_metrics() -> serde_json::Value {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DiskUsage {
+    filesystem: String,
     total_kb: u64,
     used_kb: u64,
     available_kb: u64,
@@ -2516,11 +2641,131 @@ fn parse_df_root_usage(body: &str) -> Option<DiskUsage> {
         return None;
     }
     Some(DiskUsage {
+        filesystem: parts.first()?.to_string(),
         total_kb: parts.get(1)?.parse().ok()?,
         used_kb: parts.get(2)?.parse().ok()?,
         available_kb: parts.get(3)?.parse().ok()?,
         used_percent: parts.get(4)?.trim_end_matches('%').parse().ok()?,
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MemoryUsage {
+    total_kb: u64,
+    used_kb: u64,
+    available_kb: u64,
+    used_percent: u8,
+}
+
+fn memory_usage_from_meminfo(body: &str) -> Option<MemoryUsage> {
+    let total_kb = linux_meminfo_kb(body, "MemTotal")?;
+    let available_kb = linux_meminfo_kb(body, "MemAvailable")?;
+    let used_kb = total_kb.saturating_sub(available_kb);
+    let used_percent = used_kb
+        .saturating_mul(100)
+        .checked_div(total_kb)
+        .unwrap_or(0)
+        .min(100) as u8;
+    Some(MemoryUsage {
+        total_kb,
+        used_kb,
+        available_kb,
+        used_percent,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MemoryModuleInventory {
+    count: usize,
+    source: &'static str,
+}
+
+fn collect_memory_module_inventory() -> Option<MemoryModuleInventory> {
+    linux_edac_memory_module_count(Path::new("/sys/devices/system/edac/mc"))
+        .map(|count| MemoryModuleInventory {
+            count,
+            source: "linux_edac",
+        })
+        .or_else(|| {
+            linux_dmi_memory_device_count(Path::new("/sys/firmware/dmi/entries")).map(|count| {
+                MemoryModuleInventory {
+                    count,
+                    source: "linux_dmi_type17",
+                }
+            })
+        })
+}
+
+fn linux_edac_memory_module_count(path: &Path) -> Option<usize> {
+    let mut count = 0usize;
+    let controllers = fs::read_dir(path).ok()?;
+    for controller in controllers.filter_map(Result::ok) {
+        let controller_name = controller.file_name();
+        if !controller_name.to_string_lossy().starts_with("mc") {
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(controller.path()) else {
+            continue;
+        };
+        count += entries
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("dimm"))
+            .count();
+    }
+    (count > 0).then_some(count)
+}
+
+fn linux_dmi_memory_device_count(path: &Path) -> Option<usize> {
+    let count = fs::read_dir(path)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("17-"))
+        .count();
+    (count > 0).then_some(count)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CpuSample {
+    idle: u64,
+    total: u64,
+}
+
+fn collect_cpu_usage_percent() -> Option<f64> {
+    let first = read_linux_cpu_sample("/proc/stat")?;
+    thread::sleep(Duration::from_millis(100));
+    let second = read_linux_cpu_sample("/proc/stat")?;
+    cpu_usage_percent_between(first, second)
+}
+
+fn read_linux_cpu_sample(path: &str) -> Option<CpuSample> {
+    let body = fs::read_to_string(path).ok()?;
+    parse_linux_cpu_sample(&body)
+}
+
+fn parse_linux_cpu_sample(body: &str) -> Option<CpuSample> {
+    let line = body.lines().find(|line| line.starts_with("cpu "))?;
+    let values = line
+        .split_whitespace()
+        .skip(1)
+        .map(str::parse::<u64>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    if values.len() < 4 {
+        return None;
+    }
+    let idle = values.get(3).copied().unwrap_or(0) + values.get(4).copied().unwrap_or(0);
+    let total = values.iter().copied().sum();
+    Some(CpuSample { idle, total })
+}
+
+fn cpu_usage_percent_between(first: CpuSample, second: CpuSample) -> Option<f64> {
+    let total_delta = second.total.checked_sub(first.total)?;
+    if total_delta == 0 {
+        return None;
+    }
+    let idle_delta = second.idle.saturating_sub(first.idle).min(total_delta);
+    let busy_delta = total_delta - idle_delta;
+    Some(((busy_delta as f64 / total_delta as f64) * 1000.0).round() / 10.0)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3062,6 +3307,34 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
 
+    #[derive(Debug)]
+    struct OuterHttpTestError {
+        source: InnerHttpTestError,
+    }
+
+    impl Display for OuterHttpTestError {
+        fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "outer request failed")
+        }
+    }
+
+    impl StdError for OuterHttpTestError {
+        fn source(&self) -> Option<&(dyn StdError + 'static)> {
+            Some(&self.source)
+        }
+    }
+
+    #[derive(Debug)]
+    struct InnerHttpTestError;
+
+    impl Display for InnerHttpTestError {
+        fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "connection refused")
+        }
+    }
+
+    impl StdError for InnerHttpTestError {}
+
     #[test]
     fn parses_controller_init() {
         let cli = Cli::try_parse_from(["sponzey", "controller", "init"]).expect("valid command");
@@ -3071,6 +3344,26 @@ mod tests {
                 command: ControllerSubcommand::Init { .. }
             })
         ));
+    }
+
+    #[test]
+    fn http_request_error_message_includes_source_chain_and_connect_hint() {
+        let error = OuterHttpTestError {
+            source: InnerHttpTestError,
+        };
+
+        let message = http_request_error_message(
+            "agent enrollment",
+            "http://192.168.10.11:7700/api/agents/enroll",
+            &error,
+        );
+
+        assert!(message.contains("agent enrollment failed"));
+        assert!(message.contains("outer request failed"));
+        assert!(message.contains("connection refused"));
+        assert!(message.contains("controller is running"));
+        assert!(message.contains("0.0.0.0"));
+        assert!(message.contains("firewall"));
     }
 
     #[test]
@@ -3615,6 +3908,7 @@ mod tests {
         assert_eq!(
             parse_df_root_usage(body),
             Some(DiskUsage {
+                filesystem: "/dev/root".to_owned(),
                 total_kb: 102_400,
                 used_kb: 51_200,
                 available_kb: 51_200,
@@ -3676,11 +3970,51 @@ postgresql.service loaded failed failed PostgreSQL database server
                 .is_some()
         );
         assert!(facts.get("network").is_some());
+        let memory = facts
+            .get("memory")
+            .expect("facts must include memory inventory");
         assert!(
-            facts
-                .get("disk")
-                .and_then(|value| value.get("usage_available"))
-                .is_some()
+            memory.get("total_kb").is_some(),
+            "facts must include total memory capacity",
+        );
+        assert!(
+            memory.get("module_count_known").is_some(),
+            "facts must expose whether memory module count is known",
+        );
+        assert!(
+            memory.get("available_kb").is_none(),
+            "facts must not include current memory availability",
+        );
+        assert!(
+            memory.get("used_kb").is_none(),
+            "facts must not include current memory usage",
+        );
+        assert!(
+            memory.get("used_percent").is_none(),
+            "facts must not include current memory usage percent",
+        );
+        let disk = facts
+            .get("disk")
+            .expect("facts must include disk inventory");
+        assert!(
+            disk.get("root_capacity_known").is_some(),
+            "facts must expose whether root disk capacity is known",
+        );
+        assert!(
+            disk.get("root_total_kb").is_some(),
+            "facts must include root disk total capacity",
+        );
+        assert!(
+            disk.get("used_kb").is_none(),
+            "facts must not include current disk usage",
+        );
+        assert!(
+            disk.get("available_kb").is_none(),
+            "facts must not include current disk availability",
+        );
+        assert!(
+            disk.get("used_percent").is_none(),
+            "facts must not include current disk usage percent",
         );
         assert!(
             facts
@@ -3709,9 +4043,28 @@ postgresql.service loaded failed failed PostgreSQL database server
                 .and_then(|value| value.get("logical_count"))
                 .is_some()
         );
-        assert!(metrics.get("memory").is_some());
+        assert!(
+            metrics
+                .get("cpu")
+                .and_then(|value| value.get("usage_percent"))
+                .is_some(),
+            "metrics must include current CPU usage percent",
+        );
+        let memory = metrics
+            .get("memory")
+            .expect("metrics must include memory usage");
+        assert!(memory.get("usage_available").is_some());
+        assert!(memory.get("used_kb").is_some());
+        assert!(memory.get("available_kb").is_some());
+        assert!(memory.get("used_percent").is_some());
         assert!(metrics.get("process").is_some());
-        assert!(metrics.get("disk").is_some());
+        let disk = metrics
+            .get("disk")
+            .expect("metrics must include disk usage");
+        assert!(disk.get("usage_available").is_some());
+        assert!(disk.get("used_kb").is_some());
+        assert!(disk.get("available_kb").is_some());
+        assert!(disk.get("used_percent").is_some());
         assert!(
             metrics
                 .get("service")
@@ -3721,6 +4074,34 @@ postgresql.service loaded failed failed PostgreSQL database server
         let body = metrics.to_string();
         assert!(!body.contains("token="));
         assert!(!body.contains("secret="));
+    }
+
+    #[test]
+    fn memory_usage_from_meminfo_calculates_current_usage() {
+        let usage = memory_usage_from_meminfo(
+            "MemTotal:       1000 kB\nMemFree:         100 kB\nMemAvailable:    250 kB\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            usage,
+            MemoryUsage {
+                total_kb: 1000,
+                used_kb: 750,
+                available_kb: 250,
+                used_percent: 75,
+            }
+        );
+    }
+
+    #[test]
+    fn cpu_usage_percent_uses_proc_stat_delta() {
+        let first = parse_linux_cpu_sample("cpu  100 0 50 850 0 0 0 0 0 0\n").unwrap();
+        let second = parse_linux_cpu_sample("cpu  130 0 70 900 0 0 0 0 0 0\n").unwrap();
+
+        assert_eq!(first.total, 1000);
+        assert_eq!(second.total, 1100);
+        assert_eq!(cpu_usage_percent_between(first, second), Some(50.0));
     }
 
     #[test]
@@ -3778,15 +4159,44 @@ postgresql.service loaded failed failed PostgreSQL database server
             "Start the enrolled local agent heartbeat and task loop",
             "agent/agent.conf",
             "controller-signed tasks",
+            "product-safe agent operational logs",
             "Connection failures are retried indefinitely by default",
             "The agent must be enrolled before this command can run",
             "Examples:",
             "Local development flow:",
             "--heartbeat-interval-seconds",
+            "--disable-log-upload",
+            "--log-upload-interval-seconds",
             "0 means retry indefinitely",
         ] {
             assert!(help.contains(expected), "missing help entry: {expected}");
         }
+    }
+
+    #[test]
+    fn agent_start_parses_log_upload_options() {
+        let cli = Cli::try_parse_from([
+            "sponzey",
+            "agent",
+            "start",
+            "--data-dir",
+            ".sponzey",
+            "--disable-log-upload",
+            "--log-upload-interval-seconds",
+            "45",
+        ])
+        .expect("agent start should parse");
+
+        assert!(matches!(
+            cli.command,
+            Command::Agent(AgentCommand {
+                command: AgentSubcommand::Start {
+                    disable_log_upload: true,
+                    log_upload_interval_seconds: 45,
+                    ..
+                }
+            })
+        ));
     }
 
     #[test]
@@ -4103,6 +4513,72 @@ postgresql.service loaded failed failed PostgreSQL database server
     }
 
     #[test]
+    fn agent_log_upload_due_respects_disable_and_interval() {
+        let enabled = AgentLogUploadOptions {
+            enabled: true,
+            interval: Duration::from_secs(30),
+        };
+        let disabled = AgentLogUploadOptions {
+            enabled: false,
+            interval: Duration::from_secs(30),
+        };
+
+        assert!(should_upload_agent_log(enabled, Duration::from_secs(30)));
+        assert!(!should_upload_agent_log(enabled, Duration::from_secs(29)));
+        assert!(!should_upload_agent_log(disabled, Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn agent_heartbeat_loop_uploads_log_immediately_by_default() {
+        let mut upload_flags = Vec::new();
+
+        let result = run_agent_heartbeat_loop_with(
+            AgentHeartbeatOptions {
+                once: true,
+                heartbeat_interval: Duration::from_secs(30),
+                log_upload: AgentLogUploadOptions {
+                    enabled: true,
+                    interval: Duration::from_secs(30),
+                },
+                max_reconnect_attempts: 0,
+            },
+            |upload_log| {
+                upload_flags.push(upload_log);
+                Ok(())
+            },
+            |_| panic!("once mode must not sleep after success"),
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(upload_flags, vec![true]);
+    }
+
+    #[test]
+    fn agent_heartbeat_loop_respects_disabled_log_upload() {
+        let mut upload_flags = Vec::new();
+
+        let result = run_agent_heartbeat_loop_with(
+            AgentHeartbeatOptions {
+                once: true,
+                heartbeat_interval: Duration::from_secs(30),
+                log_upload: AgentLogUploadOptions {
+                    enabled: false,
+                    interval: Duration::from_secs(30),
+                },
+                max_reconnect_attempts: 0,
+            },
+            |upload_log| {
+                upload_flags.push(upload_log);
+                Ok(())
+            },
+            |_| panic!("once mode must not sleep after success"),
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(upload_flags, vec![false]);
+    }
+
+    #[test]
     fn agent_heartbeat_loop_retries_connection_failures_until_configured_cap() {
         let mut attempts = 0;
         let mut sleeps = Vec::new();
@@ -4111,9 +4587,13 @@ postgresql.service loaded failed failed PostgreSQL database server
             AgentHeartbeatOptions {
                 once: false,
                 heartbeat_interval: Duration::from_secs(30),
+                log_upload: AgentLogUploadOptions {
+                    enabled: true,
+                    interval: Duration::from_secs(30),
+                },
                 max_reconnect_attempts: 2,
             },
-            || {
+            |_| {
                 attempts += 1;
                 Err(CliError::Http(format!("connection refused #{attempts}")))
             },
@@ -4133,9 +4613,13 @@ postgresql.service loaded failed failed PostgreSQL database server
             AgentHeartbeatOptions {
                 once: true,
                 heartbeat_interval: Duration::from_secs(30),
+                log_upload: AgentLogUploadOptions {
+                    enabled: true,
+                    interval: Duration::from_secs(30),
+                },
                 max_reconnect_attempts: 0,
             },
-            || {
+            |_| {
                 attempts += 1;
                 Err(CliError::Http("connection refused".to_owned()))
             },

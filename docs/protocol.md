@@ -107,6 +107,9 @@ task 실행과 결과 전달용 payload:
 
 Facts and metrics payloads include a lightweight system timestamp inside the JSON body so operators can identify when the agent produced the snapshot even after paging or exporting API responses.
 
+- `facts_snapshot` is inventory data. It should describe relatively stable system characteristics such as OS, architecture, hostname, CPU logical count, total memory, memory module count when discoverable, root filesystem, root disk capacity, and network interface names. It must not carry current memory usage, disk usage, or CPU usage.
+- `metrics_snapshot` is usage telemetry. It should describe values that change over time, such as CPU usage percent, memory used/available/used percent, disk used/available/used percent, process count, and service failure counts.
+
 Facts snapshot:
 
 ```json
@@ -114,7 +117,7 @@ Facts snapshot:
   "type": "facts_snapshot",
   "payload": {
     "agent_id": "agent-1",
-    "body": "{\"system_time_ms\":1710000000000,\"os\":\"linux\",\"arch\":\"x86_64\"}"
+    "body": "{\"system_time_ms\":1710000000000,\"os\":\"linux\",\"arch\":\"x86_64\",\"memory\":{\"total_kb\":16777216,\"module_count_known\":true,\"module_count\":2},\"disk\":{\"root_capacity_known\":true,\"root_total_kb\":104857600}}"
   }
 }
 ```
@@ -126,12 +129,29 @@ Metrics snapshot:
   "type": "metrics_snapshot",
   "payload": {
     "agent_id": "agent-1",
-    "body": "{\"system_time_ms\":1710000000000,\"cpu\":{\"logical_count\":4}}"
+    "body": "{\"system_time_ms\":1710000000000,\"cpu\":{\"logical_count\":4,\"usage_percent\":18.4},\"memory\":{\"usage_available\":true,\"total_kb\":16777216,\"used_kb\":4194304,\"available_kb\":12582912,\"used_percent\":25},\"disk\":{\"usage_available\":true,\"total_kb\":104857600,\"used_kb\":31457280,\"available_kb\":73400320,\"used_percent\":30}}"
   }
 }
 ```
 
 Drift report does not carry an arbitrary JSON body, so controller uses the agent message envelope `timestamp_ms` as both `checked_at_ms` and `agent_system_time_ms`.
+
+Agent operational log chunk:
+
+```json
+{
+  "type": "log_chunk",
+  "payload": {
+    "agent_id": "agent-1",
+    "line": "level=info event=agent_heartbeat_completed agent_id=agent-1 status=online"
+  }
+}
+```
+
+The default agent start mode sends product-safe operational log chunks every
+30 seconds. Operators can change the interval with
+`--log-upload-interval-seconds` or disable it with `--disable-log-upload`.
+These chunks are not raw file tails or journald streams.
 
 ## Signed Task Envelope
 
