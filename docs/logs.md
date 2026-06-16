@@ -1,6 +1,7 @@
-# Sponzey Fleet MVP Logs
+# Sponzey Fleet Logs
 
-MVP log handling is a field diagnostic surface. It is not a log aggregation or archival product.
+Current log handling is a field diagnostic surface. It is not a log aggregation
+or archival product.
 
 ## Agent Operational Log Upload
 
@@ -22,9 +23,23 @@ Current behavior:
 - redacts secret-like values before sending,
 - controller stores received chunks in `agent_log_chunks`.
 
-The upload interval is evaluated during the agent heartbeat loop. The default
-heartbeat interval is also 30 seconds, so operational logs are sent every
-heartbeat unless disabled.
+The upload interval is independent from heartbeat, facts, metrics, and task
+dispatch. Heartbeat is only the liveness signal for the persistent agent
+session. Operational log chunks are sent on their own interval and do not wait
+for command output or task completion.
+
+Stored operational log chunks are available through the controller API:
+
+```http
+GET /api/agents/{agent_id}/logs?limit=50&before=<cursor>
+Authorization: Bearer <admin-token>
+```
+
+The endpoint returns newest chunks first with the same cursor paging contract as
+facts, metrics, and drift pages. `next_cursor` is passed back as `before` to
+read older chunks. This stream is intentionally separate from
+`GET /api/jobs/{job_id}/output`, which is the only API surface for command
+stdout/stderr chunks.
 
 ## File Tail
 
@@ -42,7 +57,8 @@ Current behavior:
 - with `--follow`, polls the same file for appended lines,
 - with `--max-duration-seconds`, exits the follow loop after the requested duration.
 
-The optional `target` argument is accepted for operator context, but MVP file tail does not yet open a remote file through an agent task.
+The optional `target` argument is accepted for operator context, but current file
+tail does not yet open a remote file through an agent task.
 
 ## Journald Shortcut Skeleton
 
@@ -58,5 +74,6 @@ This is a skeleton for the later systemd/journald adapter. It validates the serv
 
 - Product application logs do not include tailed log lines.
 - Log stream output is redacted independently from application logging.
-- Log tail artifacts are not persisted separately in MVP.
+- Agent operational log chunks are persisted in `agent_log_chunks` and cleaned by explicit retention cleanup.
+- Raw file tail and journald stream artifacts are not persisted separately in MVP.
 - Remote raw file or journald log streaming remains a later signed task/streaming protocol feature.

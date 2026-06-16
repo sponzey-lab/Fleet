@@ -55,6 +55,11 @@ run ./scripts/npm_demo_smoke.sh
 run ./scripts/smoke_mvp.sh
 run ./scripts/smoke_immediate_dispatch.sh
 run ./scripts/smoke_remote_tls_loopback.sh
+if [ -f dist/release/SHA256SUMS ]; then
+  run ./scripts/verify_standalone_artifacts.sh dist/release
+else
+  echo "standalone artifact verification skipped: dist/release/SHA256SUMS not found."
+fi
 if [ -f target/release/sponzey ]; then
   run ./scripts/check_linux_glibc_baseline.sh target/release/sponzey
 else

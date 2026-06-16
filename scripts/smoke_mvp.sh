@@ -104,7 +104,7 @@ fi
 curl -fsS \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"job_id":"job-remote-1","target_agent_ids":[],"selector":"role=web","program":"printf","args":["remote-ok"],"timeout_seconds":30,"confirmed_high_risk":true,"confirmed_by":"smoke-admin","expires_in_seconds":60,"nonce_prefix":"remote-smoke"}' \
+  -d '{"job_id":"job-remote-1","target_agent_ids":[],"selector":"role=web","program":"echo","args":["remote-ok"],"timeout_seconds":30,"confirmed_high_risk":false,"confirmed_by":"smoke-admin","expires_in_seconds":60,"nonce_prefix":"remote-smoke"}' \
   "$CONTROLLER_URL/api/jobs/command" >/dev/null
 
 i=0
@@ -120,7 +120,7 @@ while [ "$i" -lt 50 ]; do
   esac
   if [ "$REMOTE_STATUS" = "success" ]; then
     case "$REMOTE_OUTPUT_API" in
-      *'"data":"remote-ok"'*) break ;;
+      *remote-ok*) break ;;
     esac
   fi
   i=$((i + 1))
@@ -134,7 +134,7 @@ if [ "$REMOTE_STATUS" != "success" ]; then
   exit 1
 fi
 case "$REMOTE_OUTPUT_API" in
-  *'"data":"remote-ok"'*) ;;
+  *remote-ok*) ;;
   *)
     echo "remote output API smoke failed: $REMOTE_OUTPUT_API" >&2
     exit 1
@@ -193,11 +193,21 @@ cat > "$RUNBOOK_REQUEST" <<'JSON'
   "nonce_prefix": "runbook-smoke"
 }
 JSON
-curl -fsS \
+RUNBOOK_CREATE_API="$(curl -fsS \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   --data-binary "@$RUNBOOK_REQUEST" \
-  "$CONTROLLER_URL/api/jobs/runbook" >/dev/null
+  "$CONTROLLER_URL/api/jobs/runbook")"
+RUNBOOK_APPROVAL_ID="$(printf '%s\n' "$RUNBOOK_CREATE_API" | sed -n 's/.*"approval_request_id":"\([^"]*\)".*/\1/p')"
+if [ -z "$RUNBOOK_APPROVAL_ID" ]; then
+  echo "runbook approval id was not returned: $RUNBOOK_CREATE_API" >&2
+  exit 1
+fi
+curl -fsS \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"reason":"approved by smoke test"}' \
+  "$CONTROLLER_URL/api/approvals/$RUNBOOK_APPROVAL_ID/approve" >/dev/null
 
 i=0
 RUNBOOK_STATUS=""

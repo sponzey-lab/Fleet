@@ -1,12 +1,14 @@
 use fleet_domain::{
-    AgentId, DriftReport, DriftStatus, JobError, PackageState, Policy, PolicyCheck, Runbook,
-    RunbookTask, ServicePrimitiveState, ServiceState, TaskEnvelope,
+    AgentId, DriftAcknowledgement, DriftReport, DriftSeverity, DriftStatus, JobError, PackageState,
+    Policy, PolicyCheck, Runbook, RunbookTask, ServicePrimitiveState, ServiceState, TaskEnvelope,
 };
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::io::Read;
+use std::net::{TcpStream, ToSocketAddrs};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
@@ -142,6 +144,19 @@ pub struct PrimitiveCommand {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackagePresentSpec {
+    pub name: String,
+    pub manager: LinuxPackageManager,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceApplySpec {
+    pub name: String,
+    pub state: ServicePrimitiveState,
+    pub enabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunbookExecutionPlan {
     pub runbook_name: String,
     pub steps: Vec<RunbookExecutionStep>,
@@ -150,6 +165,8 @@ pub struct RunbookExecutionPlan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RunbookExecutionOptions {
     pub confirmed_high_risk: bool,
+    pub check_mode: bool,
+    pub dry_run: bool,
     pub command_timeout: Duration,
     pub max_output_bytes: usize,
 }
@@ -158,26 +175,91 @@ impl Default for RunbookExecutionOptions {
     fn default() -> Self {
         Self {
             confirmed_high_risk: false,
+            check_mode: false,
+            dry_run: false,
             command_timeout: Duration::from_secs(60),
             max_output_bytes: 1024 * 1024,
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RunbookExecutionReport {
     pub runbook_name: String,
     pub outcomes: Vec<RunbookStepOutcome>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl RunbookExecutionReport {
+    pub fn aggregate_status(&self) -> PrimitiveResultStatus {
+        if self
+            .outcomes
+            .iter()
+            .any(|outcome| outcome.status == PrimitiveResultStatus::Canceled)
+        {
+            PrimitiveResultStatus::Canceled
+        } else if self
+            .outcomes
+            .iter()
+            .any(|outcome| outcome.status == PrimitiveResultStatus::Rejected)
+        {
+            PrimitiveResultStatus::Rejected
+        } else if self
+            .outcomes
+            .iter()
+            .any(|outcome| outcome.status == PrimitiveResultStatus::Failed)
+        {
+            PrimitiveResultStatus::Failed
+        } else if self
+            .outcomes
+            .iter()
+            .any(|outcome| outcome.status == PrimitiveResultStatus::Changed)
+        {
+            PrimitiveResultStatus::Changed
+        } else if !self.outcomes.is_empty()
+            && self
+                .outcomes
+                .iter()
+                .all(|outcome| outcome.status == PrimitiveResultStatus::Skipped)
+        {
+            PrimitiveResultStatus::Skipped
+        } else {
+            PrimitiveResultStatus::Success
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RunbookStepOutcome {
     pub id: String,
+    pub status: PrimitiveResultStatus,
     pub changed: Option<bool>,
+    pub message: String,
+    pub diff: Option<PrimitiveDiff>,
+    pub started_at_ms: u64,
+    pub completed_at_ms: u64,
+    pub duration_ms: u64,
     pub exit_code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
     pub audit_metadata: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrimitiveResultStatus {
+    Success,
+    Changed,
+    Skipped,
+    Failed,
+    Rejected,
+    Canceled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PrimitiveDiff {
+    pub format: String,
+    pub before: Option<String>,
+    pub after: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -189,7 +271,66 @@ pub struct RunbookExecutionStep {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunbookExecutionAction {
     Command(PrimitiveCommand),
+    PackagePresent(PackagePresentSpec),
+    ServiceApply(ServiceApplySpec),
     FileCopy(FileCopySpec),
+    PortCheck(PortCheckSpec),
+    ProcessCheck(ProcessCheckSpec),
+    Snapshot(SnapshotSpec),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortCheckSpec {
+    pub host: String,
+    pub port: u16,
+    pub timeout: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessCheckSpec {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotSpec {
+    pub kind: SnapshotKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotKind {
+    Facts,
+    Metrics,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrimitiveProbeResult {
+    pub matched: bool,
+    pub message: String,
+    pub detail: String,
+}
+
+impl PrimitiveProbeResult {
+    pub fn matched(message: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            matched: true,
+            message: message.into(),
+            detail: detail.into(),
+        }
+    }
+
+    pub fn unmatched(message: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            matched: false,
+            message: message.into(),
+            detail: detail.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotResult {
+    pub message: String,
+    pub body: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -241,6 +382,8 @@ pub enum PrimitiveError {
     EmptyName,
     UnsupportedPackageManager,
     UnsafeServiceName(String),
+    UnsafeHost(String),
+    UnsafeProcessName(String),
     UnsafePath(String),
     ParentDirectoryMissing(String),
     PermissionDenied(String),
@@ -253,6 +396,8 @@ impl Display for PrimitiveError {
             Self::EmptyName => write!(formatter, "primitive name cannot be empty"),
             Self::UnsupportedPackageManager => write!(formatter, "unsupported package manager"),
             Self::UnsafeServiceName(name) => write!(formatter, "unsafe service name: {name}"),
+            Self::UnsafeHost(host) => write!(formatter, "unsafe host value: {host}"),
+            Self::UnsafeProcessName(name) => write!(formatter, "unsafe process name: {name}"),
             Self::UnsafePath(path) => write!(formatter, "unsafe file destination: {path}"),
             Self::ParentDirectoryMissing(path) => {
                 write!(
@@ -443,44 +588,22 @@ pub fn build_runbook_execution_plan(
             RunbookTask::Package(package) => match package.state {
                 PackageState::Present => {
                     steps.push(RunbookExecutionStep {
-                        id: format!("{}:check", package.id),
-                        action: RunbookExecutionAction::Command(package_present_check_command(
-                            &package.name,
-                        )?),
-                    });
-                    steps.push(RunbookExecutionStep {
-                        id: format!("{}:install", package.id),
-                        action: RunbookExecutionAction::Command(package_install_command(
-                            package_manager,
-                            &package.name,
-                        )?),
+                        id: format!("{}:package", package.id),
+                        action: RunbookExecutionAction::PackagePresent(PackagePresentSpec {
+                            name: package.name.clone(),
+                            manager: package_manager,
+                        }),
                     });
                 }
             },
             RunbookTask::Service(service) => {
                 steps.push(RunbookExecutionStep {
-                    id: format!("{}:status", service.id),
-                    action: RunbookExecutionAction::Command(systemd_service_status_command(
-                        &service.name,
-                    )?),
-                });
-                if service.enabled == Some(true) {
-                    steps.push(RunbookExecutionStep {
-                        id: format!("{}:enable", service.id),
-                        action: RunbookExecutionAction::Command(systemd_service_enable_command(
-                            &service.name,
-                        )?),
-                    });
-                }
-                let command = match service.state {
-                    ServicePrimitiveState::Started => systemd_service_start_command(&service.name)?,
-                    ServicePrimitiveState::Restarted => {
-                        systemd_service_restart_command(&service.name)?
-                    }
-                };
-                steps.push(RunbookExecutionStep {
-                    id: format!("{}:apply", service.id),
-                    action: RunbookExecutionAction::Command(command),
+                    id: format!("{}:service", service.id),
+                    action: RunbookExecutionAction::ServiceApply(ServiceApplySpec {
+                        name: service.name.clone(),
+                        state: service.state,
+                        enabled: service.enabled,
+                    }),
                 });
             }
             RunbookTask::FileCopy(copy) => {
@@ -490,6 +613,42 @@ pub fn build_runbook_execution_plan(
                         destination: PathBuf::from(&copy.dest),
                         content: copy.content.as_bytes().to_vec(),
                         mode: copy.mode.as_deref().and_then(parse_octal_mode),
+                    }),
+                });
+            }
+            RunbookTask::PortCheck(check) => {
+                validate_host(&check.host)?;
+                steps.push(RunbookExecutionStep {
+                    id: format!("{}:port.check", check.id),
+                    action: RunbookExecutionAction::PortCheck(PortCheckSpec {
+                        host: check.host.clone(),
+                        port: check.port,
+                        timeout: Duration::from_secs(3),
+                    }),
+                });
+            }
+            RunbookTask::ProcessCheck(check) => {
+                validate_process_name(&check.name)?;
+                steps.push(RunbookExecutionStep {
+                    id: format!("{}:process.check", check.id),
+                    action: RunbookExecutionAction::ProcessCheck(ProcessCheckSpec {
+                        name: check.name.clone(),
+                    }),
+                });
+            }
+            RunbookTask::FactsCollect(snapshot) => {
+                steps.push(RunbookExecutionStep {
+                    id: format!("{}:facts.collect", snapshot.id),
+                    action: RunbookExecutionAction::Snapshot(SnapshotSpec {
+                        kind: SnapshotKind::Facts,
+                    }),
+                });
+            }
+            RunbookTask::MetricsSnapshot(snapshot) => {
+                steps.push(RunbookExecutionStep {
+                    id: format!("{}:metrics.snapshot", snapshot.id),
+                    action: RunbookExecutionAction::Snapshot(SnapshotSpec {
+                        kind: SnapshotKind::Metrics,
                     }),
                 });
             }
@@ -524,41 +683,439 @@ pub fn execute_runbook_execution_plan_with(
     mut run_command: impl FnMut(&PrimitiveCommand, &CommandSpec) -> Result<CommandOutput, RunnerError>,
     mut copy_file: impl FnMut(&FileCopySpec) -> Result<FileCopyResult, PrimitiveError>,
 ) -> Result<RunbookExecutionReport, RunnerError> {
+    execute_runbook_execution_plan_with_hooks(
+        plan,
+        options,
+        |command, spec| run_command(command, spec),
+        |spec| copy_file(spec),
+        check_tcp_port,
+        check_local_process,
+        collect_local_snapshot,
+    )
+}
+
+pub fn execute_runbook_execution_plan_with_hooks(
+    plan: &RunbookExecutionPlan,
+    options: RunbookExecutionOptions,
+    mut run_command: impl FnMut(&PrimitiveCommand, &CommandSpec) -> Result<CommandOutput, RunnerError>,
+    mut copy_file: impl FnMut(&FileCopySpec) -> Result<FileCopyResult, PrimitiveError>,
+    mut check_port: impl FnMut(&PortCheckSpec) -> Result<PrimitiveProbeResult, PrimitiveError>,
+    mut check_process: impl FnMut(&ProcessCheckSpec) -> Result<PrimitiveProbeResult, PrimitiveError>,
+    mut collect_snapshot: impl FnMut(&SnapshotSpec) -> Result<SnapshotResult, PrimitiveError>,
+) -> Result<RunbookExecutionReport, RunnerError> {
     let mut outcomes = Vec::new();
     for step in &plan.steps {
+        let started_at_ms = current_time_millis();
+        let started = Instant::now();
         let outcome = match &step.action {
             RunbookExecutionAction::Command(command) => {
-                if command.high_risk && !options.confirmed_high_risk {
-                    return Err(RunnerError::HighRiskConfirmationRequired(step.id.clone()));
+                if options.dry_run {
+                    skipped_outcome(
+                        step.id.clone(),
+                        "dry-run: command step not executed",
+                        started_at_ms,
+                        started,
+                    )
+                } else if options.check_mode && command.high_risk {
+                    skipped_outcome(
+                        step.id.clone(),
+                        "check mode: high-risk command step skipped",
+                        started_at_ms,
+                        started,
+                    )
+                } else {
+                    if command.high_risk && !options.confirmed_high_risk {
+                        return Err(RunnerError::HighRiskConfirmationRequired(step.id.clone()));
+                    }
+                    let mut spec = CommandSpec::new(
+                        command.program.clone(),
+                        command.args.clone(),
+                        options.command_timeout,
+                    );
+                    spec.max_output_bytes = options.max_output_bytes;
+                    let output = run_command(command, &spec)?;
+                    let changed = if command.high_risk { Some(true) } else { None };
+                    let status = if output.exit_code == 0 {
+                        if changed == Some(true) {
+                            PrimitiveResultStatus::Changed
+                        } else {
+                            PrimitiveResultStatus::Success
+                        }
+                    } else {
+                        PrimitiveResultStatus::Failed
+                    };
+                    RunbookStepOutcome {
+                        id: step.id.clone(),
+                        status,
+                        changed,
+                        message: if output.exit_code == 0 {
+                            "command completed".to_owned()
+                        } else {
+                            format!("command exited with status {}", output.exit_code)
+                        },
+                        diff: None,
+                        started_at_ms,
+                        completed_at_ms: current_time_millis(),
+                        duration_ms: started.elapsed().as_millis() as u64,
+                        exit_code: Some(output.exit_code),
+                        stdout: output.stdout,
+                        stderr: output.stderr,
+                        audit_metadata: format!(
+                            "primitive=command,program={},high_risk={}",
+                            command.program, command.high_risk
+                        ),
+                    }
                 }
-                let mut spec = CommandSpec::new(
-                    command.program.clone(),
-                    command.args.clone(),
-                    options.command_timeout,
-                );
-                spec.max_output_bytes = options.max_output_bytes;
-                let output = run_command(command, &spec)?;
-                RunbookStepOutcome {
-                    id: step.id.clone(),
-                    changed: if command.high_risk { Some(true) } else { None },
-                    exit_code: Some(output.exit_code),
-                    stdout: output.stdout,
-                    stderr: output.stderr,
-                    audit_metadata: format!(
-                        "primitive=command,program={},high_risk={}",
-                        command.program, command.high_risk
-                    ),
+            }
+            RunbookExecutionAction::PackagePresent(spec) => {
+                if options.dry_run {
+                    skipped_outcome(
+                        step.id.clone(),
+                        "dry-run: package step not executed",
+                        started_at_ms,
+                        started,
+                    )
+                } else {
+                    let check = package_present_check_command(&spec.name)?;
+                    let check_output = run_command(&check, &command_spec_for(&check, &options))?;
+                    let current = package_present_status(&spec.name, check_output.exit_code)?;
+                    if current.changed == Some(false) {
+                        RunbookStepOutcome {
+                            id: step.id.clone(),
+                            status: PrimitiveResultStatus::Success,
+                            changed: Some(false),
+                            message: format!("package {} is already present", spec.name),
+                            diff: None,
+                            started_at_ms,
+                            completed_at_ms: current_time_millis(),
+                            duration_ms: started.elapsed().as_millis() as u64,
+                            exit_code: Some(check_output.exit_code),
+                            stdout: check_output.stdout,
+                            stderr: check_output.stderr,
+                            audit_metadata: format!(
+                                "primitive=package,name={},state=present,changed=false",
+                                spec.name
+                            ),
+                        }
+                    } else if options.check_mode {
+                        RunbookStepOutcome {
+                            id: step.id.clone(),
+                            status: PrimitiveResultStatus::Skipped,
+                            changed: Some(true),
+                            message: format!(
+                                "check mode: package {} is missing; install skipped",
+                                spec.name
+                            ),
+                            diff: None,
+                            started_at_ms,
+                            completed_at_ms: current_time_millis(),
+                            duration_ms: started.elapsed().as_millis() as u64,
+                            exit_code: Some(check_output.exit_code),
+                            stdout: check_output.stdout,
+                            stderr: check_output.stderr,
+                            audit_metadata: format!(
+                                "primitive=package,name={},state=present,changed=true,check_mode=true",
+                                spec.name
+                            ),
+                        }
+                    } else {
+                        let install = package_install_command(spec.manager, &spec.name)?;
+                        if !options.confirmed_high_risk {
+                            return Err(RunnerError::HighRiskConfirmationRequired(step.id.clone()));
+                        }
+                        let install_output =
+                            run_command(&install, &command_spec_for(&install, &options))?;
+                        let success = install_output.exit_code == 0;
+                        RunbookStepOutcome {
+                            id: step.id.clone(),
+                            status: if success {
+                                PrimitiveResultStatus::Changed
+                            } else {
+                                PrimitiveResultStatus::Failed
+                            },
+                            changed: Some(success),
+                            message: if success {
+                                format!("package {} installed", spec.name)
+                            } else {
+                                format!(
+                                    "package {} install exited with status {}",
+                                    spec.name, install_output.exit_code
+                                )
+                            },
+                            diff: None,
+                            started_at_ms,
+                            completed_at_ms: current_time_millis(),
+                            duration_ms: started.elapsed().as_millis() as u64,
+                            exit_code: Some(install_output.exit_code),
+                            stdout: join_outputs(&check_output.stdout, &install_output.stdout),
+                            stderr: join_outputs(&check_output.stderr, &install_output.stderr),
+                            audit_metadata: format!(
+                                "primitive=package,name={},state=present,changed={success}",
+                                spec.name
+                            ),
+                        }
+                    }
+                }
+            }
+            RunbookExecutionAction::ServiceApply(spec) => {
+                if options.dry_run {
+                    skipped_outcome(
+                        step.id.clone(),
+                        "dry-run: service step not executed",
+                        started_at_ms,
+                        started,
+                    )
+                } else {
+                    let status_command = systemd_service_status_command(&spec.name)?;
+                    let status_output = run_command(
+                        &status_command,
+                        &command_spec_for(&status_command, &options),
+                    )?;
+                    let current = systemd_service_running_status(
+                        &spec.name,
+                        &status_output.stdout,
+                        Some(status_output.exit_code),
+                    )?;
+                    let needs_apply = match spec.state {
+                        ServicePrimitiveState::Started => current.changed != Some(false),
+                        ServicePrimitiveState::Restarted => true,
+                    };
+                    let needs_enable = spec.enabled == Some(true);
+                    if !needs_apply && !needs_enable {
+                        RunbookStepOutcome {
+                            id: step.id.clone(),
+                            status: PrimitiveResultStatus::Success,
+                            changed: Some(false),
+                            message: format!("service {} is already running", spec.name),
+                            diff: None,
+                            started_at_ms,
+                            completed_at_ms: current_time_millis(),
+                            duration_ms: started.elapsed().as_millis() as u64,
+                            exit_code: Some(status_output.exit_code),
+                            stdout: status_output.stdout,
+                            stderr: status_output.stderr,
+                            audit_metadata: format!(
+                                "primitive=service,name={},state={:?},changed=false",
+                                spec.name, spec.state
+                            ),
+                        }
+                    } else if options.check_mode {
+                        RunbookStepOutcome {
+                            id: step.id.clone(),
+                            status: PrimitiveResultStatus::Skipped,
+                            changed: Some(true),
+                            message: format!(
+                                "check mode: service {} requires apply; mutation skipped",
+                                spec.name
+                            ),
+                            diff: None,
+                            started_at_ms,
+                            completed_at_ms: current_time_millis(),
+                            duration_ms: started.elapsed().as_millis() as u64,
+                            exit_code: Some(status_output.exit_code),
+                            stdout: status_output.stdout,
+                            stderr: status_output.stderr,
+                            audit_metadata: format!(
+                                "primitive=service,name={},state={:?},changed=true,check_mode=true",
+                                spec.name, spec.state
+                            ),
+                        }
+                    } else {
+                        if !options.confirmed_high_risk {
+                            return Err(RunnerError::HighRiskConfirmationRequired(step.id.clone()));
+                        }
+                        let mut stdout = status_output.stdout;
+                        let mut stderr = status_output.stderr;
+                        let mut exit_code = status_output.exit_code;
+                        let mut failed_outcome = None;
+                        if needs_enable {
+                            let enable = systemd_service_enable_command(&spec.name)?;
+                            let output =
+                                run_command(&enable, &command_spec_for(&enable, &options))?;
+                            exit_code = output.exit_code;
+                            stdout = join_outputs(&stdout, &output.stdout);
+                            stderr = join_outputs(&stderr, &output.stderr);
+                            if output.exit_code != 0 {
+                                failed_outcome = Some(RunbookStepOutcome {
+                                    id: step.id.clone(),
+                                    status: PrimitiveResultStatus::Failed,
+                                    changed: Some(false),
+                                    message: format!(
+                                        "service {} enable exited with status {}",
+                                        spec.name, output.exit_code
+                                    ),
+                                    diff: None,
+                                    started_at_ms,
+                                    completed_at_ms: current_time_millis(),
+                                    duration_ms: started.elapsed().as_millis() as u64,
+                                    exit_code: Some(output.exit_code),
+                                    stdout: stdout.clone(),
+                                    stderr: stderr.clone(),
+                                    audit_metadata: format!(
+                                        "primitive=service,name={},state={:?},enable=true,changed=false",
+                                        spec.name, spec.state
+                                    ),
+                                });
+                            }
+                        }
+                        if let Some(outcome) = failed_outcome {
+                            outcome
+                        } else {
+                            if needs_apply {
+                                let apply = match spec.state {
+                                    ServicePrimitiveState::Started => {
+                                        systemd_service_start_command(&spec.name)?
+                                    }
+                                    ServicePrimitiveState::Restarted => {
+                                        systemd_service_restart_command(&spec.name)?
+                                    }
+                                };
+                                let output =
+                                    run_command(&apply, &command_spec_for(&apply, &options))?;
+                                exit_code = output.exit_code;
+                                stdout = join_outputs(&stdout, &output.stdout);
+                                stderr = join_outputs(&stderr, &output.stderr);
+                            }
+                            let success = exit_code == 0;
+                            RunbookStepOutcome {
+                                id: step.id.clone(),
+                                status: if success {
+                                    PrimitiveResultStatus::Changed
+                                } else {
+                                    PrimitiveResultStatus::Failed
+                                },
+                                changed: Some(success),
+                                message: if success {
+                                    format!("service {} applied", spec.name)
+                                } else {
+                                    format!(
+                                        "service {} apply exited with status {}",
+                                        spec.name, exit_code
+                                    )
+                                },
+                                diff: None,
+                                started_at_ms,
+                                completed_at_ms: current_time_millis(),
+                                duration_ms: started.elapsed().as_millis() as u64,
+                                exit_code: Some(exit_code),
+                                stdout,
+                                stderr,
+                                audit_metadata: format!(
+                                    "primitive=service,name={},state={:?},changed={success}",
+                                    spec.name, spec.state
+                                ),
+                            }
+                        }
+                    }
                 }
             }
             RunbookExecutionAction::FileCopy(spec) => {
-                let result = copy_file(spec)?;
-                RunbookStepOutcome {
-                    id: step.id.clone(),
-                    changed: Some(result.changed),
-                    exit_code: None,
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    audit_metadata: result.audit_metadata,
+                if options.dry_run {
+                    skipped_outcome(
+                        step.id.clone(),
+                        "dry-run: file copy step not executed",
+                        started_at_ms,
+                        started,
+                    )
+                } else if options.check_mode {
+                    skipped_outcome(
+                        step.id.clone(),
+                        "check mode: file copy mutation skipped",
+                        started_at_ms,
+                        started,
+                    )
+                } else {
+                    let result = copy_file(spec)?;
+                    RunbookStepOutcome {
+                        id: step.id.clone(),
+                        status: if result.changed {
+                            PrimitiveResultStatus::Changed
+                        } else {
+                            PrimitiveResultStatus::Success
+                        },
+                        changed: Some(result.changed),
+                        message: if result.changed {
+                            "file copied".to_owned()
+                        } else {
+                            "file already up to date".to_owned()
+                        },
+                        diff: Some(PrimitiveDiff {
+                            format: "sha256".to_owned(),
+                            before: result.before_checksum,
+                            after: Some(result.after_checksum),
+                        }),
+                        started_at_ms,
+                        completed_at_ms: current_time_millis(),
+                        duration_ms: started.elapsed().as_millis() as u64,
+                        exit_code: None,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                        audit_metadata: result.audit_metadata,
+                    }
+                }
+            }
+            RunbookExecutionAction::PortCheck(spec) => {
+                if options.dry_run {
+                    skipped_outcome(
+                        step.id.clone(),
+                        "dry-run: port check step not executed",
+                        started_at_ms,
+                        started,
+                    )
+                } else {
+                    let result = check_port(spec)?;
+                    probe_outcome(
+                        step.id.clone(),
+                        result,
+                        format!("primitive=port.check,host={},port={}", spec.host, spec.port),
+                        started_at_ms,
+                        started,
+                    )
+                }
+            }
+            RunbookExecutionAction::ProcessCheck(spec) => {
+                if options.dry_run {
+                    skipped_outcome(
+                        step.id.clone(),
+                        "dry-run: process check step not executed",
+                        started_at_ms,
+                        started,
+                    )
+                } else {
+                    let result = check_process(spec)?;
+                    probe_outcome(
+                        step.id.clone(),
+                        result,
+                        format!("primitive=process.check,name={}", spec.name),
+                        started_at_ms,
+                        started,
+                    )
+                }
+            }
+            RunbookExecutionAction::Snapshot(spec) => {
+                if options.dry_run {
+                    skipped_outcome(
+                        step.id.clone(),
+                        "dry-run: snapshot step not executed",
+                        started_at_ms,
+                        started,
+                    )
+                } else {
+                    let result = collect_snapshot(spec)?;
+                    RunbookStepOutcome {
+                        id: step.id.clone(),
+                        status: PrimitiveResultStatus::Success,
+                        changed: Some(false),
+                        message: result.message,
+                        diff: None,
+                        started_at_ms,
+                        completed_at_ms: current_time_millis(),
+                        duration_ms: started.elapsed().as_millis() as u64,
+                        exit_code: None,
+                        stdout: result.body,
+                        stderr: String::new(),
+                        audit_metadata: format!("primitive={}", spec.kind.as_primitive_name()),
+                    }
                 }
             }
         };
@@ -568,6 +1125,170 @@ pub fn execute_runbook_execution_plan_with(
         runbook_name: plan.runbook_name.clone(),
         outcomes,
     })
+}
+
+fn skipped_outcome(
+    id: String,
+    message: impl Into<String>,
+    started_at_ms: u64,
+    started: Instant,
+) -> RunbookStepOutcome {
+    RunbookStepOutcome {
+        id,
+        status: PrimitiveResultStatus::Skipped,
+        changed: None,
+        message: message.into(),
+        diff: None,
+        started_at_ms,
+        completed_at_ms: current_time_millis(),
+        duration_ms: started.elapsed().as_millis() as u64,
+        exit_code: None,
+        stdout: String::new(),
+        stderr: String::new(),
+        audit_metadata: "primitive=skipped".to_owned(),
+    }
+}
+
+fn command_spec_for(command: &PrimitiveCommand, options: &RunbookExecutionOptions) -> CommandSpec {
+    let mut spec = CommandSpec::new(
+        command.program.clone(),
+        command.args.clone(),
+        options.command_timeout,
+    );
+    spec.max_output_bytes = options.max_output_bytes;
+    spec
+}
+
+fn join_outputs(left: &str, right: &str) -> String {
+    match (left.is_empty(), right.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => right.to_owned(),
+        (false, true) => left.to_owned(),
+        (false, false) => format!("{left}\n{right}"),
+    }
+}
+
+fn probe_outcome(
+    id: String,
+    result: PrimitiveProbeResult,
+    audit_metadata: String,
+    started_at_ms: u64,
+    started: Instant,
+) -> RunbookStepOutcome {
+    RunbookStepOutcome {
+        id,
+        status: if result.matched {
+            PrimitiveResultStatus::Success
+        } else {
+            PrimitiveResultStatus::Failed
+        },
+        changed: Some(false),
+        message: result.message,
+        diff: None,
+        started_at_ms,
+        completed_at_ms: current_time_millis(),
+        duration_ms: started.elapsed().as_millis() as u64,
+        exit_code: None,
+        stdout: result.detail,
+        stderr: String::new(),
+        audit_metadata,
+    }
+}
+
+impl SnapshotKind {
+    fn as_primitive_name(self) -> &'static str {
+        match self {
+            Self::Facts => "facts.collect",
+            Self::Metrics => "metrics.snapshot",
+        }
+    }
+}
+
+pub fn check_tcp_port(spec: &PortCheckSpec) -> Result<PrimitiveProbeResult, PrimitiveError> {
+    validate_host(&spec.host)?;
+    if spec.port == 0 {
+        return Err(PrimitiveError::UnsafeHost(format!(
+            "{}:{}",
+            spec.host, spec.port
+        )));
+    }
+
+    let addrs = match (spec.host.as_str(), spec.port).to_socket_addrs() {
+        Ok(addrs) => addrs.collect::<Vec<_>>(),
+        Err(error) => {
+            return Ok(PrimitiveProbeResult::unmatched(
+                format!("port {} on {} could not be resolved", spec.port, spec.host),
+                error.to_string(),
+            ));
+        }
+    };
+    if addrs.is_empty() {
+        return Ok(PrimitiveProbeResult::unmatched(
+            format!(
+                "port {} on {} has no resolved address",
+                spec.port, spec.host
+            ),
+            "no socket address resolved",
+        ));
+    }
+    for addr in addrs {
+        if TcpStream::connect_timeout(&addr, spec.timeout).is_ok() {
+            return Ok(PrimitiveProbeResult::matched(
+                format!("port {} on {} is reachable", spec.port, spec.host),
+                addr.to_string(),
+            ));
+        }
+    }
+    Ok(PrimitiveProbeResult::unmatched(
+        format!("port {} on {} is not reachable", spec.port, spec.host),
+        "connection failed",
+    ))
+}
+
+pub fn check_local_process(
+    spec: &ProcessCheckSpec,
+) -> Result<PrimitiveProbeResult, PrimitiveError> {
+    validate_process_name(&spec.name)?;
+    let output = run_command_with_spec(CommandSpec::new(
+        "pgrep",
+        vec!["-x".to_owned(), spec.name.clone()],
+        Duration::from_secs(3),
+    ));
+    match output {
+        Ok(output) if output.exit_code == 0 => Ok(PrimitiveProbeResult::matched(
+            format!("process {} is running", spec.name),
+            output.stdout.trim().to_owned(),
+        )),
+        Ok(_) => Ok(PrimitiveProbeResult::unmatched(
+            format!("process {} is not running", spec.name),
+            "pgrep did not find an exact process name match",
+        )),
+        Err(error) => Ok(PrimitiveProbeResult::unmatched(
+            format!("process {} could not be checked", spec.name),
+            error.to_string(),
+        )),
+    }
+}
+
+pub fn collect_local_snapshot(spec: &SnapshotSpec) -> Result<SnapshotResult, PrimitiveError> {
+    let system_time_ms = current_time_millis();
+    let (kind, message) = match spec.kind {
+        SnapshotKind::Facts => ("facts", "facts snapshot collected"),
+        SnapshotKind::Metrics => ("metrics", "metrics snapshot collected"),
+    };
+    Ok(SnapshotResult {
+        message: message.to_owned(),
+        body: format!(
+            "{{\"kind\":\"{kind}\",\"source\":\"runbook\",\"system_time_ms\":{system_time_ms}}}"
+        ),
+    })
+}
+
+fn current_time_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn parse_octal_mode(value: &str) -> Option<u32> {
@@ -728,6 +1449,8 @@ pub fn evaluate_policy_drift(policy: &Policy, probe: &impl DriftProbe) -> DriftR
 
     DriftReport {
         policy_name: policy.name.clone(),
+        severity: DriftSeverity::for_status(status.clone()),
+        acknowledgement: DriftAcknowledgement::Open,
         status,
         expected,
         actual,
@@ -907,6 +1630,32 @@ fn validate_service_name(value: &str) -> Result<(), PrimitiveError> {
         })
     {
         Err(PrimitiveError::UnsafeServiceName(value.to_owned()))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_host(value: &str) -> Result<(), PrimitiveError> {
+    if value.is_empty()
+        || value == "0.0.0.0"
+        || value == "::"
+        || !value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | ':' | '[' | ']')
+        })
+    {
+        Err(PrimitiveError::UnsafeHost(value.to_owned()))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_process_name(value: &str) -> Result<(), PrimitiveError> {
+    if value.is_empty()
+        || !value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '+' | '-' | '@')
+        })
+    {
+        Err(PrimitiveError::UnsafeProcessName(value.to_owned()))
     } else {
         Ok(())
     }
@@ -1333,35 +2082,25 @@ spec:
         let plan = build_runbook_execution_plan(&runbook, LinuxPackageManager::Apt).unwrap();
 
         assert_eq!(plan.runbook_name, "bootstrap-web");
-        assert_eq!(plan.steps.len(), 6);
-        assert_eq!(plan.steps[0].id, "nginx-package:check");
-        assert_eq!(plan.steps[1].id, "nginx-package:install");
+        assert_eq!(plan.steps.len(), 3);
+        assert_eq!(plan.steps[0].id, "nginx-package:package");
         assert!(matches!(
-            &plan.steps[2].action,
+            &plan.steps[0].action,
+            RunbookExecutionAction::PackagePresent(spec)
+                if spec.name == "nginx" && spec.manager == LinuxPackageManager::Apt
+        ));
+        assert!(matches!(
+            &plan.steps[1].action,
             RunbookExecutionAction::FileCopy(spec)
                 if spec.destination == Path::new("/etc/nginx/conf.d/sponzey.conf")
                     && spec.mode == Some(0o644)
         ));
         assert!(matches!(
-            &plan.steps[3].action,
-            RunbookExecutionAction::Command(command)
-                if command.program == "systemctl"
-                    && command.args == ["is-active", "nginx.service"]
-                    && !command.high_risk
-        ));
-        assert!(matches!(
-            &plan.steps[4].action,
-            RunbookExecutionAction::Command(command)
-                if command.program == "systemctl"
-                    && command.args == ["enable", "nginx.service"]
-                    && command.high_risk
-        ));
-        assert!(matches!(
-            &plan.steps[5].action,
-            RunbookExecutionAction::Command(command)
-                if command.program == "systemctl"
-                    && command.args == ["start", "nginx.service"]
-                    && command.high_risk
+            &plan.steps[2].action,
+            RunbookExecutionAction::ServiceApply(spec)
+                if spec.name == "nginx.service"
+                    && spec.state == ServicePrimitiveState::Started
+                    && spec.enabled == Some(true)
         ));
     }
 
@@ -1425,7 +2164,16 @@ spec:
         assert_eq!(report.runbook_name, "copy-config");
         assert_eq!(report.outcomes.len(), 1);
         assert_eq!(report.outcomes[0].id, "config:copy");
+        assert_eq!(report.outcomes[0].status, PrimitiveResultStatus::Changed);
         assert_eq!(report.outcomes[0].changed, Some(true));
+        assert_eq!(
+            report.outcomes[0]
+                .diff
+                .as_ref()
+                .map(|diff| diff.format.as_str()),
+            Some("sha256")
+        );
+        assert!(report.outcomes[0].completed_at_ms >= report.outcomes[0].started_at_ms);
         assert!(report.outcomes[0].audit_metadata.contains("changed=true"));
         assert_eq!(
             fs::read_to_string(&destination).unwrap(),
@@ -1490,6 +2238,449 @@ spec:
         );
         assert_eq!(report.outcomes[0].changed, None);
         assert_eq!(report.outcomes[1].changed, Some(true));
+        assert_eq!(report.outcomes[0].status, PrimitiveResultStatus::Success);
+        assert_eq!(report.outcomes[1].status, PrimitiveResultStatus::Changed);
+        assert_eq!(report.aggregate_status(), PrimitiveResultStatus::Changed);
+    }
+
+    #[test]
+    fn package_present_skips_install_when_already_installed() {
+        let plan = RunbookExecutionPlan {
+            runbook_name: "package-idempotency".to_owned(),
+            steps: vec![RunbookExecutionStep {
+                id: "nginx:package".to_owned(),
+                action: RunbookExecutionAction::PackagePresent(PackagePresentSpec {
+                    name: "nginx".to_owned(),
+                    manager: LinuxPackageManager::Apt,
+                }),
+            }],
+        };
+        let mut programs = Vec::new();
+
+        let report = execute_runbook_execution_plan_with(
+            &plan,
+            RunbookExecutionOptions::default(),
+            |command, _spec| {
+                programs.push(command.program.clone());
+                if command.program == "apt-get" {
+                    panic!("install must not run for an already-present package");
+                }
+                Ok(CommandOutput {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    exit_code: 0,
+                    truncated: false,
+                })
+            },
+            |_spec| panic!("file copy must not execute"),
+        )
+        .unwrap();
+
+        assert_eq!(programs, vec!["sh"]);
+        assert_eq!(report.outcomes[0].status, PrimitiveResultStatus::Success);
+        assert_eq!(report.outcomes[0].changed, Some(false));
+        assert!(report.outcomes[0].message.contains("already present"));
+    }
+
+    #[test]
+    fn package_present_installs_missing_package_when_confirmed() {
+        let plan = RunbookExecutionPlan {
+            runbook_name: "package-install".to_owned(),
+            steps: vec![RunbookExecutionStep {
+                id: "nginx:package".to_owned(),
+                action: RunbookExecutionAction::PackagePresent(PackagePresentSpec {
+                    name: "nginx".to_owned(),
+                    manager: LinuxPackageManager::Apt,
+                }),
+            }],
+        };
+        let mut programs = Vec::new();
+
+        let report = execute_runbook_execution_plan_with(
+            &plan,
+            RunbookExecutionOptions {
+                confirmed_high_risk: true,
+                ..RunbookExecutionOptions::default()
+            },
+            |command, _spec| {
+                programs.push(command.program.clone());
+                Ok(CommandOutput {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    exit_code: if command.program == "sh" { 1 } else { 0 },
+                    truncated: false,
+                })
+            },
+            |_spec| panic!("file copy must not execute"),
+        )
+        .unwrap();
+
+        assert_eq!(programs, vec!["sh", "apt-get"]);
+        assert_eq!(report.outcomes[0].status, PrimitiveResultStatus::Changed);
+        assert_eq!(report.outcomes[0].changed, Some(true));
+    }
+
+    #[test]
+    fn service_started_skips_start_when_already_active() {
+        let plan = RunbookExecutionPlan {
+            runbook_name: "service-idempotency".to_owned(),
+            steps: vec![RunbookExecutionStep {
+                id: "nginx:service".to_owned(),
+                action: RunbookExecutionAction::ServiceApply(ServiceApplySpec {
+                    name: "nginx.service".to_owned(),
+                    state: ServicePrimitiveState::Started,
+                    enabled: None,
+                }),
+            }],
+        };
+        let mut commands = Vec::new();
+
+        let report = execute_runbook_execution_plan_with(
+            &plan,
+            RunbookExecutionOptions::default(),
+            |command, _spec| {
+                commands.push(command.args.join(" "));
+                Ok(CommandOutput {
+                    stdout: "active\n".to_owned(),
+                    stderr: String::new(),
+                    exit_code: 0,
+                    truncated: false,
+                })
+            },
+            |_spec| panic!("file copy must not execute"),
+        )
+        .unwrap();
+
+        assert_eq!(commands, vec!["is-active nginx.service"]);
+        assert_eq!(report.outcomes[0].status, PrimitiveResultStatus::Success);
+        assert_eq!(report.outcomes[0].changed, Some(false));
+    }
+
+    #[test]
+    fn service_started_runs_start_when_inactive_and_confirmed() {
+        let plan = RunbookExecutionPlan {
+            runbook_name: "service-apply".to_owned(),
+            steps: vec![RunbookExecutionStep {
+                id: "nginx:service".to_owned(),
+                action: RunbookExecutionAction::ServiceApply(ServiceApplySpec {
+                    name: "nginx.service".to_owned(),
+                    state: ServicePrimitiveState::Started,
+                    enabled: None,
+                }),
+            }],
+        };
+        let mut commands = Vec::new();
+
+        let report = execute_runbook_execution_plan_with(
+            &plan,
+            RunbookExecutionOptions {
+                confirmed_high_risk: true,
+                ..RunbookExecutionOptions::default()
+            },
+            |command, _spec| {
+                commands.push(command.args.join(" "));
+                Ok(CommandOutput {
+                    stdout: if command.args.first().map(String::as_str) == Some("is-active") {
+                        "inactive\n".to_owned()
+                    } else {
+                        String::new()
+                    },
+                    stderr: String::new(),
+                    exit_code: 0,
+                    truncated: false,
+                })
+            },
+            |_spec| panic!("file copy must not execute"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            commands,
+            vec!["is-active nginx.service", "start nginx.service"]
+        );
+        assert_eq!(report.outcomes[0].status, PrimitiveResultStatus::Changed);
+        assert_eq!(report.outcomes[0].changed, Some(true));
+    }
+
+    #[test]
+    fn file_copy_execution_returns_no_change_checksum_diff() {
+        let plan = RunbookExecutionPlan {
+            runbook_name: "file-idempotency".to_owned(),
+            steps: vec![RunbookExecutionStep {
+                id: "config:copy".to_owned(),
+                action: RunbookExecutionAction::FileCopy(FileCopySpec {
+                    destination: PathBuf::from("/tmp/app.conf"),
+                    content: b"same".to_vec(),
+                    mode: None,
+                }),
+            }],
+        };
+
+        let report = execute_runbook_execution_plan_with(
+            &plan,
+            RunbookExecutionOptions::default(),
+            |_command, _spec| panic!("command must not execute"),
+            |_spec| {
+                Ok(FileCopyResult {
+                    changed: false,
+                    before_checksum: Some("abc".to_owned()),
+                    after_checksum: "abc".to_owned(),
+                    bytes_written: 4,
+                    audit_metadata: "primitive=file.copy,changed=false".to_owned(),
+                    atomic: true,
+                })
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.outcomes[0].status, PrimitiveResultStatus::Success);
+        assert_eq!(report.outcomes[0].changed, Some(false));
+        assert_eq!(
+            report.outcomes[0].diff.as_ref().unwrap().before,
+            Some("abc".to_owned())
+        );
+        assert_eq!(
+            report.outcomes[0].diff.as_ref().unwrap().after,
+            Some("abc".to_owned())
+        );
+    }
+
+    #[test]
+    fn port_and_process_checks_report_success_and_failure_without_changed_state() {
+        let plan = RunbookExecutionPlan {
+            runbook_name: "checks".to_owned(),
+            steps: vec![
+                RunbookExecutionStep {
+                    id: "open:port.check".to_owned(),
+                    action: RunbookExecutionAction::PortCheck(PortCheckSpec {
+                        host: "127.0.0.1".to_owned(),
+                        port: 80,
+                        timeout: Duration::from_millis(10),
+                    }),
+                },
+                RunbookExecutionStep {
+                    id: "closed:port.check".to_owned(),
+                    action: RunbookExecutionAction::PortCheck(PortCheckSpec {
+                        host: "127.0.0.1".to_owned(),
+                        port: 81,
+                        timeout: Duration::from_millis(10),
+                    }),
+                },
+                RunbookExecutionStep {
+                    id: "running:process.check".to_owned(),
+                    action: RunbookExecutionAction::ProcessCheck(ProcessCheckSpec {
+                        name: "nginx".to_owned(),
+                    }),
+                },
+                RunbookExecutionStep {
+                    id: "missing:process.check".to_owned(),
+                    action: RunbookExecutionAction::ProcessCheck(ProcessCheckSpec {
+                        name: "redis".to_owned(),
+                    }),
+                },
+            ],
+        };
+
+        let report = execute_runbook_execution_plan_with_hooks(
+            &plan,
+            RunbookExecutionOptions::default(),
+            |_command, _spec| panic!("command must not execute"),
+            |_spec| panic!("file copy must not execute"),
+            |spec| {
+                Ok(if spec.port == 80 {
+                    PrimitiveProbeResult::matched("port reachable", "127.0.0.1:80")
+                } else {
+                    PrimitiveProbeResult::unmatched("port not reachable", "connection failed")
+                })
+            },
+            |spec| {
+                Ok(if spec.name == "nginx" {
+                    PrimitiveProbeResult::matched("process running", "123")
+                } else {
+                    PrimitiveProbeResult::unmatched("process not running", "not found")
+                })
+            },
+            |_spec| panic!("snapshot must not execute"),
+        )
+        .unwrap();
+
+        assert_eq!(report.outcomes[0].status, PrimitiveResultStatus::Success);
+        assert_eq!(report.outcomes[0].changed, Some(false));
+        assert_eq!(report.outcomes[1].status, PrimitiveResultStatus::Failed);
+        assert_eq!(report.outcomes[1].changed, Some(false));
+        assert_eq!(report.outcomes[2].status, PrimitiveResultStatus::Success);
+        assert_eq!(report.outcomes[2].changed, Some(false));
+        assert_eq!(report.outcomes[3].status, PrimitiveResultStatus::Failed);
+        assert_eq!(report.outcomes[3].changed, Some(false));
+    }
+
+    #[test]
+    fn facts_and_metrics_snapshots_return_schema_without_store_side_effects() {
+        let plan = RunbookExecutionPlan {
+            runbook_name: "snapshots".to_owned(),
+            steps: vec![
+                RunbookExecutionStep {
+                    id: "facts:facts.collect".to_owned(),
+                    action: RunbookExecutionAction::Snapshot(SnapshotSpec {
+                        kind: SnapshotKind::Facts,
+                    }),
+                },
+                RunbookExecutionStep {
+                    id: "metrics:metrics.snapshot".to_owned(),
+                    action: RunbookExecutionAction::Snapshot(SnapshotSpec {
+                        kind: SnapshotKind::Metrics,
+                    }),
+                },
+            ],
+        };
+
+        let report = execute_runbook_execution_plan_with_hooks(
+            &plan,
+            RunbookExecutionOptions::default(),
+            |_command, _spec| panic!("command must not execute"),
+            |_spec| panic!("file copy must not execute"),
+            |_spec| panic!("port check must not execute"),
+            |_spec| panic!("process check must not execute"),
+            |spec| {
+                let kind = match spec.kind {
+                    SnapshotKind::Facts => "facts",
+                    SnapshotKind::Metrics => "metrics",
+                };
+                Ok(SnapshotResult {
+                    message: format!("{kind} snapshot collected"),
+                    body: format!(
+                        "{{\"kind\":\"{kind}\",\"source\":\"runbook\",\"system_time_ms\":10}}"
+                    ),
+                })
+            },
+        )
+        .unwrap();
+
+        for outcome in &report.outcomes {
+            assert_eq!(outcome.status, PrimitiveResultStatus::Success);
+            assert_eq!(outcome.changed, Some(false));
+            let value: serde_json::Value = serde_json::from_str(&outcome.stdout).unwrap();
+            assert_eq!(value["source"], "runbook");
+            assert_eq!(value["system_time_ms"], 10);
+        }
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&report.outcomes[0].stdout).unwrap()["kind"],
+            "facts"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&report.outcomes[1].stdout).unwrap()["kind"],
+            "metrics"
+        );
+    }
+
+    #[test]
+    fn primitive_result_serializes_common_schema() {
+        let outcome = RunbookStepOutcome {
+            id: "config:copy".to_owned(),
+            status: PrimitiveResultStatus::Changed,
+            changed: Some(true),
+            message: "file copied".to_owned(),
+            diff: Some(PrimitiveDiff {
+                format: "sha256".to_owned(),
+                before: Some("old".to_owned()),
+                after: Some("new".to_owned()),
+            }),
+            started_at_ms: 10,
+            completed_at_ms: 25,
+            duration_ms: 15,
+            exit_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            audit_metadata: "primitive=file.copy".to_owned(),
+        };
+
+        let value = serde_json::to_value(&outcome).unwrap();
+
+        assert_eq!(value["status"], "changed");
+        assert_eq!(value["changed"], true);
+        assert_eq!(value["diff"]["format"], "sha256");
+        assert_eq!(value["started_at_ms"], 10);
+        assert_eq!(value["duration_ms"], 15);
+    }
+
+    #[test]
+    fn check_mode_skips_mutations_but_runs_low_risk_checks() {
+        let plan = RunbookExecutionPlan {
+            runbook_name: "check-mode".to_owned(),
+            steps: vec![
+                RunbookExecutionStep {
+                    id: "check".to_owned(),
+                    action: RunbookExecutionAction::Command(PrimitiveCommand {
+                        program: "sh".to_owned(),
+                        args: vec!["-c".to_owned(), "true".to_owned()],
+                        high_risk: false,
+                    }),
+                },
+                RunbookExecutionStep {
+                    id: "install".to_owned(),
+                    action: RunbookExecutionAction::Command(PrimitiveCommand {
+                        program: "apt-get".to_owned(),
+                        args: vec!["install".to_owned(), "-y".to_owned(), "nginx".to_owned()],
+                        high_risk: true,
+                    }),
+                },
+            ],
+        };
+        let mut executed = Vec::new();
+
+        let report = execute_runbook_execution_plan_with(
+            &plan,
+            RunbookExecutionOptions {
+                check_mode: true,
+                ..RunbookExecutionOptions::default()
+            },
+            |command, _spec| {
+                executed.push(command.program.clone());
+                Ok(CommandOutput {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    exit_code: 0,
+                    truncated: false,
+                })
+            },
+            |_spec| panic!("check mode must not mutate files"),
+        )
+        .unwrap();
+
+        assert_eq!(executed, vec!["sh"]);
+        assert_eq!(report.outcomes[0].status, PrimitiveResultStatus::Success);
+        assert_eq!(report.outcomes[1].status, PrimitiveResultStatus::Skipped);
+        assert_eq!(report.aggregate_status(), PrimitiveResultStatus::Success);
+    }
+
+    #[test]
+    fn dry_run_skips_every_step_without_side_effects() {
+        let plan = RunbookExecutionPlan {
+            runbook_name: "dry-run".to_owned(),
+            steps: vec![RunbookExecutionStep {
+                id: "copy".to_owned(),
+                action: RunbookExecutionAction::FileCopy(FileCopySpec {
+                    destination: PathBuf::from("/tmp/sponzey-dry-run"),
+                    content: b"hello".to_vec(),
+                    mode: None,
+                }),
+            }],
+        };
+
+        let report = execute_runbook_execution_plan_with(
+            &plan,
+            RunbookExecutionOptions {
+                dry_run: true,
+                ..RunbookExecutionOptions::default()
+            },
+            |_command, _spec| panic!("dry-run must not run commands"),
+            |_spec| panic!("dry-run must not copy files"),
+        )
+        .unwrap();
+
+        assert_eq!(report.outcomes[0].status, PrimitiveResultStatus::Skipped);
+        assert_eq!(report.outcomes[0].changed, None);
+        assert_eq!(report.aggregate_status(), PrimitiveResultStatus::Skipped);
     }
 
     #[test]
@@ -2074,7 +3265,10 @@ spec:
 
     fn policy_fixture() -> Policy {
         Policy {
+            id: "nginx-running".to_owned(),
             name: "nginx-running".to_owned(),
+            version: 1,
+            source: "kind: Policy".to_owned(),
             selector: Selector::parse("role=web").unwrap(),
             checks: vec![
                 PolicyCheck::Service {
@@ -2093,6 +3287,8 @@ spec:
                     sha256: "abc".to_owned(),
                 },
             ],
+            remediation: None,
+            schedule: None,
         }
     }
 

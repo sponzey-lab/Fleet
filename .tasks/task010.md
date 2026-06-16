@@ -1,90 +1,104 @@
-# Task 010 - Backpressure와 Output 안정성
+# Task 010: Runbook Schema와 Result Model
 
-상태: `[ ] 대기` `[ ] 진행 중` `[x] 완료`
+상태: Completed
+우선순위: P1
+연결 계획: `.tasks/plan.md` Phase 008
+의존성: Task 006, Task 008
+결과물: runbook DSL과 primitive result의 안정된 계약
 
 ## 목표
 
-persistent session에서 output과 outbound task가 Controller 또는 Agent를 압박하지 않도록 안정성 경계를 구현한다.
+runbook primitive를 늘리기 전에 schema와 result model을 먼저 고정한다. 자동화 제품에서 중요한 것은 실행 여부뿐 아니라 changed/skipped/failed, diff, duration, target별 결과를 일관되게 해석할 수 있는 것이다.
 
-상시 연결은 반응성을 높이지만, 동시에 긴 command output, 느린 DB write, 느린 network writer, queue overflow 같은 문제가 더 중요해진다.
+## 기능 묶음
 
-## 기능 범위
+1. runbook schema version과 parser contract
+2. strategy/check mode/dry-run model
+3. primitive result common schema
 
-### 1. Per-session outbound queue 제한
+## 구현 체크리스트
 
-- [x] session당 outbound queue capacity를 명시한다.
-- [x] queue full 시 정책을 정한다.
-- [x] queue depth를 FieldDebug 또는 session summary에 노출할 수 있게 한다.
+Schema:
 
-정책 후보:
+- [x] 현재 runbook parser와 schema를 조사한다.
+- [x] schema version 필드를 필수화할지 결정한다.
+- [x] `name`, `description`, `selector`, `strategy`, `steps` 구조를 정리한다.
+- [x] `matchLabels` selector와 runbook selector의 연결을 정리한다.
+- [x] invalid YAML error를 사용자 친화적으로 만든다.
+- [x] unknown field handling 정책을 정한다.
+- [x] backward compatibility fixture를 만든다.
 
-- task_assignment queue full: dispatch failure로 기록하고 queued 유지
-- heartbeat/log queue full: drop 가능 여부 검토
-- output queue full: task failure 또는 session failure로 전환
+Strategy:
 
-원칙:
+- [x] `strategy.concurrency`를 schema에 반영한다.
+- [x] `strategy.maxFailures`를 schema에 반영한다.
+- [x] check mode를 설계한다.
+- [x] dry-run과 check mode의 차이를 정한다.
+- [x] approval required 판정이 runbook 전체/step 단위 중 어디에 적용되는지 정한다.
 
-- 무제한 메모리 증가 금지
-- task 유실 금지
-- Product log에 raw output 기록 금지
+Result Model:
 
-### 2. Output chunk 안정성
+- [x] primitive common result schema를 정의한다.
+- [x] status: changed/skipped/success/failed/rejected/canceled 등을 정리한다.
+- [x] changed boolean 또는 status 표현 방식을 결정한다.
+- [x] diff field 구조를 정한다.
+- [x] message field를 정한다.
+- [x] started_at/completed_at/duration_ms를 정한다.
+- [x] stdout/stderr와 product log 분리를 유지한다.
+- [x] per-step result와 assignment result aggregate 규칙을 정한다.
 
-- [x] max output bytes 정책을 persistent session에서도 유지한다.
-- [x] output chunk size와 sequence ordering을 재검증한다.
-- [x] duplicate output chunk 처리 정책을 구현한다.
+## 테스트
 
-현재 DB unique:
+- [x] valid runbook fixture test
+- [x] invalid YAML fixture test
+- [x] unknown field policy test
+- [x] backward compatibility fixture test
+- [x] strategy parsing test
+- [x] check mode parsing test
+- [x] dry-run parsing test
+- [x] primitive result serialization test
+- [x] per-step aggregate result test
 
-```text
-UNIQUE(job_id, agent_id, stream, chunk_index)
+## 검증 명령
+
+```bash
+cargo fmt --check
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+git diff --check
 ```
 
-권장:
+## 문서 업데이트
 
-- 같은 key + 같은 body: idempotent duplicate
-- 같은 key + 다른 body: security/audit 또는 protocol error
-- insert duplicate 때문에 session 전체가 불필요하게 죽지 않게 한다.
-
-### 3. Long-running command와 disconnect 처리
-
-- [x] command timeout을 강제한다.
-- [x] running 중 Controller connection drop 시 Agent task worker 정책을 정한다.
-- [x] running 중 Agent disconnect 시 Controller job 상태 정책을 정한다.
-
-초기 정책:
-
-- Agent local command는 timeout까지 실행될 수 있다.
-- connection이 끊기면 output/result 전송 실패로 task failure 또는 reconnect 후 재전송 불가 상태가 될 수 있다.
-- Controller는 task_result 없는 running job을 즉시 failed로 만들지 않고 expiry/reconciler 정책을 따른다.
-
-## 테스트와 검증
-
-필수:
-
-- [x] output limit exceeded test
-- [x] outbound queue full test
-- [x] duplicate output chunk idempotency test
-- [x] duplicate output chunk body mismatch test
-- [x] slow store/write failure test
-- [x] running 중 disconnect 시 job 상태 정책 test
-- [x] command timeout test
-- [x] `cargo test -p fleet-runner output`
-- [x] `cargo test -p fleet-store job_output_chunks`
-- [x] `cargo test -p fleet-controller websocket`
-- [x] `cargo fmt --all --check`
-- [x] `git diff --check`
+- [x] docs/runbooks.md 또는 runbook 섹션을 추가한다.
+- [x] runbook YAML 예시를 추가한다.
+- [x] result schema 예시를 추가한다.
+- [x] dry-run/check mode 의미를 문서화한다.
 
 ## 완료 기준
 
-- [x] Agent 하나의 과도한 output이 Controller 전체를 막지 않는다.
-- [x] outbound queue는 bounded다.
-- [x] output은 job output storage에만 저장되고 Product application log에 원문이 남지 않는다.
-- [x] duplicate output과 disconnect 정책이 테스트로 고정된다.
-- [x] long-running command timeout이 유지된다.
+- [x] runbook schema가 fixture test로 고정된다.
+- [x] primitive result common schema가 명확하다.
+- [x] strategy와 selector가 job/fanout model과 충돌하지 않는다.
+- [x] safe primitive 확장을 시작할 수 있다.
 
-## 비범위
+## 구현 결과
 
-- [x] full streaming admin WebSocket 구현하지 않음
-- [x] HA/outbox 대규모 재설계하지 않음
-- [x] command cancellation protocol 구현하지 않음
+- Canonical runbook schema를 `apiVersion`, `kind`, `name`, `description`, `selector`/`matchLabels`, `strategy`, `checkMode`, `dryRun`, `steps`로 정리했다.
+- 기존 `metadata/spec/targets/tasks` 구조는 `examples/runbooks/legacy-nginx-basic.yml` fixture로 유지했다.
+- Parser는 unknown top-level/spec/task field를 거부하고, invalid YAML 메시지를 `expected key: value` 형태로 더 명확히 반환한다.
+- `strategy.concurrency`, `strategy.maxFailures`, `checkMode`, `dryRun` parsing을 domain test로 고정했다.
+- Controller runbook job은 request target 지정이 없을 때 runbook 문서 selector를 사용해 target snapshot을 만든다.
+- Runner는 `dryRun`이면 모든 primitive를 `skipped`, `checkMode`이면 low-risk check만 실행하고 mutation step을 `skipped`로 처리한다.
+- Primitive result common schema에 `status`, `changed`, `message`, `diff`, `started_at_ms`, `completed_at_ms`, `duration_ms`를 추가하고 serialization test를 추가했다.
+- Per-step aggregate rule은 `canceled > rejected > failed > changed > skipped > success` 순서로 고정했다.
+- `docs/runbooks.md`, `docs/api.md`, `docs/openapi.json`, `docs/feature-matrix.md`를 현재 계약에 맞춰 갱신했다.
+
+## 검증 결과
+
+- [x] `cargo fmt --all`
+- [x] `cargo test -p fleet-domain -p fleet-runner -p fleet-controller`
+- [x] `cargo fmt --all --check`
+- [x] `cargo test --workspace`
+- [x] `cargo clippy --workspace --all-targets -- -D warnings`
+- [x] `git diff --check`

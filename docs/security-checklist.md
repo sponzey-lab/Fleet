@@ -1,6 +1,8 @@
 # Security Checklist
 
 - Enrollment tokens are one-time visible secrets.
+- Bootstrap admin token maps to an authenticated admin actor and role before protected APIs run.
+- Dangerous admin APIs check route permissions and return 403 with the required permission when denied.
 - Agent identity is key-pair based.
 - Controller identity is key-pair based.
 - Agents pin the controller public key after enrollment.

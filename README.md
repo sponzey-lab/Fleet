@@ -73,6 +73,56 @@ cargo build -p fleet-cli
 
 If you use the source build, replace `sponzey` below with `./target/debug/sponzey`.
 
+### Install Paths
+
+Use npm for the simplest developer and small-server install:
+
+```bash
+npm install -g @sponzey/fleet
+```
+
+Use standalone release archives when you do not want npm on the target host.
+Release archives are named:
+
+```text
+sponzey-darwin-arm64.tar.gz
+sponzey-darwin-x64.tar.gz
+sponzey-linux-arm64.tar.gz
+sponzey-linux-x64.tar.gz
+```
+
+Verify the archive checksum before installing:
+
+```bash
+./scripts/verify_standalone_artifacts.sh dist/release
+```
+
+The release workflow publishes `SHA256SUMS` with the archives. Signature
+verification is not implemented yet; treat checksum verification plus release
+provenance as the current integrity boundary.
+
+For long-running Linux hosts, install the resolved binary as a systemd service:
+
+```bash
+sponzey controller install-service --data-dir /var/lib/sponzey-fleet --dry-run
+sudo sponzey controller install-service --data-dir /var/lib/sponzey-fleet
+sponzey controller status-service --dry-run
+sponzey controller logs-service --dry-run
+```
+
+Agent services use the same shape with `sponzey agent install-service`.
+Service units pass explicit CLI arguments and do not patch process environment
+at runtime.
+
+Upgrade is currently an external package/artifact operation. Inspect the policy
+before replacing a binary:
+
+```bash
+sponzey upgrade --dry-run
+```
+
+Back up controller data before any upgrade that may touch controller storage.
+
 ## Fastest Demo
 
 ```bash
@@ -95,7 +145,17 @@ GET /swagger-ui
 Protected API calls use the admin token printed by `sponzey controller init` as
 a Bearer token. Do not use Swagger UI over HTTP except for local or short-lived
 tests because tokens and request payloads are not encrypted. The detailed API
-contract is maintained in [docs/api.md](docs/api.md).
+contract, public/internal endpoint boundary, pagination shape, and deprecation
+policy are maintained in [docs/api.md](docs/api.md). The agent WebSocket
+protocol is documented separately in [docs/protocol.md](docs/protocol.md).
+
+The current bootstrap admin token maps to the `bootstrap-admin` actor with the
+`owner` role. Minimal role and permission boundaries are documented in
+[docs/security.md](docs/security.md).
+
+Current implementation status is tracked in
+[docs/feature-matrix.md](docs/feature-matrix.md). Release verification commands
+and required smoke checks are tracked in [docs/release-gate.md](docs/release-gate.md).
 
 ## Transport Safety Warning
 
@@ -165,6 +225,12 @@ http://127.0.0.1:7700/admin
 ```
 
 Paste the admin token from step 1.
+
+The Web Admin surface shows agent inventory, selected agent details, facts,
+disk and mount inventory, metrics charts with a range selector, drift latest
+and history, agent operational logs, job output, per-target assignment state,
+pending approvals, enrollment tokens, policy assignment, runbook job creation,
+audit events, and an HTTP transport warning banner when opened over HTTP.
 
 ### 4. Create An Enrollment Token
 
@@ -259,9 +325,85 @@ path, so the UI can show queued, delivered, running, completed, and no-output
 states without embedding raw command output in product logs.
 
 Revoking an agent key disables the agent, closes any active session with the
-`agent_revoked` reason, and blocks additional task delivery. It does not
-guarantee an immediate kill of a local OS process that the agent already
-started. That requires a separate task cancellation protocol.
+`agent_revoked` reason, and blocks additional task delivery. Revoke is not the
+job stop button. To stop a specific job, call `POST /api/jobs/{job_id}/cancel`
+or use the equivalent UI/CLI surface when available.
+
+Cancel records the job and assignment as `canceled`. If the agent session is
+active and the task was already dispatched, the controller sends `task_cancel`
+over the existing WebSocket session. The agent kills the current command
+process when the task id matches and reports `task_result.status = "canceled"`.
+Command timeout is separate: timeout reports `task_result.status = "timed_out"`
+and the controller stores the job as `expired`.
+
+## Target Preview and Snapshots
+
+Before creating a job, automation or Web Admin can call `POST
+/api/selectors/preview` with either a string selector or `matchLabels`:
+
+```json
+{ "matchLabels": { "role": "web", "env": "prod" } }
+```
+
+Supported string selectors are `agent:<name-or-id>`, `label:key=value`, and
+`key=value,key2=value2`. Disabled or revoked agents are shown in preview but
+excluded from dispatch. Offline agents can be selected; their assignments stay
+queued until they reconnect.
+
+When a job is created, the controller stores the selector source and a target
+snapshot. Later label or status changes do not change the job's original target
+set.
+
+For multi-agent jobs, create the job after checking the preview result. The
+controller creates one assignment per target in that snapshot. The optional job
+`strategy` controls fanout:
+
+```json
+{
+  "strategy": {
+    "concurrency": 2,
+    "maxFailures": 1
+  }
+}
+```
+
+`concurrency` defaults to `1`, which means sequential dispatch. `maxFailures`
+is optional; when the threshold is reached, remaining queued assignments are
+canceled instead of being dispatched. Job detail responses include the saved
+strategy, per-target `task_id`, `assignment_status`, and `last_error` fields,
+plus an `assignment_summary` count object so Web Admin and automation can
+distinguish connectivity from execution state.
+
+## Risky Jobs And Approval
+
+Sponzey separates creating a risky job from dispatching it to an agent.
+
+Safe single-agent probes such as `uptime` can be queued immediately. Shell
+commands, `sudo`, `su`, reboot/shutdown actions, user/group changes,
+package/service/file mutations, unknown commands, and broad multi-agent targets
+create an approval request instead. The job stays in `pending_approval` and is
+not dispatched until the approval is approved.
+
+`confirmed_high_risk` and `--confirm-risk` are compatibility acknowledgements.
+They do not replace approval. An approval records the approver, reason, status,
+expiry, and audit events.
+
+The approver is derived from the authenticated admin token. Approval request
+bodies can include a reason; UI-provided actor fields are not trusted for audit
+or authorization.
+
+The approval API is available now:
+
+```text
+GET  /api/approvals?status=pending
+POST /api/approvals/{approval_id}/approve
+POST /api/approvals/{approval_id}/reject
+POST /api/approvals/expire
+```
+
+The Web Admin approval queue uses the same API. Approve/reject actions send only
+the decision reason; the controller derives the approver from the authenticated
+admin token and then refreshes approval, job, and audit views.
 
 ## HTTPS Preparation
 
@@ -389,11 +531,49 @@ sudo rm -rf /var/lib/sponzey-fleet/agent
 Controller inventory and audit records are kept. To use the same host again,
 create a new enrollment token and run `sponzey agent init` again.
 
+## Back Up And Restore Controller Data
+
+Back up the controller before deleting a data directory, moving to another
+machine, or performing risky maintenance. Stop the controller first so the
+SQLite database is not being written while the backup is created.
+
+```bash
+sponzey controller backup \
+  --data-dir .sponzey \
+  --output ./sponzey-controller.backup.json
+```
+
+The backup archive contains sensitive controller state, including the controller
+identity keys and SQLite data. Store it like a secret.
+
+Validate a restore without writing files:
+
+```bash
+sponzey controller restore \
+  --data-dir ./restore-check \
+  --input ./sponzey-controller.backup.json \
+  --dry-run
+```
+
+Restore into an empty data directory:
+
+```bash
+sponzey controller restore \
+  --data-dir .sponzey-restored \
+  --input ./sponzey-controller.backup.json
+```
+
+Restore refuses to overwrite an existing controller directory. Use `--force`
+only after you have confirmed the target data directory can be replaced.
+
 To reset everything, remove the whole data directory:
 
 ```bash
 rm -rf .sponzey
 ```
+
+Deleting the data directory is a reset. Backup/restore preserves controller
+identity, inventory, jobs, audit events, telemetry, and enrollment records.
 
 ## Common Problems
 
@@ -409,6 +589,19 @@ The controller data directory was probably not initialized. Run
 ### `agent is not enrolled`
 
 Run `sponzey agent init ...` before `sponzey agent start ...`.
+
+### A running job stays running after the agent disconnects
+
+This is expected. The controller does not mark a job as failed just because the
+WebSocket dropped. A final `task_result`, cancel, timeout, or expiry policy
+decides the terminal state. Use job output and audit entries to confirm what
+happened.
+
+### Cancel, failed, and expired look different
+
+`canceled` means an operator cancel was recorded. `failed` means the agent
+reported a non-zero or failed result. `expired` means timeout or assignment
+expiry won. These states are intentionally separate.
 
 ### `WARNING: insecure HTTP controller URL enabled`
 
@@ -427,6 +620,8 @@ Open `/admin`, not an API path.
 - Agent init: use the enrollment token from `sponzey enroll-token create`.
 
 ## Development Checks
+
+The full release gate is documented in [docs/release-gate.md](docs/release-gate.md).
 
 ```bash
 cargo fmt --all --check

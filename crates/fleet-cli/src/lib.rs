@@ -2,6 +2,8 @@ use clap::{Args, Parser, Subcommand};
 use fleet_core::{
     LogProfile, format_error_message, format_warning_message, init_logging, redact_secret,
 };
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::error::Error as StdError;
 use std::fmt::{Display, Formatter};
 use std::fs::{self, OpenOptions};
@@ -71,6 +73,7 @@ pub enum Command {
     Drift(DriftCommand),
     Apply(ApplyCommand),
     Retention(RetentionCommand),
+    Upgrade(UpgradeCommand),
     Demo(DemoCommand),
 }
 
@@ -137,9 +140,49 @@ pub enum ControllerSubcommand {
         #[arg(long)]
         dry_run: bool,
     },
+    StatusService {
+        #[arg(long)]
+        dry_run: bool,
+    },
+    LogsService {
+        #[arg(long, default_value_t = 50)]
+        lines: usize,
+        #[arg(long)]
+        dry_run: bool,
+    },
     UninstallService {
         #[arg(long)]
         dry_run: bool,
+    },
+    #[command(
+        about = "Create a controller data backup archive",
+        long_about = "Create a JSON backup archive for the controller data under <data-dir>/controller.\n\nThe archive contains controller keys, SQLite data, metadata, and checksums. Treat it as sensitive because it contains enough controller state to restore the fleet."
+    )]
+    Backup {
+        #[arg(long, default_value = ".sponzey")]
+        data_dir: PathBuf,
+        #[arg(long, help = "Backup archive path to create")]
+        output: PathBuf,
+    },
+    #[command(
+        about = "Restore a controller data backup archive",
+        long_about = "Restore a JSON backup archive into <data-dir>/controller.\n\nDry-run validates format, checksums, schema compatibility, and SQLite integrity without writing. Actual restore refuses to overwrite existing controller data unless --force is provided."
+    )]
+    Restore {
+        #[arg(long, default_value = ".sponzey")]
+        data_dir: PathBuf,
+        #[arg(long, help = "Backup archive path to restore")]
+        input: PathBuf,
+        #[arg(
+            long,
+            help = "Validate the archive and print the restore plan without writing"
+        )]
+        dry_run: bool,
+        #[arg(
+            long,
+            help = "Allow replacing an existing non-empty controller data directory"
+        )]
+        force: bool,
     },
 }
 
@@ -252,6 +295,18 @@ pub enum AgentSubcommand {
     #[command(about = "Start the installed agent systemd service")]
     StartService {
         #[arg(long, help = "Print the systemctl command without executing it")]
+        dry_run: bool,
+    },
+    #[command(about = "Show the installed agent systemd service status")]
+    StatusService {
+        #[arg(long, help = "Print the systemctl command without executing it")]
+        dry_run: bool,
+    },
+    #[command(about = "Show recent installed agent service logs from journald")]
+    LogsService {
+        #[arg(long, default_value_t = 50, help = "Number of recent journald lines")]
+        lines: usize,
+        #[arg(long, help = "Print the journalctl command without executing it")]
         dry_run: bool,
     },
     #[command(about = "Disable and remove the installed agent systemd service")]
@@ -394,6 +449,38 @@ pub enum DriftSubcommand {
     },
 }
 
+#[derive(Debug, Args)]
+#[command(
+    about = "Inspect the Sponzey Fleet upgrade plan",
+    long_about = "Inspect the current upgrade policy without replacing the running binary.\n\nAutomatic self-upgrade is intentionally not implemented yet. Use --dry-run to see the required backup, artifact integrity, channel, and recovery steps before upgrading with an external package manager or release artifact."
+)]
+pub struct UpgradeCommand {
+    #[arg(long, default_value = "stable")]
+    channel: UpgradeChannelArg,
+    #[arg(
+        long,
+        help = "Target version to inspect; defaults to latest in the channel"
+    )]
+    version: Option<String>,
+    #[arg(long, help = "Print the upgrade plan without changing files")]
+    dry_run: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum UpgradeChannelArg {
+    Stable,
+    Beta,
+}
+
+impl UpgradeChannelArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Beta => "beta",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum CliError {
     Io(std::io::Error),
@@ -410,6 +497,7 @@ pub enum CliError {
     ServiceOperationRequiresRoot,
     ServiceBinaryMustBeAbsolute(PathBuf),
     InvalidServiceAccount(String),
+    UpgradeRequiresDryRun,
 }
 
 impl Display for CliError {
@@ -459,6 +547,12 @@ impl Display for CliError {
             }
             Self::InvalidServiceAccount(value) => {
                 write!(formatter, "invalid service user/group value: {value}")
+            }
+            Self::UpgradeRequiresDryRun => {
+                write!(
+                    formatter,
+                    "automatic self-upgrade is not implemented; rerun with --dry-run to inspect the supported external upgrade plan"
+                )
             }
         }
     }
@@ -516,6 +610,7 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
         Command::Drift(command) => execute_drift(command),
         Command::Apply(command) => execute_apply(command),
         Command::Retention(command) => execute_retention(command),
+        Command::Upgrade(command) => execute_upgrade(command),
         Command::Demo(command) => execute_demo(command),
     }
 }
@@ -582,10 +677,433 @@ fn execute_controller(command: ControllerCommand) -> Result<(), CliError> {
         ControllerSubcommand::StartService { dry_run } => {
             start_systemd_service(ServiceRole::Controller, dry_run)
         }
+        ControllerSubcommand::StatusService { dry_run } => {
+            status_systemd_service(ServiceRole::Controller, dry_run)
+        }
+        ControllerSubcommand::LogsService { lines, dry_run } => {
+            logs_systemd_service(ServiceRole::Controller, lines, dry_run)
+        }
         ControllerSubcommand::UninstallService { dry_run } => {
             uninstall_systemd_service(ServiceRole::Controller, dry_run)
         }
+        ControllerSubcommand::Backup { data_dir, output } => {
+            execute_controller_backup(&data_dir, &output)
+        }
+        ControllerSubcommand::Restore {
+            data_dir,
+            input,
+            dry_run,
+            force,
+        } => execute_controller_restore(&data_dir, &input, dry_run, force),
     }
+}
+
+const CONTROLLER_BACKUP_FORMAT: &str = "sponzey-controller-backup";
+const CONTROLLER_BACKUP_FORMAT_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ControllerBackupArchive {
+    format: String,
+    format_version: u32,
+    package_version: String,
+    created_at_ms: u64,
+    source_data_dir: String,
+    schema_version: i64,
+    sqlite_integrity_check: String,
+    files: Vec<ControllerBackupFile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ControllerBackupFile {
+    path: String,
+    size_bytes: u64,
+    sha256: String,
+    content_hex: String,
+}
+
+fn execute_controller_backup(data_dir: &Path, output: &Path) -> Result<(), CliError> {
+    ensure_controller_initialized_for_start(data_dir)?;
+    let db_path = controller_db_path(data_dir);
+    if !db_path.is_file() {
+        return Err(CliError::Http(format!(
+            "controller database was not found: {}",
+            db_path.display()
+        )));
+    }
+    ensure_no_sqlite_transient_files(&db_path)?;
+    let store = fleet_store::SqliteStore::open(&db_path)?;
+    let integrity = store.integrity_check()?;
+    if integrity != "ok" {
+        return Err(CliError::Http(format!(
+            "sqlite integrity check failed: {integrity}"
+        )));
+    }
+    let schema_version = store.current_schema_version()?.unwrap_or(0);
+    let archive = build_controller_backup_archive(data_dir, schema_version, integrity)?;
+    write_backup_archive(output, &archive)?;
+    println!("backup_archive={}", output.display());
+    println!("format={}", archive.format);
+    println!("format_version={}", archive.format_version);
+    println!("schema_version={}", archive.schema_version);
+    println!("file_count={}", archive.files.len());
+    println!(
+        "{}",
+        format_warning_message(
+            "backup contains sensitive controller state; store it securely and do not share it",
+        )
+    );
+    Ok(())
+}
+
+fn execute_controller_restore(
+    data_dir: &Path,
+    input: &Path,
+    dry_run: bool,
+    force: bool,
+) -> Result<(), CliError> {
+    let archive = read_backup_archive(input)?;
+    validate_backup_archive(&archive)?;
+    if archive.schema_version > fleet_store::CURRENT_SCHEMA_VERSION {
+        return Err(CliError::Http(format!(
+            "backup schema version {} is newer than this binary supports ({})",
+            archive.schema_version,
+            fleet_store::CURRENT_SCHEMA_VERSION
+        )));
+    }
+    let target_controller_dir = controller_dir(data_dir);
+    let existing_non_empty = directory_exists_and_is_non_empty(&target_controller_dir)?;
+    if dry_run {
+        println!("restore_dry_run=true");
+        println!("input={}", input.display());
+        println!("target_data_dir={}", data_dir.display());
+        println!("schema_version={}", archive.schema_version);
+        println!("file_count={}", archive.files.len());
+        println!("would_overwrite={existing_non_empty}");
+        return Ok(());
+    }
+    if existing_non_empty && !force {
+        return Err(CliError::Http(format!(
+            "refusing to overwrite existing controller data dir {}; rerun with --force after taking a backup",
+            target_controller_dir.display()
+        )));
+    }
+
+    let temp_root = restore_temp_dir(data_dir);
+    if temp_root.exists() {
+        fs::remove_dir_all(&temp_root)?;
+    }
+    fs::create_dir_all(&temp_root)?;
+    let restore_result = restore_archive_into_temp_dir(&archive, &temp_root)
+        .and_then(|()| verify_restored_controller_dir(&temp_root))
+        .and_then(|()| replace_controller_dir(data_dir, &temp_root, force));
+    if restore_result.is_err() {
+        let _ = fs::remove_dir_all(&temp_root);
+    }
+    restore_result?;
+    println!("restore_dry_run=false");
+    println!("restored_data_dir={}", data_dir.display());
+    println!("schema_version={}", archive.schema_version);
+    println!("file_count={}", archive.files.len());
+    println!(
+        "{}",
+        format_warning_message(
+            "restored backup contains controller secrets; verify filesystem permissions before production use",
+        )
+    );
+    Ok(())
+}
+
+fn build_controller_backup_archive(
+    data_dir: &Path,
+    schema_version: i64,
+    sqlite_integrity_check: String,
+) -> Result<ControllerBackupArchive, CliError> {
+    let files = collect_controller_backup_files(data_dir)?;
+    Ok(ControllerBackupArchive {
+        format: CONTROLLER_BACKUP_FORMAT.to_owned(),
+        format_version: CONTROLLER_BACKUP_FORMAT_VERSION,
+        package_version: env!("CARGO_PKG_VERSION").to_owned(),
+        created_at_ms: epoch_millis() as u64,
+        source_data_dir: data_dir.display().to_string(),
+        schema_version,
+        sqlite_integrity_check,
+        files,
+    })
+}
+
+fn collect_controller_backup_files(data_dir: &Path) -> Result<Vec<ControllerBackupFile>, CliError> {
+    let mut files = Vec::new();
+    collect_controller_backup_files_from_dir(data_dir, &controller_dir(data_dir), &mut files)?;
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(files)
+}
+
+fn collect_controller_backup_files_from_dir(
+    data_dir: &Path,
+    directory: &Path,
+    files: &mut Vec<ControllerBackupFile>,
+) -> Result<(), CliError> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
+            collect_controller_backup_files_from_dir(data_dir, &path, files)?;
+            continue;
+        }
+        if !metadata.is_file() {
+            return Err(CliError::Http(format!(
+                "controller backup only supports regular files: {}",
+                path.display()
+            )));
+        }
+        let relative_path = backup_relative_path(data_dir, &path)?;
+        let content = fs::read(&path)?;
+        let sha256 = sha256_hex(&content);
+        files.push(ControllerBackupFile {
+            path: relative_path,
+            size_bytes: content.len() as u64,
+            sha256,
+            content_hex: hex_encode(&content),
+        });
+    }
+    Ok(())
+}
+
+fn backup_relative_path(data_dir: &Path, path: &Path) -> Result<String, CliError> {
+    let relative = path.strip_prefix(data_dir).map_err(|_| {
+        CliError::Http(format!(
+            "backup path is outside data dir: {}",
+            path.display()
+        ))
+    })?;
+    let parts = relative
+        .components()
+        .map(|component| match component {
+            std::path::Component::Normal(value) => Ok(value.to_string_lossy().to_string()),
+            _ => Err(CliError::Http(format!(
+                "invalid backup path component: {}",
+                path.display()
+            ))),
+        })
+        .collect::<Result<Vec<_>, CliError>>()?;
+    Ok(parts.join("/"))
+}
+
+fn write_backup_archive(output: &Path, archive: &ControllerBackupArchive) -> Result<(), CliError> {
+    if let Some(parent) = output.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
+    let temp_output = output.with_extension(format!(
+        "{}.tmp",
+        output
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("backup")
+    ));
+    let body =
+        serde_json::to_vec_pretty(archive).map_err(|error| CliError::Http(error.to_string()))?;
+    fs::write(&temp_output, body)?;
+    fs::rename(&temp_output, output)?;
+    Ok(())
+}
+
+fn read_backup_archive(input: &Path) -> Result<ControllerBackupArchive, CliError> {
+    let body = fs::read(input)?;
+    serde_json::from_slice(&body).map_err(|error| CliError::Http(error.to_string()))
+}
+
+fn validate_backup_archive(archive: &ControllerBackupArchive) -> Result<(), CliError> {
+    if archive.format != CONTROLLER_BACKUP_FORMAT {
+        return Err(CliError::Http(format!(
+            "unsupported backup format: {}",
+            archive.format
+        )));
+    }
+    if archive.format_version != CONTROLLER_BACKUP_FORMAT_VERSION {
+        return Err(CliError::Http(format!(
+            "unsupported backup format version: {}",
+            archive.format_version
+        )));
+    }
+    if archive.files.is_empty() {
+        return Err(CliError::Http(
+            "backup archive contains no files".to_owned(),
+        ));
+    }
+    for file in &archive.files {
+        validate_backup_file_path(&file.path)?;
+        let content = hex_decode(&file.content_hex)?;
+        if content.len() as u64 != file.size_bytes {
+            return Err(CliError::Http(format!(
+                "backup file size mismatch: {}",
+                file.path
+            )));
+        }
+        let actual = sha256_hex(&content);
+        if actual != file.sha256 {
+            return Err(CliError::Http(format!(
+                "backup checksum mismatch for {}",
+                file.path
+            )));
+        }
+    }
+    if !archive
+        .files
+        .iter()
+        .any(|file| file.path == "controller/fleet.db")
+    {
+        return Err(CliError::Http(
+            "backup archive does not contain controller/fleet.db".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_backup_file_path(path: &str) -> Result<(), CliError> {
+    if path.is_empty()
+        || path.starts_with('/')
+        || path.contains('\\')
+        || path
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+        || !path.starts_with("controller/")
+    {
+        return Err(CliError::Http(format!("invalid backup file path: {path}")));
+    }
+    Ok(())
+}
+
+fn restore_archive_into_temp_dir(
+    archive: &ControllerBackupArchive,
+    temp_root: &Path,
+) -> Result<(), CliError> {
+    for file in &archive.files {
+        let path = temp_root.join(&file.path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&path, hex_decode(&file.content_hex)?)?;
+        set_restored_file_permissions(&path)?;
+    }
+    Ok(())
+}
+
+fn set_restored_file_permissions(path: &Path) -> Result<(), CliError> {
+    #[cfg(unix)]
+    {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
+fn verify_restored_controller_dir(temp_root: &Path) -> Result<(), CliError> {
+    let db_path = temp_root.join("controller").join("fleet.db");
+    let store = fleet_store::SqliteStore::open(&db_path)?;
+    let integrity = store.integrity_check()?;
+    if integrity != "ok" {
+        return Err(CliError::Http(format!(
+            "restored sqlite integrity check failed: {integrity}"
+        )));
+    }
+    Ok(())
+}
+
+fn replace_controller_dir(data_dir: &Path, temp_root: &Path, force: bool) -> Result<(), CliError> {
+    let target_controller_dir = controller_dir(data_dir);
+    let temp_controller_dir = temp_root.join("controller");
+    fs::create_dir_all(data_dir)?;
+    if target_controller_dir.exists() {
+        if directory_exists_and_is_non_empty(&target_controller_dir)? && !force {
+            return Err(CliError::Http(format!(
+                "refusing to overwrite existing controller data dir {}",
+                target_controller_dir.display()
+            )));
+        }
+        let old_controller_dir =
+            data_dir.join(format!(".controller-restore-old-{}", epoch_millis()));
+        if old_controller_dir.exists() {
+            fs::remove_dir_all(&old_controller_dir)?;
+        }
+        fs::rename(&target_controller_dir, &old_controller_dir)?;
+        match fs::rename(&temp_controller_dir, &target_controller_dir) {
+            Ok(()) => {
+                fs::remove_dir_all(old_controller_dir)?;
+            }
+            Err(error) => {
+                let _ = fs::rename(&old_controller_dir, &target_controller_dir);
+                return Err(CliError::Io(error));
+            }
+        }
+    } else {
+        fs::rename(&temp_controller_dir, &target_controller_dir)?;
+    }
+    fs::remove_dir_all(temp_root)?;
+    Ok(())
+}
+
+fn directory_exists_and_is_non_empty(path: &Path) -> Result<bool, CliError> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    Ok(fs::read_dir(path)?.next().transpose()?.is_some())
+}
+
+fn restore_temp_dir(data_dir: &Path) -> PathBuf {
+    let parent = data_dir.parent().unwrap_or_else(|| Path::new("."));
+    let name = data_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("sponzey-fleet");
+    parent.join(format!(".{name}-restore-tmp-{}", epoch_millis()))
+}
+
+fn ensure_no_sqlite_transient_files(db_path: &Path) -> Result<(), CliError> {
+    for suffix in ["-wal", "-shm"] {
+        let path = PathBuf::from(format!("{}{suffix}", db_path.display()));
+        if path.exists() {
+            return Err(CliError::Http(format!(
+                "refusing to backup SQLite database with transient file present: {}; stop the controller and retry",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn sha256_hex(content: &[u8]) -> String {
+    hex_encode(&Sha256::digest(content))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
+}
+
+fn hex_decode(value: &str) -> Result<Vec<u8>, CliError> {
+    if !value.len().is_multiple_of(2) {
+        return Err(CliError::Http(
+            "hex content must have even length".to_owned(),
+        ));
+    }
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let text =
+                std::str::from_utf8(pair).map_err(|error| CliError::Http(error.to_string()))?;
+            u8::from_str_radix(text, 16)
+                .map_err(|_| CliError::Http(format!("invalid hex byte in backup content: {text}")))
+        })
+        .collect()
 }
 
 fn execute_enroll_token(command: EnrollTokenCommand) -> Result<(), CliError> {
@@ -825,6 +1343,12 @@ fn execute_agent(command: AgentCommand) -> Result<(), CliError> {
         }
         AgentSubcommand::StartService { dry_run } => {
             start_systemd_service(ServiceRole::Agent, dry_run)
+        }
+        AgentSubcommand::StatusService { dry_run } => {
+            status_systemd_service(ServiceRole::Agent, dry_run)
+        }
+        AgentSubcommand::LogsService { lines, dry_run } => {
+            logs_systemd_service(ServiceRole::Agent, lines, dry_run)
         }
         AgentSubcommand::UninstallService { dry_run } => {
             uninstall_systemd_service(ServiceRole::Agent, dry_run)
@@ -1087,10 +1611,11 @@ fn execute_retention(command: RetentionCommand) -> Result<(), CliError> {
                     actor: fleet_domain::AuditActor::new("cli"),
                     target: fleet_domain::AuditTarget::new("controller-store"),
                     value: fleet_domain::AuditValue::Plain(format!(
-                        "job_output_chunks={},facts_snapshots={},metrics_snapshots={},total={}",
+                        "job_output_chunks={},facts_snapshots={},metrics_snapshots={},agent_log_chunks={},total={}",
                         summary.job_output_chunks,
                         summary.facts_snapshots,
                         summary.metrics_snapshots,
+                        summary.agent_log_chunks,
                         summary.total()
                     )),
                     occurred_at: SystemTime::now(),
@@ -1099,6 +1624,7 @@ fn execute_retention(command: RetentionCommand) -> Result<(), CliError> {
             println!("job_output_chunks={}", summary.job_output_chunks);
             println!("facts_snapshots={}", summary.facts_snapshots);
             println!("metrics_snapshots={}", summary.metrics_snapshots);
+            println!("agent_log_chunks={}", summary.agent_log_chunks);
             println!("total={}", summary.total());
             println!("dry_run={dry_run}");
             Ok(())
@@ -1262,6 +1788,30 @@ fn execute_drift(command: DriftCommand) -> Result<(), CliError> {
     }
 }
 
+fn execute_upgrade(command: UpgradeCommand) -> Result<(), CliError> {
+    if !command.dry_run {
+        return Err(CliError::UpgradeRequiresDryRun);
+    }
+    let target_version = command.version.as_deref().unwrap_or("latest");
+    println!("upgrade_dry_run=true");
+    println!("current_version={}", env!("CARGO_PKG_VERSION"));
+    println!("channel={}", command.channel.as_str());
+    println!("target_version={target_version}");
+    println!("backup_required=true");
+    println!(
+        "recommended_backup_command=sponzey controller backup --data-dir <controller-data-dir> --output ./sponzey-controller-before-upgrade.backup.json"
+    );
+    println!("artifact_integrity_required=true");
+    println!("artifact_integrity_command=./scripts/verify_standalone_artifacts.sh dist/release");
+    println!(
+        "recovery_policy=restore the previous sponzey binary; if controller data was migrated or changed, restore the controller backup before restarting services"
+    );
+    println!(
+        "service_policy=stop services before binary replacement, then restart and verify with status-service"
+    );
+    Ok(())
+}
+
 fn drift_status_to_cli(status: &fleet_domain::DriftStatus) -> &'static str {
     match status {
         fleet_domain::DriftStatus::Compliant => "compliant",
@@ -1326,7 +1876,7 @@ fn execute_demo(command: DemoCommand) -> Result<(), CliError> {
     create_demo_command_job(port, &admin_token)?;
     run_agent_heartbeat_once(&agent_config, true)?;
     let output = http_get(port, "/api/jobs/job-demo-1/output", Some(&admin_token))?;
-    if !output.contains("\"data\":\"demo-ok\"") {
+    if !output.contains("demo-ok") {
         return Err(CliError::Http(format!(
             "demo command output was not observed: {output}"
         )));
@@ -1385,12 +1935,11 @@ fn enroll_demo_agent(
 fn create_demo_command_job(port: u16, admin_token: &str) -> Result<(), CliError> {
     let body = serde_json::json!({
         "job_id": "job-demo-1",
-        "target_agent_ids": [],
-        "selector": "role=web",
-        "program": "printf",
+        "target_agent_ids": ["agent-web-01"],
+        "program": "echo",
         "args": ["demo-ok"],
         "timeout_seconds": 30,
-        "confirmed_high_risk": true,
+        "confirmed_high_risk": false,
         "confirmed_by": "demo-admin",
         "expires_in_seconds": 60,
         "nonce_prefix": "demo"
@@ -1666,6 +2215,17 @@ fn render_systemctl_command(action: &str, role: ServiceRole) -> String {
     format!("systemctl {action} {}", service_unit_name(role))
 }
 
+fn render_service_status_command(role: ServiceRole) -> String {
+    format!("systemctl status {} --no-pager", service_unit_name(role))
+}
+
+fn render_service_logs_command(role: ServiceRole, lines: usize) -> String {
+    format!(
+        "journalctl -u {} --no-pager -n {lines}",
+        service_unit_name(role)
+    )
+}
+
 fn render_uninstall_service_commands(role: ServiceRole) -> Vec<String> {
     vec![
         render_systemctl_command("disable --now", role),
@@ -1681,6 +2241,50 @@ fn start_systemd_service(role: ServiceRole, dry_run: bool) -> Result<(), CliErro
     }
     ensure_systemd_operation_allowed()?;
     run_systemctl(&["start", service_unit_name(role)])
+}
+
+fn status_systemd_service(role: ServiceRole, dry_run: bool) -> Result<(), CliError> {
+    if dry_run {
+        println!("{}", render_service_status_command(role));
+        return Ok(());
+    }
+    ensure_systemd_query_allowed()?;
+    let status = ProcessCommand::new("systemctl")
+        .arg("status")
+        .arg(service_unit_name(role))
+        .arg("--no-pager")
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(CliError::Io(std::io::Error::other(format!(
+            "systemctl status {} failed with status {status}",
+            service_unit_name(role)
+        ))))
+    }
+}
+
+fn logs_systemd_service(role: ServiceRole, lines: usize, dry_run: bool) -> Result<(), CliError> {
+    if dry_run {
+        println!("{}", render_service_logs_command(role, lines));
+        return Ok(());
+    }
+    ensure_systemd_query_allowed()?;
+    let status = ProcessCommand::new("journalctl")
+        .arg("-u")
+        .arg(service_unit_name(role))
+        .arg("--no-pager")
+        .arg("-n")
+        .arg(lines.to_string())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(CliError::Io(std::io::Error::other(format!(
+            "journalctl -u {} failed with status {status}",
+            service_unit_name(role)
+        ))))
+    }
 }
 
 fn install_systemd_service(role: ServiceRole, unit: &str) -> Result<(), CliError> {
@@ -1708,11 +2312,16 @@ fn uninstall_systemd_service(role: ServiceRole, dry_run: bool) -> Result<(), Cli
 }
 
 fn ensure_systemd_operation_allowed() -> Result<(), CliError> {
-    if std::env::consts::OS != "linux" {
-        return Err(CliError::ServiceOperationRequiresLinux);
-    }
+    ensure_systemd_query_allowed()?;
     if effective_user_id()? != 0 {
         return Err(CliError::ServiceOperationRequiresRoot);
+    }
+    Ok(())
+}
+
+fn ensure_systemd_query_allowed() -> Result<(), CliError> {
+    if std::env::consts::OS != "linux" {
+        return Err(CliError::ServiceOperationRequiresLinux);
     }
     Ok(())
 }
@@ -2547,6 +3156,63 @@ type AgentWebSocket = tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream
 type AgentOutboundSender = SyncSender<fleet_protocol::WireMessage>;
 type AgentOutboundReceiver = Receiver<fleet_protocol::WireMessage>;
 
+#[derive(Default)]
+struct AgentTaskRuntimeState {
+    current_task_id: Mutex<Option<String>>,
+    cancel_requested: AtomicBool,
+}
+
+#[derive(Clone)]
+struct AgentTaskSessionState {
+    busy: Arc<AtomicBool>,
+    runtime: Arc<AgentTaskRuntimeState>,
+    replay_guard: Arc<Mutex<fleet_runner::NonceReplayGuard>>,
+}
+
+impl AgentTaskRuntimeState {
+    fn start_task(&self, task_id: &str) -> Result<(), CliError> {
+        let mut current = self
+            .current_task_id
+            .lock()
+            .map_err(|_| CliError::Http("agent task runtime lock poisoned".to_owned()))?;
+        *current = Some(task_id.to_owned());
+        self.cancel_requested.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn request_cancel(&self, task_id: &str) -> Result<bool, CliError> {
+        let current = self
+            .current_task_id
+            .lock()
+            .map_err(|_| CliError::Http("agent task runtime lock poisoned".to_owned()))?;
+        if current.as_deref() == Some(task_id) {
+            self.cancel_requested.store(true, Ordering::SeqCst);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn should_cancel(&self, task_id: &str) -> bool {
+        if !self.cancel_requested.load(Ordering::SeqCst) {
+            return false;
+        }
+        self.current_task_id
+            .lock()
+            .map(|current| current.as_deref() == Some(task_id))
+            .unwrap_or(false)
+    }
+
+    fn finish_task(&self, task_id: &str) {
+        if let Ok(mut current) = self.current_task_id.lock()
+            && current.as_deref() == Some(task_id)
+        {
+            *current = None;
+            self.cancel_requested.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
 fn run_agent_session_once(
     config: &LocalAgentConfig,
     options: AgentHeartbeatOptions,
@@ -2564,8 +3230,11 @@ fn run_agent_session_once(
 
     let (outbound_sender, outbound_receiver) =
         mpsc::sync_channel(AGENT_SESSION_OUTBOUND_QUEUE_CAPACITY);
-    let task_busy = Arc::new(AtomicBool::new(false));
-    let replay_guard = Arc::new(Mutex::new(fleet_runner::NonceReplayGuard::default()));
+    let task_state = AgentTaskSessionState {
+        busy: Arc::new(AtomicBool::new(false)),
+        runtime: Arc::new(AgentTaskRuntimeState::default()),
+        replay_guard: Arc::new(Mutex::new(fleet_runner::NonceReplayGuard::default())),
+    };
     enqueue_initial_agent_session_messages(&outbound_sender, config, &correlation_id, options)?;
 
     let mut last_heartbeat = Instant::now();
@@ -2587,8 +3256,7 @@ fn run_agent_session_once(
                 controller_signing_public_key(&identity),
                 &correlation_id,
                 &outbound_sender,
-                &task_busy,
-                &replay_guard,
+                &task_state,
             )?,
             AgentSessionInbound::Idle => {}
             AgentSessionInbound::Closed => return Ok(AgentSessionEnd::ControllerClosed),
@@ -2775,26 +3443,44 @@ fn handle_agent_session_message(
     controller_public_key: &str,
     correlation_id: &str,
     outbound_sender: &AgentOutboundSender,
-    task_busy: &Arc<AtomicBool>,
-    replay_guard: &Arc<Mutex<fleet_runner::NonceReplayGuard>>,
+    task_state: &AgentTaskSessionState,
 ) -> Result<(), CliError> {
-    let fleet_protocol::WirePayload::TaskAssignment { envelope, task } = message.payload else {
-        return Ok(());
+    let (envelope, task) = match message.payload {
+        fleet_protocol::WirePayload::TaskAssignment { envelope, task } => (envelope, task),
+        fleet_protocol::WirePayload::TaskCancel {
+            job_id,
+            task_id,
+            reason,
+        } => {
+            let _ = job_id;
+            let _ = reason;
+            let _ = task_state.runtime.request_cancel(&task_id)?;
+            return Ok(());
+        }
+        _ => return Ok(()),
     };
-    if task_busy.swap(true, Ordering::SeqCst) {
+    if task_state.busy.swap(true, Ordering::SeqCst) {
         enqueue_wire_message(
             outbound_sender,
-            agent_security_event_message(config, correlation_id, "task_rejected", "agent is busy")?,
+            agent_task_rejected_message(
+                config,
+                correlation_id,
+                &envelope.job_id,
+                &envelope.task_id,
+                fleet_protocol::TaskRejectionReasonCode::AgentBusy,
+                "agent is busy",
+            )?,
         )?;
         return Ok(());
     }
+    task_state.runtime.start_task(&envelope.task_id)?;
 
     let worker_config = config.clone();
     let worker_public_key = controller_public_key.to_owned();
     let worker_correlation_id = correlation_id.to_owned();
     let worker_sender = outbound_sender.clone();
-    let worker_busy = task_busy.clone();
-    let worker_replay_guard = replay_guard.clone();
+    let worker_task_state = task_state.clone();
+    let worker_task_id = envelope.task_id.clone();
     thread::spawn(move || {
         if let Err(error) = handle_task_assignment_with_queue(
             &worker_sender,
@@ -2803,7 +3489,7 @@ fn handle_agent_session_message(
             &worker_correlation_id,
             envelope,
             task,
-            &worker_replay_guard,
+            &worker_task_state,
         ) {
             let _ = enqueue_wire_message(
                 &worker_sender,
@@ -2828,7 +3514,8 @@ fn handle_agent_session_message(
                 }),
             );
         }
-        worker_busy.store(false, Ordering::SeqCst);
+        worker_task_state.runtime.finish_task(&worker_task_id);
+        worker_task_state.busy.store(false, Ordering::SeqCst);
     });
     Ok(())
 }
@@ -3203,6 +3890,13 @@ struct BlockDeviceFact {
     size_kb: Option<u64>,
     removable: Option<bool>,
     rotational: Option<bool>,
+    partitions: Vec<BlockPartitionFact>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct BlockPartitionFact {
+    name: String,
+    size_kb: Option<u64>,
 }
 
 fn collect_linux_block_devices(path: &Path) -> Option<Vec<BlockDeviceFact>> {
@@ -3227,8 +3921,47 @@ fn linux_block_device_from_sysfs_entry(path: &Path) -> Option<BlockDeviceFact> {
             .map(|sectors| sectors / 2),
         removable: read_linux_bool_file(&path.join("removable")),
         rotational: read_linux_bool_file(&path.join("queue").join("rotational")),
+        partitions: linux_block_device_partitions(path, &name),
         name,
     })
+}
+
+fn linux_block_device_partitions(path: &Path, device_name: &str) -> Vec<BlockPartitionFact> {
+    let mut partitions = fs::read_dir(path)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(Result::ok))
+        .filter_map(|entry| {
+            let partition_path = entry.path();
+            let name = partition_path.file_name()?.to_string_lossy().to_string();
+            if !linux_partition_name_matches(device_name, &name) {
+                return None;
+            }
+            Some(BlockPartitionFact {
+                size_kb: read_optional_trimmed_path(&partition_path.join("size"))
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .map(|sectors| sectors / 2),
+                name,
+            })
+        })
+        .collect::<Vec<_>>();
+    partitions.sort_by(|left, right| left.name.cmp(&right.name));
+    partitions
+}
+
+fn linux_partition_name_matches(device_name: &str, partition_name: &str) -> bool {
+    if partition_name == device_name {
+        return false;
+    }
+    let Some(suffix) = partition_name.strip_prefix(device_name) else {
+        return false;
+    };
+    let suffix = if device_name.starts_with("nvme") || device_name.starts_with("mmcblk") {
+        suffix.strip_prefix('p').unwrap_or("")
+    } else {
+        suffix
+    };
+    !suffix.is_empty() && suffix.chars().all(|character| character.is_ascii_digit())
 }
 
 fn is_ignored_linux_block_device(name: &str) -> bool {
@@ -3549,15 +4282,17 @@ fn read_and_handle_task_assignment(
         &verifier,
         &mut replay_guard,
     ) {
-        send_agent_security_event(
+        send_agent_task_rejected(
             socket,
             config,
             correlation_id,
-            "task_verification_failed",
+            &envelope,
+            task_rejection_reason_from_runner_error(&error),
             &error.to_string(),
         )?;
         return Ok(());
     }
+    send_agent_task_ack(socket, config, correlation_id, &envelope)?;
 
     match task {
         fleet_protocol::TaskWire::Command(command) => {
@@ -3580,7 +4315,7 @@ fn handle_task_assignment_with_queue(
     correlation_id: &str,
     envelope: fleet_protocol::SignedTaskEnvelopeWire,
     task: fleet_protocol::TaskWire,
-    replay_guard: &Arc<Mutex<fleet_runner::NonceReplayGuard>>,
+    task_state: &AgentTaskSessionState,
 ) -> Result<(), CliError> {
     let envelope = task_envelope_from_wire(envelope)?;
     let verifier = ControllerSignatureVerifier {
@@ -3589,7 +4324,8 @@ fn handle_task_assignment_with_queue(
     let agent_id = fleet_domain::AgentId::new(config.agent_id.clone())
         .map_err(|error| CliError::Http(error.to_string()))?;
     let verification = {
-        let mut replay_guard = replay_guard
+        let mut replay_guard = task_state
+            .replay_guard
             .lock()
             .map_err(|_| CliError::Http("agent nonce replay guard lock poisoned".to_owned()))?;
         fleet_runner::verify_signed_envelope_once(
@@ -3601,15 +4337,29 @@ fn handle_task_assignment_with_queue(
         )
     };
     if let Err(error) = verification {
-        send_agent_security_event_queue(
+        send_agent_task_rejected_queue(
             outbound_sender,
             config,
             correlation_id,
-            "task_verification_failed",
+            &envelope,
+            task_rejection_reason_from_runner_error(&error),
             &error.to_string(),
         )?;
         return Ok(());
     }
+    if task_state.runtime.should_cancel(envelope.task_id.as_str()) {
+        send_agent_task_result_queue(
+            outbound_sender,
+            config,
+            correlation_id,
+            &envelope,
+            -1,
+            fleet_protocol::TaskResultStatus::Canceled,
+            "operator requested cancel",
+        )?;
+        return Ok(());
+    }
+    send_agent_task_ack_queue(outbound_sender, config, correlation_id, &envelope)?;
 
     match task {
         fleet_protocol::TaskWire::Command(command) => {
@@ -3619,6 +4369,7 @@ fn handle_task_assignment_with_queue(
                 correlation_id,
                 &envelope,
                 command,
+                task_state.runtime.as_ref(),
             )?;
         }
         fleet_protocol::TaskWire::DriftCheck(task) => {
@@ -3649,6 +4400,7 @@ fn run_signed_command_task_queue(
     correlation_id: &str,
     envelope: &fleet_domain::TaskEnvelope,
     command: fleet_protocol::CommandTaskWire,
+    task_runtime: &AgentTaskRuntimeState,
 ) -> Result<(), CliError> {
     let mut spec = fleet_runner::CommandSpec::new(
         command.program,
@@ -3656,20 +4408,19 @@ fn run_signed_command_task_queue(
         Duration::from_millis(command.timeout_ms),
     );
     spec.max_output_bytes = command.max_output_bytes;
+    send_agent_task_started_queue(outbound_sender, config, correlation_id, envelope)?;
     let mut streamed_any = false;
-    let output = match fleet_runner::run_command_streaming(spec, |chunk| {
-        streamed_any = true;
-        send_agent_output_chunk_queue(outbound_sender, config, correlation_id, envelope, chunk)
-            .map_err(|error| fleet_runner::RunnerError::Stream(error.to_string()))
-    }) {
-        Ok(output) => output,
-        Err(error) => fleet_runner::CommandOutput {
-            stdout: String::new(),
-            stderr: error.to_string(),
-            exit_code: -1,
-            truncated: false,
+    let task_id = envelope.task_id.as_str().to_owned();
+    let result = fleet_runner::run_command_streaming_with_cancel(
+        spec,
+        || task_runtime.should_cancel(&task_id),
+        |chunk| {
+            streamed_any = true;
+            send_agent_output_chunk_queue(outbound_sender, config, correlation_id, envelope, chunk)
+                .map_err(|error| fleet_runner::RunnerError::Stream(error.to_string()))
         },
-    };
+    );
+    let (output, result_status, reason) = command_execution_result(result);
     if !streamed_any && output.exit_code != 0 && !output.stderr.is_empty() {
         send_agent_output_chunk_queue(
             outbound_sender,
@@ -3689,8 +4440,64 @@ fn run_signed_command_task_queue(
         correlation_id,
         envelope,
         output.exit_code,
+        result_status,
+        &reason,
     )?;
     Ok(())
+}
+
+fn command_execution_result(
+    result: Result<fleet_runner::CommandOutput, fleet_runner::RunnerError>,
+) -> (
+    fleet_runner::CommandOutput,
+    fleet_protocol::TaskResultStatus,
+    String,
+) {
+    match result {
+        Ok(output) if output.exit_code == 0 => (
+            output,
+            fleet_protocol::TaskResultStatus::Succeeded,
+            String::new(),
+        ),
+        Ok(output) => {
+            let reason = if output.stderr.is_empty() {
+                format!("exit_code={}", output.exit_code)
+            } else {
+                output.stderr.clone()
+            };
+            (output, fleet_protocol::TaskResultStatus::Failed, reason)
+        }
+        Err(error @ fleet_runner::RunnerError::Canceled) => (
+            fleet_runner::CommandOutput {
+                stdout: String::new(),
+                stderr: error.to_string(),
+                exit_code: -1,
+                truncated: false,
+            },
+            fleet_protocol::TaskResultStatus::Canceled,
+            error.to_string(),
+        ),
+        Err(error @ fleet_runner::RunnerError::Timeout) => (
+            fleet_runner::CommandOutput {
+                stdout: String::new(),
+                stderr: error.to_string(),
+                exit_code: -1,
+                truncated: false,
+            },
+            fleet_protocol::TaskResultStatus::TimedOut,
+            error.to_string(),
+        ),
+        Err(error) => (
+            fleet_runner::CommandOutput {
+                stdout: String::new(),
+                stderr: error.to_string(),
+                exit_code: -1,
+                truncated: false,
+            },
+            fleet_protocol::TaskResultStatus::Failed,
+            error.to_string(),
+        ),
+    }
 }
 
 fn run_signed_drift_check_task_queue(
@@ -3714,10 +4521,19 @@ fn run_signed_drift_check_task_queue(
                     data: format!("invalid drift policy: {error}"),
                 },
             )?;
-            send_agent_task_result_queue(outbound_sender, config, correlation_id, envelope, -1)?;
+            send_agent_task_result_queue(
+                outbound_sender,
+                config,
+                correlation_id,
+                envelope,
+                -1,
+                fleet_protocol::TaskResultStatus::Failed,
+                &error.to_string(),
+            )?;
             return Ok(());
         }
     };
+    send_agent_task_started_queue(outbound_sender, config, correlation_id, envelope)?;
     let report = fleet_runner::evaluate_policy_drift(&policy, &fleet_runner::LocalDriftProbe);
     enqueue_wire_message(
         outbound_sender,
@@ -3734,7 +4550,15 @@ fn run_signed_drift_check_task_queue(
             },
         ),
     )?;
-    send_agent_task_result_queue(outbound_sender, config, correlation_id, envelope, 0)?;
+    send_agent_task_result_queue(
+        outbound_sender,
+        config,
+        correlation_id,
+        envelope,
+        0,
+        fleet_protocol::TaskResultStatus::Succeeded,
+        "",
+    )?;
     Ok(())
 }
 
@@ -3759,24 +4583,43 @@ fn run_signed_runbook_task_queue(
                     data: format!("invalid runbook: {error}"),
                 },
             )?;
-            send_agent_task_result_queue(outbound_sender, config, correlation_id, envelope, -1)?;
+            send_agent_task_result_queue(
+                outbound_sender,
+                config,
+                correlation_id,
+                envelope,
+                -1,
+                fleet_protocol::TaskResultStatus::Failed,
+                &error.to_string(),
+            )?;
             return Ok(());
         }
     };
-    let Some(package_manager) = fleet_runner::detect_local_linux_package_manager() else {
-        send_agent_output_chunk_queue(
-            outbound_sender,
-            config,
-            correlation_id,
-            envelope,
-            fleet_runner::CommandOutputChunk {
-                stream: fleet_runner::CommandOutputStream::Stderr,
-                sequence: 0,
-                data: "no supported Linux package manager detected".to_owned(),
-            },
-        )?;
-        send_agent_task_result_queue(outbound_sender, config, correlation_id, envelope, -1)?;
-        return Ok(());
+    let package_manager = match local_runbook_package_manager(&runbook) {
+        Ok(package_manager) => package_manager,
+        Err(error) => {
+            send_agent_output_chunk_queue(
+                outbound_sender,
+                config,
+                correlation_id,
+                envelope,
+                fleet_runner::CommandOutputChunk {
+                    stream: fleet_runner::CommandOutputStream::Stderr,
+                    sequence: 0,
+                    data: error.to_owned(),
+                },
+            )?;
+            send_agent_task_result_queue(
+                outbound_sender,
+                config,
+                correlation_id,
+                envelope,
+                -1,
+                fleet_protocol::TaskResultStatus::Failed,
+                error,
+            )?;
+            return Ok(());
+        }
     };
     let plan = match fleet_runner::build_runbook_execution_plan(&runbook, package_manager) {
         Ok(plan) => plan,
@@ -3792,17 +4635,33 @@ fn run_signed_runbook_task_queue(
                     data: format!("invalid runbook primitive: {error}"),
                 },
             )?;
-            send_agent_task_result_queue(outbound_sender, config, correlation_id, envelope, -1)?;
+            send_agent_task_result_queue(
+                outbound_sender,
+                config,
+                correlation_id,
+                envelope,
+                -1,
+                fleet_protocol::TaskResultStatus::Failed,
+                &error.to_string(),
+            )?;
             return Ok(());
         }
     };
-    let report = match fleet_runner::execute_runbook_execution_plan(
+    send_agent_task_started_queue(outbound_sender, config, correlation_id, envelope)?;
+    let report = match fleet_runner::execute_runbook_execution_plan_with_hooks(
         &plan,
         fleet_runner::RunbookExecutionOptions {
             confirmed_high_risk: task.confirmed_high_risk,
+            check_mode: runbook.check_mode,
+            dry_run: runbook.dry_run,
             command_timeout: Duration::from_millis(task.timeout_ms),
             ..fleet_runner::RunbookExecutionOptions::default()
         },
+        runbook_command_runner,
+        fleet_runner::copy_file_atomic,
+        fleet_runner::check_tcp_port,
+        fleet_runner::check_local_process,
+        collect_runbook_snapshot,
     ) {
         Ok(report) => report,
         Err(error) => {
@@ -3817,7 +4676,15 @@ fn run_signed_runbook_task_queue(
                     data: error.to_string(),
                 },
             )?;
-            send_agent_task_result_queue(outbound_sender, config, correlation_id, envelope, -1)?;
+            send_agent_task_result_queue(
+                outbound_sender,
+                config,
+                correlation_id,
+                envelope,
+                -1,
+                fleet_protocol::TaskResultStatus::Failed,
+                &error.to_string(),
+            )?;
             return Ok(());
         }
     };
@@ -3867,7 +4734,15 @@ fn run_signed_runbook_task_queue(
             sequence += 1;
         }
     }
-    send_agent_task_result_queue(outbound_sender, config, correlation_id, envelope, 0)?;
+    send_agent_task_result_queue(
+        outbound_sender,
+        config,
+        correlation_id,
+        envelope,
+        0,
+        fleet_protocol::TaskResultStatus::Succeeded,
+        "",
+    )?;
     Ok(())
 }
 
@@ -3884,20 +4759,18 @@ fn run_signed_command_task(
         Duration::from_millis(command.timeout_ms),
     );
     spec.max_output_bytes = command.max_output_bytes;
+    send_agent_task_started(socket, config, correlation_id, envelope)?;
     let mut streamed_any = false;
-    let output = match fleet_runner::run_command_streaming(spec, |chunk| {
-        streamed_any = true;
-        send_agent_output_chunk(socket, config, correlation_id, envelope, chunk)
-            .map_err(|error| fleet_runner::RunnerError::Stream(error.to_string()))
-    }) {
-        Ok(output) => output,
-        Err(error) => fleet_runner::CommandOutput {
-            stdout: String::new(),
-            stderr: error.to_string(),
-            exit_code: -1,
-            truncated: false,
+    let result = fleet_runner::run_command_streaming_with_cancel(
+        spec,
+        || false,
+        |chunk| {
+            streamed_any = true;
+            send_agent_output_chunk(socket, config, correlation_id, envelope, chunk)
+                .map_err(|error| fleet_runner::RunnerError::Stream(error.to_string()))
         },
-    };
+    );
+    let (output, result_status, reason) = command_execution_result(result);
     if !streamed_any && output.exit_code != 0 && !output.stderr.is_empty() {
         send_agent_output_chunk(
             socket,
@@ -3911,7 +4784,15 @@ fn run_signed_command_task(
             },
         )?;
     }
-    send_agent_task_result(socket, config, correlation_id, envelope, output.exit_code)?;
+    send_agent_task_result(
+        socket,
+        config,
+        correlation_id,
+        envelope,
+        output.exit_code,
+        result_status,
+        &reason,
+    )?;
     Ok(())
 }
 
@@ -3936,10 +4817,19 @@ fn run_signed_drift_check_task(
                     data: format!("invalid drift policy: {error}"),
                 },
             )?;
-            send_agent_task_result(socket, config, correlation_id, envelope, -1)?;
+            send_agent_task_result(
+                socket,
+                config,
+                correlation_id,
+                envelope,
+                -1,
+                fleet_protocol::TaskResultStatus::Failed,
+                &error.to_string(),
+            )?;
             return Ok(());
         }
     };
+    send_agent_task_started(socket, config, correlation_id, envelope)?;
     let report = fleet_runner::evaluate_policy_drift(&policy, &fleet_runner::LocalDriftProbe);
     let message = fleet_protocol::WireMessage::new(
         prefixed_ulid("msg")?,
@@ -3959,8 +4849,62 @@ fn run_signed_drift_check_task(
                 .map_err(|error| CliError::Http(error.to_string()))?,
         ))
         .map_err(|error| CliError::Http(error.to_string()))?;
-    send_agent_task_result(socket, config, correlation_id, envelope, 0)?;
+    send_agent_task_result(
+        socket,
+        config,
+        correlation_id,
+        envelope,
+        0,
+        fleet_protocol::TaskResultStatus::Succeeded,
+        "",
+    )?;
     Ok(())
+}
+
+fn local_runbook_package_manager(
+    runbook: &fleet_domain::Runbook,
+) -> Result<fleet_runner::LinuxPackageManager, &'static str> {
+    if runbook
+        .tasks
+        .iter()
+        .any(|task| matches!(task, fleet_domain::RunbookTask::Package(_)))
+    {
+        fleet_runner::detect_local_linux_package_manager()
+            .ok_or("no supported Linux package manager detected")
+    } else {
+        Ok(fleet_runner::LinuxPackageManager::Apt)
+    }
+}
+
+fn runbook_command_runner(
+    command: &fleet_runner::PrimitiveCommand,
+    spec: &fleet_runner::CommandSpec,
+) -> Result<fleet_runner::CommandOutput, fleet_runner::RunnerError> {
+    let mut spec = spec.clone();
+    spec.program = command.program.clone();
+    spec.args = command.args.clone();
+    fleet_runner::run_command_with_spec(spec)
+}
+
+fn collect_runbook_snapshot(
+    spec: &fleet_runner::SnapshotSpec,
+) -> Result<fleet_runner::SnapshotResult, fleet_runner::PrimitiveError> {
+    let (message, mut body) = match spec.kind {
+        fleet_runner::SnapshotKind::Facts => ("facts snapshot collected", collect_local_facts()),
+        fleet_runner::SnapshotKind::Metrics => {
+            ("metrics snapshot collected", collect_local_metrics())
+        }
+    };
+    if let Some(object) = body.as_object_mut() {
+        object.insert(
+            "source".to_owned(),
+            serde_json::Value::String("runbook".to_owned()),
+        );
+    }
+    Ok(fleet_runner::SnapshotResult {
+        message: message.to_owned(),
+        body: body.to_string(),
+    })
 }
 
 fn run_signed_runbook_task(
@@ -3984,24 +4928,43 @@ fn run_signed_runbook_task(
                     data: format!("invalid runbook: {error}"),
                 },
             )?;
-            send_agent_task_result(socket, config, correlation_id, envelope, -1)?;
+            send_agent_task_result(
+                socket,
+                config,
+                correlation_id,
+                envelope,
+                -1,
+                fleet_protocol::TaskResultStatus::Failed,
+                &error.to_string(),
+            )?;
             return Ok(());
         }
     };
-    let Some(package_manager) = fleet_runner::detect_local_linux_package_manager() else {
-        send_agent_output_chunk(
-            socket,
-            config,
-            correlation_id,
-            envelope,
-            fleet_runner::CommandOutputChunk {
-                stream: fleet_runner::CommandOutputStream::Stderr,
-                sequence: 0,
-                data: "no supported Linux package manager detected".to_owned(),
-            },
-        )?;
-        send_agent_task_result(socket, config, correlation_id, envelope, -1)?;
-        return Ok(());
+    let package_manager = match local_runbook_package_manager(&runbook) {
+        Ok(package_manager) => package_manager,
+        Err(error) => {
+            send_agent_output_chunk(
+                socket,
+                config,
+                correlation_id,
+                envelope,
+                fleet_runner::CommandOutputChunk {
+                    stream: fleet_runner::CommandOutputStream::Stderr,
+                    sequence: 0,
+                    data: error.to_owned(),
+                },
+            )?;
+            send_agent_task_result(
+                socket,
+                config,
+                correlation_id,
+                envelope,
+                -1,
+                fleet_protocol::TaskResultStatus::Failed,
+                error,
+            )?;
+            return Ok(());
+        }
     };
     let plan = match fleet_runner::build_runbook_execution_plan(&runbook, package_manager) {
         Ok(plan) => plan,
@@ -4017,17 +4980,33 @@ fn run_signed_runbook_task(
                     data: format!("invalid runbook primitive: {error}"),
                 },
             )?;
-            send_agent_task_result(socket, config, correlation_id, envelope, -1)?;
+            send_agent_task_result(
+                socket,
+                config,
+                correlation_id,
+                envelope,
+                -1,
+                fleet_protocol::TaskResultStatus::Failed,
+                &error.to_string(),
+            )?;
             return Ok(());
         }
     };
-    let report = match fleet_runner::execute_runbook_execution_plan(
+    send_agent_task_started(socket, config, correlation_id, envelope)?;
+    let report = match fleet_runner::execute_runbook_execution_plan_with_hooks(
         &plan,
         fleet_runner::RunbookExecutionOptions {
             confirmed_high_risk: task.confirmed_high_risk,
+            check_mode: runbook.check_mode,
+            dry_run: runbook.dry_run,
             command_timeout: Duration::from_millis(task.timeout_ms),
             ..fleet_runner::RunbookExecutionOptions::default()
         },
+        runbook_command_runner,
+        fleet_runner::copy_file_atomic,
+        fleet_runner::check_tcp_port,
+        fleet_runner::check_local_process,
+        collect_runbook_snapshot,
     ) {
         Ok(report) => report,
         Err(error) => {
@@ -4042,7 +5021,15 @@ fn run_signed_runbook_task(
                     data: error.to_string(),
                 },
             )?;
-            send_agent_task_result(socket, config, correlation_id, envelope, -1)?;
+            send_agent_task_result(
+                socket,
+                config,
+                correlation_id,
+                envelope,
+                -1,
+                fleet_protocol::TaskResultStatus::Failed,
+                &error.to_string(),
+            )?;
             return Ok(());
         }
     };
@@ -4093,8 +5080,194 @@ fn run_signed_runbook_task(
             sequence += 1;
         }
     }
-    send_agent_task_result(socket, config, correlation_id, envelope, 0)?;
+    send_agent_task_result(
+        socket,
+        config,
+        correlation_id,
+        envelope,
+        0,
+        fleet_protocol::TaskResultStatus::Succeeded,
+        "",
+    )?;
     Ok(())
+}
+
+fn send_agent_task_ack(
+    socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
+    config: &LocalAgentConfig,
+    correlation_id: &str,
+    envelope: &fleet_domain::TaskEnvelope,
+) -> Result<(), CliError> {
+    send_wire_message_to_socket(
+        socket,
+        &agent_task_ack_message(config, correlation_id, envelope)?,
+    )
+}
+
+fn send_agent_task_ack_queue(
+    outbound_sender: &AgentOutboundSender,
+    config: &LocalAgentConfig,
+    correlation_id: &str,
+    envelope: &fleet_domain::TaskEnvelope,
+) -> Result<(), CliError> {
+    enqueue_wire_message(
+        outbound_sender,
+        agent_task_ack_message(config, correlation_id, envelope)?,
+    )
+}
+
+fn send_agent_task_started(
+    socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
+    config: &LocalAgentConfig,
+    correlation_id: &str,
+    envelope: &fleet_domain::TaskEnvelope,
+) -> Result<(), CliError> {
+    send_wire_message_to_socket(
+        socket,
+        &agent_task_started_message(config, correlation_id, envelope)?,
+    )
+}
+
+fn send_agent_task_started_queue(
+    outbound_sender: &AgentOutboundSender,
+    config: &LocalAgentConfig,
+    correlation_id: &str,
+    envelope: &fleet_domain::TaskEnvelope,
+) -> Result<(), CliError> {
+    enqueue_wire_message(
+        outbound_sender,
+        agent_task_started_message(config, correlation_id, envelope)?,
+    )
+}
+
+fn send_agent_task_rejected(
+    socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
+    config: &LocalAgentConfig,
+    correlation_id: &str,
+    envelope: &fleet_domain::TaskEnvelope,
+    reason_code: fleet_protocol::TaskRejectionReasonCode,
+    reason: &str,
+) -> Result<(), CliError> {
+    send_wire_message_to_socket(
+        socket,
+        &agent_task_rejected_message(
+            config,
+            correlation_id,
+            envelope.job_id.as_str(),
+            envelope.task_id.as_str(),
+            reason_code,
+            reason,
+        )?,
+    )
+}
+
+fn send_agent_task_rejected_queue(
+    outbound_sender: &AgentOutboundSender,
+    config: &LocalAgentConfig,
+    correlation_id: &str,
+    envelope: &fleet_domain::TaskEnvelope,
+    reason_code: fleet_protocol::TaskRejectionReasonCode,
+    reason: &str,
+) -> Result<(), CliError> {
+    enqueue_wire_message(
+        outbound_sender,
+        agent_task_rejected_message(
+            config,
+            correlation_id,
+            envelope.job_id.as_str(),
+            envelope.task_id.as_str(),
+            reason_code,
+            reason,
+        )?,
+    )
+}
+
+fn agent_task_ack_message(
+    config: &LocalAgentConfig,
+    correlation_id: &str,
+    envelope: &fleet_domain::TaskEnvelope,
+) -> Result<fleet_protocol::WireMessage, CliError> {
+    Ok(fleet_protocol::WireMessage::new(
+        prefixed_ulid("msg")?,
+        correlation_id.to_owned(),
+        Some(config.agent_id.clone()),
+        epoch_millis() as u64,
+        fleet_protocol::WirePayload::TaskAck {
+            job_id: envelope.job_id.as_str().to_owned(),
+            task_id: envelope.task_id.as_str().to_owned(),
+        },
+    ))
+}
+
+fn agent_task_started_message(
+    config: &LocalAgentConfig,
+    correlation_id: &str,
+    envelope: &fleet_domain::TaskEnvelope,
+) -> Result<fleet_protocol::WireMessage, CliError> {
+    Ok(fleet_protocol::WireMessage::new(
+        prefixed_ulid("msg")?,
+        correlation_id.to_owned(),
+        Some(config.agent_id.clone()),
+        epoch_millis() as u64,
+        fleet_protocol::WirePayload::TaskStarted {
+            job_id: envelope.job_id.as_str().to_owned(),
+            task_id: envelope.task_id.as_str().to_owned(),
+        },
+    ))
+}
+
+fn agent_task_rejected_message(
+    config: &LocalAgentConfig,
+    correlation_id: &str,
+    job_id: &str,
+    task_id: &str,
+    reason_code: fleet_protocol::TaskRejectionReasonCode,
+    reason: &str,
+) -> Result<fleet_protocol::WireMessage, CliError> {
+    Ok(fleet_protocol::WireMessage::new(
+        prefixed_ulid("msg")?,
+        correlation_id.to_owned(),
+        Some(config.agent_id.clone()),
+        epoch_millis() as u64,
+        fleet_protocol::WirePayload::TaskRejected {
+            job_id: job_id.to_owned(),
+            task_id: task_id.to_owned(),
+            reason_code,
+            reason: fleet_core::redact_secret(reason),
+        },
+    ))
+}
+
+fn task_rejection_reason_from_runner_error(
+    error: &fleet_runner::RunnerError,
+) -> fleet_protocol::TaskRejectionReasonCode {
+    match error {
+        fleet_runner::RunnerError::InvalidSignature
+        | fleet_runner::RunnerError::Job(fleet_domain::JobError::UnsignedTask) => {
+            fleet_protocol::TaskRejectionReasonCode::InvalidSignature
+        }
+        fleet_runner::RunnerError::ReplayedNonce => fleet_protocol::TaskRejectionReasonCode::Replay,
+        fleet_runner::RunnerError::Job(fleet_domain::JobError::ExpiredTask) => {
+            fleet_protocol::TaskRejectionReasonCode::Expired
+        }
+        fleet_runner::RunnerError::Job(fleet_domain::JobError::TargetAgentMismatch) => {
+            fleet_protocol::TaskRejectionReasonCode::TargetMismatch
+        }
+        fleet_runner::RunnerError::HighRiskConfirmationRequired(_) => {
+            fleet_protocol::TaskRejectionReasonCode::LocalPolicy
+        }
+        fleet_runner::RunnerError::Primitive(_) => {
+            fleet_protocol::TaskRejectionReasonCode::CapabilityUnsupported
+        }
+        fleet_runner::RunnerError::Job(_) => fleet_protocol::TaskRejectionReasonCode::InvalidTask,
+        fleet_runner::RunnerError::Io(_)
+        | fleet_runner::RunnerError::Timeout
+        | fleet_runner::RunnerError::Canceled
+        | fleet_runner::RunnerError::OutputLimitExceeded
+        | fleet_runner::RunnerError::Stream(_) => {
+            fleet_protocol::TaskRejectionReasonCode::InternalError
+        }
+    }
 }
 
 fn send_agent_task_result(
@@ -4103,6 +5276,8 @@ fn send_agent_task_result(
     correlation_id: &str,
     envelope: &fleet_domain::TaskEnvelope,
     exit_code: i32,
+    status: fleet_protocol::TaskResultStatus,
+    reason: &str,
 ) -> Result<(), CliError> {
     let result = fleet_protocol::WireMessage::new(
         prefixed_ulid("msg")?,
@@ -4113,6 +5288,8 @@ fn send_agent_task_result(
             job_id: envelope.job_id.as_str().to_owned(),
             task_id: envelope.task_id.as_str().to_owned(),
             exit_code,
+            status: Some(status),
+            reason: reason.to_owned(),
         },
     );
     socket
@@ -4130,6 +5307,8 @@ fn send_agent_task_result_queue(
     correlation_id: &str,
     envelope: &fleet_domain::TaskEnvelope,
     exit_code: i32,
+    status: fleet_protocol::TaskResultStatus,
+    reason: &str,
 ) -> Result<(), CliError> {
     enqueue_wire_message(
         outbound_sender,
@@ -4142,6 +5321,8 @@ fn send_agent_task_result_queue(
                 job_id: envelope.job_id.as_str().to_owned(),
                 task_id: envelope.task_id.as_str().to_owned(),
                 exit_code,
+                status: Some(status),
+                reason: reason.to_owned(),
             },
         ),
     )
@@ -4200,33 +5381,7 @@ fn send_agent_output_chunk_queue(
     )
 }
 
-fn send_agent_security_event(
-    socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
-    config: &LocalAgentConfig,
-    correlation_id: &str,
-    action: &str,
-    detail: &str,
-) -> Result<(), CliError> {
-    let message = fleet_protocol::WireMessage::new(
-        prefixed_ulid("msg")?,
-        correlation_id.to_owned(),
-        Some(config.agent_id.clone()),
-        epoch_millis() as u64,
-        fleet_protocol::WirePayload::SecurityEvent {
-            agent_id: config.agent_id.clone(),
-            action: action.to_owned(),
-            detail: detail.to_owned(),
-        },
-    );
-    socket
-        .send(Message::Text(
-            fleet_protocol::encode_message(&message)
-                .map_err(|error| CliError::Http(error.to_string()))?,
-        ))
-        .map_err(|error| CliError::Http(error.to_string()))?;
-    Ok(())
-}
-
+#[cfg(test)]
 fn send_agent_security_event_queue(
     outbound_sender: &AgentOutboundSender,
     config: &LocalAgentConfig,
@@ -4396,6 +5551,57 @@ mod tests {
             parse_sqlite_database_url(db.as_deref().unwrap()).unwrap(),
             PathBuf::from("/tmp/sponzey-fleet.db")
         );
+    }
+
+    #[test]
+    fn parses_controller_backup_and_restore_commands() {
+        let backup = Cli::try_parse_from([
+            "sponzey",
+            "controller",
+            "backup",
+            "--data-dir",
+            "/tmp/fleet",
+            "--output",
+            "/tmp/fleet.backup.json",
+        ])
+        .expect("valid backup command");
+        let Command::Controller(ControllerCommand {
+            command: ControllerSubcommand::Backup { data_dir, output },
+        }) = backup.command
+        else {
+            panic!("expected controller backup command");
+        };
+        assert_eq!(data_dir, PathBuf::from("/tmp/fleet"));
+        assert_eq!(output, PathBuf::from("/tmp/fleet.backup.json"));
+
+        let restore = Cli::try_parse_from([
+            "sponzey",
+            "controller",
+            "restore",
+            "--data-dir",
+            "/tmp/fleet-restored",
+            "--input",
+            "/tmp/fleet.backup.json",
+            "--dry-run",
+            "--force",
+        ])
+        .expect("valid restore command");
+        let Command::Controller(ControllerCommand {
+            command:
+                ControllerSubcommand::Restore {
+                    data_dir,
+                    input,
+                    dry_run,
+                    force,
+                },
+        }) = restore.command
+        else {
+            panic!("expected controller restore command");
+        };
+        assert_eq!(data_dir, PathBuf::from("/tmp/fleet-restored"));
+        assert_eq!(input, PathBuf::from("/tmp/fleet.backup.json"));
+        assert!(dry_run);
+        assert!(force);
     }
 
     #[test]
@@ -4655,6 +5861,32 @@ mod tests {
     }
 
     #[test]
+    fn service_status_and_logs_dry_run_render_commands() {
+        let status =
+            Cli::try_parse_from(["sponzey", "controller", "status-service", "--dry-run"]).unwrap();
+        let logs = Cli::try_parse_from([
+            "sponzey",
+            "agent",
+            "logs-service",
+            "--lines",
+            "25",
+            "--dry-run",
+        ])
+        .unwrap();
+
+        assert!(execute(status).is_ok());
+        assert!(execute(logs).is_ok());
+        assert_eq!(
+            render_service_status_command(ServiceRole::Controller),
+            "systemctl status sponzey-fleet-controller.service --no-pager"
+        );
+        assert_eq!(
+            render_service_logs_command(ServiceRole::Agent, 25),
+            "journalctl -u sponzey-fleet-agent.service --no-pager -n 25"
+        );
+    }
+
+    #[test]
     fn agent_uninstall_service_dry_run_renders_safe_commands() {
         let cli =
             Cli::try_parse_from(["sponzey", "agent", "uninstall-service", "--dry-run"]).unwrap();
@@ -4688,6 +5920,34 @@ mod tests {
             CliError::ServiceOperationRequiresRoot.to_string(),
             "systemd service operations require root; rerun with sudo"
         );
+    }
+
+    #[test]
+    fn parses_upgrade_dry_run_and_rejects_automatic_upgrade() {
+        let cli = Cli::try_parse_from([
+            "sponzey",
+            "upgrade",
+            "--channel",
+            "beta",
+            "--version",
+            "0.2.0-beta.1",
+            "--dry-run",
+        ])
+        .expect("valid upgrade dry-run command");
+        let Command::Upgrade(UpgradeCommand {
+            channel,
+            version,
+            dry_run,
+        }) = cli.command
+        else {
+            panic!("expected upgrade command");
+        };
+        assert_eq!(channel, UpgradeChannelArg::Beta);
+        assert_eq!(version.as_deref(), Some("0.2.0-beta.1"));
+        assert!(dry_run);
+
+        let cli = Cli::try_parse_from(["sponzey", "upgrade"]).expect("valid upgrade command");
+        assert!(matches!(execute(cli), Err(CliError::UpgradeRequiresDryRun)));
     }
 
     #[test]
@@ -4864,6 +6124,156 @@ mod tests {
     }
 
     #[test]
+    fn controller_backup_creates_archive_with_metadata() {
+        let data_dir = initialized_controller_backup_fixture("backup-metadata");
+        let output = unique_test_dir("backup-output").join("controller-backup.json");
+
+        execute_controller_backup(&data_dir, &output).unwrap();
+
+        let archive = read_backup_archive(&output).unwrap();
+        validate_backup_archive(&archive).unwrap();
+        assert_eq!(archive.format, CONTROLLER_BACKUP_FORMAT);
+        assert_eq!(archive.format_version, CONTROLLER_BACKUP_FORMAT_VERSION);
+        assert_eq!(archive.schema_version, fleet_store::CURRENT_SCHEMA_VERSION);
+        assert_eq!(archive.sqlite_integrity_check, "ok");
+        assert_eq!(archive.source_data_dir, data_dir.display().to_string());
+        assert!(archive.created_at_ms > 0);
+        assert!(
+            archive
+                .files
+                .iter()
+                .any(|file| file.path == "controller/fleet.db")
+        );
+        assert!(
+            archive
+                .files
+                .iter()
+                .any(|file| file.path == "controller/controller_private.key")
+        );
+
+        let _ = fs::remove_dir_all(data_dir);
+        let _ = fs::remove_file(output);
+    }
+
+    #[test]
+    fn controller_restore_dry_run_does_not_write() {
+        let data_dir = initialized_controller_backup_fixture("restore-dry-run-source");
+        let output = unique_test_dir("restore-dry-run-output").join("controller-backup.json");
+        let restore_dir = unique_test_dir("restore-dry-run-target");
+        execute_controller_backup(&data_dir, &output).unwrap();
+
+        execute_controller_restore(&restore_dir, &output, true, false).unwrap();
+
+        assert!(!controller_dir(&restore_dir).exists());
+
+        let _ = fs::remove_dir_all(data_dir);
+        let _ = fs::remove_dir_all(restore_dir);
+        let _ = fs::remove_file(output);
+    }
+
+    #[test]
+    fn controller_backup_restore_roundtrip_restores_database_and_keys() {
+        let data_dir = initialized_controller_backup_fixture("restore-roundtrip-source");
+        let output = unique_test_dir("restore-roundtrip-output").join("controller-backup.json");
+        let restore_dir = unique_test_dir("restore-roundtrip-target");
+        execute_controller_backup(&data_dir, &output).unwrap();
+
+        execute_controller_restore(&restore_dir, &output, false, false).unwrap();
+
+        let restored_store =
+            fleet_store::SqliteStore::open(controller_db_path(&restore_dir)).unwrap();
+        assert!(
+            restored_store
+                .verify_admin_token_hash("backup-admin-hash")
+                .unwrap()
+        );
+        assert!(
+            controller_dir(&restore_dir)
+                .join("controller_private.key")
+                .is_file()
+        );
+        assert!(
+            controller_dir(&restore_dir)
+                .join("controller_public.key")
+                .is_file()
+        );
+
+        let _ = fs::remove_dir_all(data_dir);
+        let _ = fs::remove_dir_all(restore_dir);
+        let _ = fs::remove_file(output);
+    }
+
+    #[test]
+    fn controller_restore_refuses_overwrite_without_force() {
+        let data_dir = initialized_controller_backup_fixture("restore-overwrite-source");
+        let output = unique_test_dir("restore-overwrite-output").join("controller-backup.json");
+        let restore_dir = initialized_controller_backup_fixture("restore-overwrite-target");
+        execute_controller_backup(&data_dir, &output).unwrap();
+
+        let result = execute_controller_restore(&restore_dir, &output, false, false);
+
+        assert!(
+            matches!(result, Err(CliError::Http(message)) if message.contains("refusing to overwrite"))
+        );
+
+        let _ = fs::remove_dir_all(data_dir);
+        let _ = fs::remove_dir_all(restore_dir);
+        let _ = fs::remove_file(output);
+    }
+
+    #[test]
+    fn controller_restore_refuses_incompatible_schema_version() {
+        let data_dir = initialized_controller_backup_fixture("restore-schema-source");
+        let output = unique_test_dir("restore-schema-output").join("controller-backup.json");
+        let restore_dir = unique_test_dir("restore-schema-target");
+        execute_controller_backup(&data_dir, &output).unwrap();
+        let mut archive = read_backup_archive(&output).unwrap();
+        archive.schema_version = fleet_store::CURRENT_SCHEMA_VERSION + 1;
+        write_backup_archive(&output, &archive).unwrap();
+
+        let result = execute_controller_restore(&restore_dir, &output, true, false);
+
+        assert!(
+            matches!(result, Err(CliError::Http(message)) if message.contains("newer than this binary supports"))
+        );
+
+        let _ = fs::remove_dir_all(data_dir);
+        let _ = fs::remove_dir_all(restore_dir);
+        let _ = fs::remove_file(output);
+    }
+
+    #[test]
+    fn controller_restore_rejects_corrupted_sqlite_archive() {
+        let data_dir = initialized_controller_backup_fixture("restore-corrupt-source");
+        let output = unique_test_dir("restore-corrupt-output").join("controller-backup.json");
+        let restore_dir = unique_test_dir("restore-corrupt-target");
+        execute_controller_backup(&data_dir, &output).unwrap();
+        let mut archive = read_backup_archive(&output).unwrap();
+        let corrupt = b"not a sqlite database";
+        let db = archive
+            .files
+            .iter_mut()
+            .find(|file| file.path == "controller/fleet.db")
+            .expect("backup must include db");
+        db.content_hex = hex_encode(corrupt);
+        db.size_bytes = corrupt.len() as u64;
+        db.sha256 = sha256_hex(corrupt);
+        write_backup_archive(&output, &archive).unwrap();
+
+        let result = execute_controller_restore(&restore_dir, &output, false, false);
+
+        assert!(matches!(
+            result,
+            Err(CliError::Store(_)) | Err(CliError::Http(_))
+        ));
+        assert!(!controller_dir(&restore_dir).exists());
+
+        let _ = fs::remove_dir_all(data_dir);
+        let _ = fs::remove_dir_all(restore_dir);
+        let _ = fs::remove_file(output);
+    }
+
+    #[test]
     fn parses_demo_command() {
         let cli = Cli::try_parse_from(["sponzey", "demo", "--keep-temp", "--port", "17700"])
             .expect("valid command");
@@ -4973,10 +6383,18 @@ server:/export /mnt/nfs nfs4 rw,vers=4.2 0 0
         fs::write(dir.join("sda").join("size"), "2097152\n").unwrap();
         fs::write(dir.join("sda").join("removable"), "0\n").unwrap();
         fs::write(dir.join("sda").join("queue").join("rotational"), "1\n").unwrap();
+        fs::create_dir_all(dir.join("sda").join("sda1")).unwrap();
+        fs::write(dir.join("sda").join("sda1").join("size"), "1048576\n").unwrap();
         fs::create_dir_all(dir.join("nvme0n1").join("queue")).unwrap();
         fs::write(dir.join("nvme0n1").join("size"), "4194304\n").unwrap();
         fs::write(dir.join("nvme0n1").join("removable"), "0\n").unwrap();
         fs::write(dir.join("nvme0n1").join("queue").join("rotational"), "0\n").unwrap();
+        fs::create_dir_all(dir.join("nvme0n1").join("nvme0n1p1")).unwrap();
+        fs::write(
+            dir.join("nvme0n1").join("nvme0n1p1").join("size"),
+            "2097152\n",
+        )
+        .unwrap();
         fs::create_dir_all(dir.join("loop0")).unwrap();
 
         let devices = collect_linux_block_devices(&dir).unwrap();
@@ -4990,6 +6408,10 @@ server:/export /mnt/nfs nfs4 rw,vers=4.2 0 0
                     size_kb: Some(2_097_152),
                     removable: Some(false),
                     rotational: Some(false),
+                    partitions: vec![BlockPartitionFact {
+                        name: "nvme0n1p1".to_owned(),
+                        size_kb: Some(1_048_576),
+                    }],
                 },
                 BlockDeviceFact {
                     name: "sda".to_owned(),
@@ -4997,6 +6419,10 @@ server:/export /mnt/nfs nfs4 rw,vers=4.2 0 0
                     size_kb: Some(1_048_576),
                     removable: Some(false),
                     rotational: Some(true),
+                    partitions: vec![BlockPartitionFact {
+                        name: "sda1".to_owned(),
+                        size_kb: Some(524_288),
+                    }],
                 },
             ]
         );
@@ -5180,6 +6606,48 @@ postgresql.service loaded failed failed PostgreSQL database server
         let body = metrics.to_string();
         assert!(!body.contains("token="));
         assert!(!body.contains("secret="));
+    }
+
+    #[test]
+    fn safe_only_runbook_does_not_require_package_manager() {
+        let runbook = fleet_domain::parse_runbook_document(
+            r#"
+apiVersion: fleet.sponzey.dev/v1alpha1
+kind: Runbook
+name: safe-only
+selector: role=web
+steps:
+  - id: http
+    port.check:
+      host: 127.0.0.1
+      port: 7700
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            local_runbook_package_manager(&runbook),
+            Ok(fleet_runner::LinuxPackageManager::Apt)
+        );
+    }
+
+    #[test]
+    fn runbook_snapshot_uses_agent_collectors_with_runbook_source() {
+        let facts = collect_runbook_snapshot(&fleet_runner::SnapshotSpec {
+            kind: fleet_runner::SnapshotKind::Facts,
+        })
+        .unwrap();
+        let metrics = collect_runbook_snapshot(&fleet_runner::SnapshotSpec {
+            kind: fleet_runner::SnapshotKind::Metrics,
+        })
+        .unwrap();
+        let facts_body: serde_json::Value = serde_json::from_str(&facts.body).unwrap();
+        let metrics_body: serde_json::Value = serde_json::from_str(&metrics.body).unwrap();
+
+        assert_eq!(facts_body["source"], "runbook");
+        assert_eq!(metrics_body["source"], "runbook");
+        assert!(facts_body.get("os").is_some());
+        assert!(metrics_body.get("cpu").is_some());
     }
 
     #[test]
@@ -6073,8 +7541,11 @@ postgresql.service loaded failed failed PostgreSQL database server
     fn agent_session_busy_task_rejects_new_assignment() {
         let (sender, receiver) = mpsc::sync_channel(4);
         let config = test_agent_config();
-        let task_busy = Arc::new(AtomicBool::new(true));
-        let replay_guard = Arc::new(Mutex::new(fleet_runner::NonceReplayGuard::default()));
+        let task_state = AgentTaskSessionState {
+            busy: Arc::new(AtomicBool::new(true)),
+            runtime: Arc::new(AgentTaskRuntimeState::default()),
+            replay_guard: Arc::new(Mutex::new(fleet_runner::NonceReplayGuard::default())),
+        };
 
         handle_agent_session_message(
             test_task_assignment_message(&config.agent_id),
@@ -6082,32 +7553,74 @@ postgresql.service loaded failed failed PostgreSQL database server
             "controller-public-key",
             "corr-test",
             &sender,
-            &task_busy,
-            &replay_guard,
+            &task_state,
         )
         .unwrap();
 
         let event = receiver.try_recv().expect("busy reject event");
-        let fleet_protocol::WirePayload::SecurityEvent {
-            agent_id,
-            action,
-            detail,
+        let fleet_protocol::WirePayload::TaskRejected {
+            job_id,
+            task_id,
+            reason_code,
+            reason,
         } = event.payload
         else {
-            panic!("expected security event");
+            panic!("expected task rejected event");
         };
-        assert_eq!(agent_id, config.agent_id);
-        assert_eq!(action, "task_rejected");
-        assert_eq!(detail, "agent is busy");
-        assert!(task_busy.load(Ordering::SeqCst));
+        assert_eq!(job_id, "job-test");
+        assert_eq!(task_id, "task-test");
+        assert_eq!(
+            reason_code,
+            fleet_protocol::TaskRejectionReasonCode::AgentBusy
+        );
+        assert_eq!(reason, "agent is busy");
+        assert!(task_state.busy.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn agent_task_runtime_cancel_only_matches_current_task() {
+        let runtime = AgentTaskRuntimeState::default();
+
+        runtime.start_task("task-current").unwrap();
+
+        assert!(!runtime.request_cancel("task-other").unwrap());
+        assert!(!runtime.should_cancel("task-current"));
+        assert!(runtime.request_cancel("task-current").unwrap());
+        assert!(runtime.should_cancel("task-current"));
+        assert!(!runtime.should_cancel("task-other"));
+
+        runtime.finish_task("task-current");
+
+        assert!(!runtime.should_cancel("task-current"));
+    }
+
+    #[test]
+    fn command_execution_result_maps_cancel_timeout_and_failure() {
+        let (_, canceled_status, _) =
+            command_execution_result(Err(fleet_runner::RunnerError::Canceled));
+        let (_, timeout_status, _) =
+            command_execution_result(Err(fleet_runner::RunnerError::Timeout));
+        let (_, failed_status, _) = command_execution_result(Ok(fleet_runner::CommandOutput {
+            stdout: String::new(),
+            stderr: "failed".to_owned(),
+            exit_code: 2,
+            truncated: false,
+        }));
+
+        assert_eq!(canceled_status, fleet_protocol::TaskResultStatus::Canceled);
+        assert_eq!(timeout_status, fleet_protocol::TaskResultStatus::TimedOut);
+        assert_eq!(failed_status, fleet_protocol::TaskResultStatus::Failed);
     }
 
     #[test]
     fn agent_session_due_telemetry_does_not_precede_inbound_task_handling() {
         let (sender, receiver) = mpsc::sync_channel(8);
         let config = test_agent_config();
-        let task_busy = Arc::new(AtomicBool::new(true));
-        let replay_guard = Arc::new(Mutex::new(fleet_runner::NonceReplayGuard::default()));
+        let task_state = AgentTaskSessionState {
+            busy: Arc::new(AtomicBool::new(true)),
+            runtime: Arc::new(AgentTaskRuntimeState::default()),
+            replay_guard: Arc::new(Mutex::new(fleet_runner::NonceReplayGuard::default())),
+        };
 
         handle_agent_session_message(
             test_task_assignment_message(&config.agent_id),
@@ -6115,8 +7628,7 @@ postgresql.service loaded failed failed PostgreSQL database server
             "controller-public-key",
             "corr-test",
             &sender,
-            &task_busy,
-            &replay_guard,
+            &task_state,
         )
         .unwrap();
         enqueue_agent_session_tick_messages(
@@ -6134,7 +7646,10 @@ postgresql.service loaded failed failed PostgreSQL database server
 
         assert!(matches!(
             receiver.try_recv().unwrap().payload,
-            fleet_protocol::WirePayload::SecurityEvent { ref action, .. } if action == "task_rejected"
+            fleet_protocol::WirePayload::TaskRejected {
+                reason_code: fleet_protocol::TaskRejectionReasonCode::AgentBusy,
+                ..
+            }
         ));
         assert!(matches!(
             receiver.try_recv().unwrap().payload,
@@ -6173,7 +7688,16 @@ postgresql.service loaded failed failed PostgreSQL database server
             },
         )
         .unwrap();
-        send_agent_task_result_queue(&sender, &config, "corr-test", &envelope, 0).unwrap();
+        send_agent_task_result_queue(
+            &sender,
+            &config,
+            "corr-test",
+            &envelope,
+            0,
+            fleet_protocol::TaskResultStatus::Succeeded,
+            "",
+        )
+        .unwrap();
         send_agent_security_event_queue(&sender, &config, "corr-test", "task_checked", "ok")
             .unwrap();
 
@@ -6320,6 +7844,16 @@ postgresql.service loaded failed failed PostgreSQL database server
             std::process::id(),
             epoch_millis()
         ))
+    }
+
+    fn initialized_controller_backup_fixture(name: &str) -> PathBuf {
+        let data_dir = unique_test_dir(name);
+        fs::create_dir_all(controller_dir(&data_dir)).unwrap();
+        fs::create_dir_all(agent_dir(&data_dir)).unwrap();
+        let store = fleet_store::SqliteStore::open(controller_db_path(&data_dir)).unwrap();
+        store.insert_admin_token_hash("backup-admin-hash").unwrap();
+        ensure_controller_identity(&data_dir).unwrap();
+        data_dir
     }
 
     fn test_agent_config() -> LocalAgentConfig {

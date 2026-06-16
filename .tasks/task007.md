@@ -1,93 +1,82 @@
-# Task 007 - Job 상태와 Output UX 정밀화
+# Task 007: Fanout Concurrency, MaxFailures, Partial Success
 
-상태: `[ ] 대기` `[ ] 진행 중` `[x] 완료`
+상태: Completed
+우선순위: P0
+연결 계획: `.tasks/plan.md` Phase 006
+의존성: Task 006
+결과물: 여러 agent 대상 실행 모델
 
 ## 목표
 
-운영자가 job이 어디서 멈췄는지 Web Admin에서 알 수 있게 한다.
+하나의 job을 여러 agent에 안전하게 분배한다. target snapshot을 기준으로 assignment를 만들고, concurrency와 maxFailures를 지키며, 전체 결과를 success/failed/partial_success로 계산한다.
 
-persistent session이 도입되면 단순히 "No job output"만으로는 충분하지 않다. job created, queued, delivered, running, completed, rejected, expired를 구분해야 한다.
+## 기능 묶음
 
-## 기능 범위
+1. fanout dispatcher
+2. concurrency/maxFailures 정책
+3. target별 summary와 aggregate result
 
-### 1. Job/detail API 보강
+## 구현 체크리스트
 
-- [x] `/api/jobs` 응답 또는 신규 `/api/jobs/{job_id}` 응답에 dispatch 상태를 포함한다.
-- [x] target agent 상태와 connected 여부를 API로 제공한다.
-- [x] Web Admin이 connected/running 상태를 자체 추측하지 않도록 한다.
+Fanout:
 
-응답 후보:
+- [x] job target snapshot에서 assignment를 생성한다.
+- [x] 각 target agent마다 assignment를 하나씩 만든다.
+- [x] disconnected target 처리 정책을 구현한다.
+- [x] revoked/disabled target 처리 정책을 구현한다.
+- [x] assignment dispatch queue를 만든다.
+- [x] active session이 있으면 즉시 dispatch한다.
+- [x] active session이 없으면 queued 또는 unreachable 정책에 따른다.
 
-```json
-{
-  "id": "job-1",
-  "status": "running",
-  "dispatch_state": "delivered",
-  "target_agent_ids": ["agent-1"],
-  "created_at_ms": 1710000000000,
-  "updated_at_ms": 1710000001000,
-  "expires_at_ms": 1710000060000,
-  "last_error": ""
-}
+Concurrency/MaxFailures:
+
+- [x] job strategy에 concurrency 필드를 추가한다.
+- [x] concurrency 기본값을 정한다.
+- [x] concurrency가 1일 때 순차 실행을 보장한다.
+- [x] concurrency가 N일 때 동시에 N개 이하만 dispatch한다.
+- [x] maxFailures 필드를 추가한다.
+- [x] maxFailures 도달 시 남은 queued assignment를 중단한다.
+- [x] maxFailures 도달 audit/log를 남긴다.
+
+Result Summary:
+
+- [x] target별 assignment summary API를 만든다.
+- [x] job aggregate status 계산을 적용한다.
+- [x] partial_success 계산을 구현한다.
+- [x] skipped/canceled/expired target 수를 summary에 포함한다.
+- [x] Web Admin에서 target별 결과를 표시할 수 있는 response를 만든다.
+
+## 테스트
+
+- [x] fanout creates assignment per target test
+- [x] concurrency one runs sequentially test
+- [x] concurrency N limit test
+- [x] maxFailures stops queued assignments test
+- [x] offline target summary test
+- [x] revoked target summary test
+- [x] all success aggregate success test
+- [x] all failed aggregate failed test
+- [x] mixed result aggregate partial_success test
+- [x] Web Admin API response shape test
+
+## 검증 명령
+
+```bash
+cargo fmt --check
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+git diff --check
 ```
 
-체크:
+## 문서 업데이트
 
-- [x] status와 dispatch_state 의미가 섞이지 않는다.
-- [x] raw command output은 job detail에 넣지 않는다.
-- [x] OpenAPI와 `web-admin/api.schema.json`을 함께 갱신한다.
-
-### 2. Web Admin Run 패널 상태 문구 분리
-
-- [x] job created: `Job created. Checking dispatch state.`
-- [x] queued/offline: `Queued until agent reconnects.`
-- [x] delivered/running: `Running on agent. Waiting for output.`
-- [x] output streaming: chunk count와 sequence를 표시한다.
-- [x] completed without output: `Completed with no output.`
-- [x] rejected/expired/failed: 원인과 다음 조치를 보여준다.
-
-규칙:
-
-- `No job output`은 polling 완료 후에도 실제 chunk가 전혀 없을 때만 표시한다.
-- pending 상태에서 `No job output`을 표시하지 않는다.
-- UI는 domain rule을 재구현하지 않고 API 상태를 표현한다.
-
-### 3. Output polling 개선
-
-- [x] `/api/jobs/{job_id}/output` polling과 job status polling을 함께 수행한다.
-- [x] job이 terminal 상태가 되면 polling을 멈춘다.
-- [x] connected/running 상태인데 output이 없는 경우와 completed no-output을 구분한다.
-
-후속 후보:
-
-- Admin UI용 SSE 또는 WebSocket output subscribe
-- 현재 task에서는 REST polling fallback을 안정화하는 것을 우선한다.
-
-## 테스트와 검증
-
-필수:
-
-- [x] job detail API test
-- [x] job status transition response test
-- [x] Web Admin smoke test
-- [x] output 없는 completed job과 pending job 문구 구분 test
-- [x] rejected/expired 표시 test
-- [x] OpenAPI와 `web-admin/api.schema.json` 정합성 test
-- [x] `npm test --workspace web-admin`
-- [x] `npm run typecheck --workspace web-admin`
-- [x] `npm run build --workspace web-admin`
-- [x] `cargo test -p fleet-controller jobs`
-- [x] `git diff --check`
+- [x] docs/api.md에 fanout job request/response를 문서화한다.
+- [x] runbook strategy 문서에 concurrency/maxFailures를 추가한다.
+- [x] README에 multi-agent 실행은 target preview 후 실행하는 흐름이라고 설명한다.
 
 ## 완료 기준
 
-- [x] 운영자가 queued/offline/running/completed/rejected/expired를 구분할 수 있다.
-- [x] `No job output`이 pending 상태에서 보이지 않는다.
-- [x] Web Admin은 상태를 API에서 받아 표시한다.
-- [x] API 문서와 Swagger가 실제 응답과 일치한다.
-
-## 비범위
-
-- [x] Admin streaming subscribe 구현하지 않음
-- [x] 복잡한 dashboard builder 만들지 않음
-- [x] UI에서 authorization 판단하지 않음
+- [x] target snapshot 기준으로 multi-agent job이 실행된다.
+- [x] concurrency 제한이 테스트로 보장된다.
+- [x] maxFailures 도달 시 남은 assignment가 무작정 실행되지 않는다.
+- [x] partial_success가 API/UI에서 설명 가능하다.

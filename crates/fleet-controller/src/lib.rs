@@ -10,26 +10,36 @@ use axum::{
     routing::get,
 };
 use fleet_application::{
-    AdminTokenRepository, AgentInventoryRepository, CommandJobRepository, CreateCommandJob,
-    CreateCommandJobError, CreateCommandJobInput, CreateDriftCheckJob, CreateDriftCheckJobError,
-    CreateDriftCheckJobInput, CreateEnrollmentToken, CreateEnrollmentTokenInput, CreateRunbookJob,
-    CreateRunbookJobError, CreateRunbookJobInput, DispatchAssignmentRepository,
-    DispatchPendingAssignments, DispatchPendingAssignmentsInput, DispatchPendingAssignmentsOutput,
-    DriftRepository, EnrollmentTokenRepository, EnrollmentTokenUseCaseError, EnsureAdminToken,
+    AdminTokenRepository, AgentInventoryRepository, AgentLogRepository, AuthenticateAdminToken,
+    CommandJobRepository, CreateCommandJob, CreateCommandJobError, CreateCommandJobInput,
+    CreateDriftCheckJob, CreateDriftCheckJobError, CreateDriftCheckJobInput, CreateEnrollmentToken,
+    CreateEnrollmentTokenInput, CreateRunbookJob, CreateRunbookJobError, CreateRunbookJobInput,
+    DispatchAssignmentRepository, DispatchPendingAssignments, DispatchPendingAssignmentsInput,
+    DispatchPendingAssignmentsOutput, DriftRepository, EnrollmentTokenRepository,
+    EnrollmentTokenUseCaseError, EnsureAdminToken, ExpireApprovalRequests, ExpireApprovalsInput,
     FactsRepository, GetInventoryAgent, GetJobSummary, GetLatestDrift, GetLatestFacts,
-    GetLatestMetrics, JobOutputChunk, JobOutputRepository, JobOutputStream, JobQueryRepository,
-    JobRepository, ListAuditEvents, ListDriftReports, ListEnrollmentTokens, ListFactsSnapshots,
+    GetLatestMetrics, JobDispatchGate, JobOutputChunk, JobOutputRepository, JobOutputStream,
+    JobQueryRepository, JobRepository, ListAgentLogChunks, ListApprovalRequests, ListAuditEvents,
+    ListDriftReports, ListDueScheduledDrift, ListEnrollmentTokens, ListFactsSnapshots,
     ListInventoryAgents, ListJobOutputForJob, ListJobSummaries, ListMetricsSnapshots,
-    MetricsRepository, PendingAssignmentDispatcher, PendingTaskAssignment, RevokeAgentKey,
-    RevokeAgentKeyError, RevokeAgentKeyInput, RevokeEnrollmentToken, RevokeEnrollmentTokenInput,
-    RunbookJobRepository, SnapshotPageCursor, TaskAssignmentRepository, TaskEnvelopeSigner,
-    UpdateAgentLabels, UpdateAgentLabelsError, UpdateAgentLabelsInput, VerifyAdminToken,
-    select_dispatch_targets,
+    MetricsRepository, PendingAssignmentDispatcher, PendingTaskAssignment,
+    PolicyRepository as AppPolicyRepository, PreviewSelector, RevokeAgentKey, RevokeAgentKeyError,
+    RevokeAgentKeyInput, RevokeEnrollmentToken, RevokeEnrollmentTokenInput, RunbookJobRepository,
+    SavePolicy, SavePolicyInput, SchedulePolicyDrift, SchedulePolicyDriftInput,
+    SelectorPreviewInput, SnapshotPageCursor, TaskAssignmentRepository, TaskEnvelopeSigner,
+    UpdateAgentLabels, UpdateAgentLabelsError, UpdateAgentLabelsInput, select_dispatch_targets,
 };
+use fleet_application::{
+    ApprovalRepository as AppApprovalRepository, ApprovalRequestRecord as AppApprovalRequestRecord,
+    ApprovalUseCaseError, ApproveApprovalInput, ApproveApprovalRequest, RejectApprovalInput,
+    RejectApprovalRequest,
+};
+use fleet_application::{AssignPolicyToAgent, AssignPolicyToAgentInput};
 use fleet_domain::{
     Agent, AgentFingerprint, AgentId, AgentIdentity, AgentLabel, AgentName, AgentPublicKey,
-    AgentStatus, AuditActor, AuditCategory, AuditEvent, AuditTarget, AuditValue,
-    ControllerPublicKey, DriftReport, DriftStatus, Job, JobId, JobStatus, Selector, TaskEnvelope,
+    AgentStatus, AssignmentStatus, AuditActor, AuditCategory, AuditEvent, AuditTarget, AuditValue,
+    ControllerPublicKey, DriftAcknowledgement, DriftReport, DriftSeverity, DriftStatus, Job, JobId,
+    JobStatus, Selector, TaskEnvelope,
 };
 use fleet_store::SqliteStore;
 use futures_util::{
@@ -90,6 +100,102 @@ struct ControllerAppState {
 struct ControllerRuntimeMetadata {
     external_url: Option<String>,
     tls_enabled: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdminRole {
+    Owner,
+    Admin,
+    Operator,
+    Viewer,
+}
+
+impl AdminRole {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "owner" => Some(Self::Owner),
+            "admin" => Some(Self::Admin),
+            "operator" => Some(Self::Operator),
+            "viewer" => Some(Self::Viewer),
+            _ => None,
+        }
+    }
+
+    fn allows(self, permission: AdminPermission) -> bool {
+        match self {
+            Self::Owner | Self::Admin => true,
+            Self::Operator => matches!(
+                permission,
+                AdminPermission::AgentRead
+                    | AdminPermission::ApprovalRead
+                    | AdminPermission::JobRead
+                    | AdminPermission::JobCreate
+                    | AdminPermission::JobApprove
+                    | AdminPermission::JobCancel
+                    | AdminPermission::AuditRead
+                    | AdminPermission::PolicyRead
+            ),
+            Self::Viewer => matches!(
+                permission,
+                AdminPermission::AgentRead
+                    | AdminPermission::ApprovalRead
+                    | AdminPermission::JobRead
+                    | AdminPermission::AuditRead
+                    | AdminPermission::PolicyRead
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdminPermission {
+    AgentRead,
+    AgentWrite,
+    AgentRevoke,
+    ApprovalRead,
+    JobRead,
+    JobCreate,
+    JobApprove,
+    JobCancel,
+    EnrollmentTokenRead,
+    EnrollmentTokenCreate,
+    EnrollmentTokenRevoke,
+    AuditRead,
+    PolicyRead,
+    PolicyWrite,
+}
+
+impl AdminPermission {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AgentRead => "agent_read",
+            Self::AgentWrite => "agent_write",
+            Self::AgentRevoke => "agent_revoke",
+            Self::ApprovalRead => "approval_read",
+            Self::JobRead => "job_read",
+            Self::JobCreate => "job_create",
+            Self::JobApprove => "job_approve",
+            Self::JobCancel => "job_cancel",
+            Self::EnrollmentTokenRead => "enrollment_token_read",
+            Self::EnrollmentTokenCreate => "enrollment_token_create",
+            Self::EnrollmentTokenRevoke => "enrollment_token_revoke",
+            Self::AuditRead => "audit_read",
+            Self::PolicyRead => "policy_read",
+            Self::PolicyWrite => "policy_write",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AdminRequestContext {
+    actor_id: String,
+    role: AdminRole,
+}
+
+impl AdminRequestContext {
+    fn allows(&self, permission: AdminPermission) -> bool {
+        self.role.allows(permission)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -490,6 +596,10 @@ pub struct CreateCommandJobRequest {
     pub target_agent_ids: Vec<String>,
     #[serde(default)]
     pub selector: Option<String>,
+    #[serde(default, rename = "matchLabels", alias = "match_labels")]
+    pub match_labels: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    pub strategy: Option<JobStrategyRequest>,
     pub program: String,
     #[serde(default)]
     pub args: Vec<String>,
@@ -508,6 +618,8 @@ pub struct CreateCommandJobResponse {
     pub job_id: String,
     pub target_count: usize,
     pub assignment_count: usize,
+    pub status: String,
+    pub approval_request_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -516,6 +628,10 @@ pub struct CreateDriftCheckJobRequest {
     pub target_agent_ids: Vec<String>,
     #[serde(default)]
     pub selector: Option<String>,
+    #[serde(default, rename = "matchLabels", alias = "match_labels")]
+    pub match_labels: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    pub strategy: Option<JobStrategyRequest>,
     pub policy_document: String,
     #[serde(default = "default_drift_timeout_seconds")]
     pub timeout_seconds: u64,
@@ -532,6 +648,8 @@ pub struct CreateDriftCheckJobResponse {
     pub job_id: String,
     pub target_count: usize,
     pub assignment_count: usize,
+    pub status: String,
+    pub approval_request_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -540,6 +658,10 @@ pub struct CreateRunbookJobRequest {
     pub target_agent_ids: Vec<String>,
     #[serde(default)]
     pub selector: Option<String>,
+    #[serde(default, rename = "matchLabels", alias = "match_labels")]
+    pub match_labels: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    pub strategy: Option<JobStrategyRequest>,
     pub runbook_document: String,
     #[serde(default = "default_drift_timeout_seconds")]
     pub timeout_seconds: u64,
@@ -557,6 +679,100 @@ pub struct CreateRunbookJobResponse {
     pub job_id: String,
     pub target_count: usize,
     pub assignment_count: usize,
+    pub status: String,
+    pub approval_request_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalRequestResponse {
+    pub id: String,
+    pub job_id: String,
+    pub requester: String,
+    pub approver: Option<String>,
+    pub reason: String,
+    pub status: String,
+    pub expires_at_ms: u64,
+    pub created_at_ms: u64,
+    pub decided_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalDecisionRequest {
+    #[serde(default)]
+    pub actor: String,
+    #[serde(default)]
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExpireApprovalsResponse {
+    pub expired_count: usize,
+    pub approvals: Vec<ApprovalRequestResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobStrategyRequest {
+    #[serde(default)]
+    pub concurrency: Option<u32>,
+    #[serde(default, rename = "maxFailures", alias = "max_failures")]
+    pub max_failures: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct JobStrategyConfig {
+    concurrency: u32,
+    max_failures: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelectorPreviewRequest {
+    #[serde(default)]
+    pub selector: Option<String>,
+    #[serde(default, rename = "matchLabels", alias = "match_labels")]
+    pub match_labels: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelectorPreviewWarningResponse {
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelectorPreviewAgentResponse {
+    pub agent_id: String,
+    pub name: String,
+    pub status: String,
+    pub labels: Vec<AgentLabelResponse>,
+    pub selected_for_dispatch: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelectorPreviewResponse {
+    pub matched_count: usize,
+    pub selected_count: usize,
+    pub disabled_count: usize,
+    pub offline_count: usize,
+    pub warnings: Vec<SelectorPreviewWarningResponse>,
+    pub agents: Vec<SelectorPreviewAgentResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CancelJobRequest {
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CancelJobResponse {
+    pub job_id: String,
+    pub status: String,
+    pub task_id: Option<String>,
+    pub agent_id: Option<String>,
+    pub assignment_status: Option<String>,
+    pub canceled_count: usize,
+    pub cancel_delivered_count: usize,
+    pub cancel_delivered: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -567,9 +783,13 @@ pub struct JobSummaryResponse {
     pub risk: String,
     pub command_program: Option<String>,
     pub command_args: Vec<String>,
+    pub selector_kind: String,
+    pub selector_source: String,
+    pub strategy: JobStrategyResponse,
     pub target_count: usize,
     pub target_agent_ids: Vec<String>,
     pub target_agents: Vec<JobTargetSummaryResponse>,
+    pub assignment_summary: JobAssignmentSummaryResponse,
     pub target_connected: bool,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
@@ -580,9 +800,37 @@ pub struct JobSummaryResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobTargetSummaryResponse {
     pub agent_id: String,
+    pub name: String,
     pub status: String,
+    pub snapshot_status: String,
+    pub labels: Vec<AgentLabelResponse>,
+    pub task_id: Option<String>,
+    pub assignment_status: Option<String>,
+    pub last_error: String,
     pub connected: bool,
     pub revoked: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobAssignmentSummaryResponse {
+    pub queued: usize,
+    pub dispatched: usize,
+    pub accepted: usize,
+    pub started: usize,
+    pub succeeded: usize,
+    pub failed: usize,
+    pub rejected: usize,
+    pub canceled: usize,
+    pub expired: usize,
+    pub skipped: usize,
+    pub unknown: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobStrategyResponse {
+    pub concurrency: u32,
+    #[serde(rename = "maxFailures")]
+    pub max_failures: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -609,6 +857,7 @@ pub struct AgentResponse {
     pub revoked: bool,
     pub fingerprint: String,
     pub labels: Vec<AgentLabelResponse>,
+    pub assigned_policy_ids: Vec<String>,
     pub last_seen_at_ms: Option<u64>,
     pub last_seen_age_seconds: Option<u64>,
     pub hostname: Option<String>,
@@ -619,6 +868,48 @@ pub struct AgentResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateAgentLabelsRequest {
     pub labels: Vec<AgentLabelResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavePolicyRequest {
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyResponse {
+    pub id: String,
+    pub name: String,
+    pub version: u32,
+    pub source: String,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssignPolicyRequest {
+    pub agent_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyAssignmentResponse {
+    pub policy_id: String,
+    pub agent_id: String,
+    pub assigned_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchedulePolicyDriftRequest {
+    pub agent_id: String,
+    pub interval_seconds: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduledDriftResponse {
+    pub policy_id: String,
+    pub agent_id: String,
+    pub interval_seconds: u64,
+    pub next_due_at_ms: u64,
+    pub last_checked_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -668,12 +959,33 @@ pub struct MetricsSnapshotPageResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentLogChunkItemResponse {
+    pub agent_id: String,
+    pub collected_at_ms: u64,
+    pub line: String,
+    pub cursor: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentLogChunkPageResponse {
+    pub items: Vec<AgentLogChunkItemResponse>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LatestDriftReportResponse {
     pub agent_id: String,
     pub checked_at_ms: u64,
     pub agent_system_time_ms: u64,
     pub policy_name: String,
     pub status: String,
+    pub severity: String,
+    pub acknowledged: bool,
+    pub acknowledged_by: Option<String>,
+    pub acknowledged_at_ms: Option<u64>,
+    pub resolved: bool,
+    pub resolution_job_id: Option<String>,
+    pub resolved_at_ms: Option<u64>,
     pub expected: String,
     pub actual: String,
 }
@@ -685,6 +997,13 @@ pub struct DriftReportItemResponse {
     pub agent_system_time_ms: u64,
     pub policy_name: String,
     pub status: String,
+    pub severity: String,
+    pub acknowledged: bool,
+    pub acknowledged_by: Option<String>,
+    pub acknowledged_at_ms: Option<u64>,
+    pub resolved: bool,
+    pub resolution_job_id: Option<String>,
+    pub resolved_at_ms: Option<u64>,
     pub expected: String,
     pub actual: String,
     pub cursor: String,
@@ -1166,6 +1485,10 @@ async fn read_task_data_until_close_axum(
         if done {
             return Ok(AgentSessionCloseReason::NormalShutdown);
         }
+        {
+            let store = lock_store(state)?;
+            let _ = dispatch_pending_assignments(&store, &state.sessions, None, None, 100)?;
+        }
     }
 }
 
@@ -1381,6 +1704,8 @@ fn dispatch_pending_assignments(
         dispatched_count = output.dispatched_count,
         queued_count = output.queued_count,
         failed_count = output.failed_count,
+        skipped_concurrency_count = output.skipped_concurrency_count,
+        skipped_max_failures_count = output.skipped_max_failures_count,
         skipped_expired_count = output.skipped_expired_count,
         skipped_disabled_count = output.skipped_disabled_count,
         dispatch_latency_ms = started_at.elapsed().as_millis(),
@@ -1644,27 +1969,126 @@ fn handle_agent_task_data_message(
                 },
             )?;
         }
+        fleet_protocol::WirePayload::TaskAck { job_id, task_id } => {
+            let changed = store.update_active_task_assignment_status(
+                &task_id,
+                AssignmentStatus::Accepted,
+                agent_message_time,
+                None,
+            )?;
+            if changed {
+                apply_job_aggregate_after_assignment_update(store, &job_id, agent_message_time)?;
+                audit_job(
+                    store,
+                    "task_accepted",
+                    &job_id,
+                    AuditValue::Plain(format!(
+                        "agent_id={agent_id},task_id={task_id},assignment_status=accepted"
+                    )),
+                )?;
+            }
+        }
+        fleet_protocol::WirePayload::TaskStarted { job_id, task_id } => {
+            let changed = store.update_active_task_assignment_status(
+                &task_id,
+                AssignmentStatus::Started,
+                agent_message_time,
+                None,
+            )?;
+            if changed {
+                apply_job_aggregate_after_assignment_update(store, &job_id, agent_message_time)?;
+                audit_job(
+                    store,
+                    "task_started",
+                    &job_id,
+                    AuditValue::Plain(format!(
+                        "agent_id={agent_id},task_id={task_id},assignment_status=started"
+                    )),
+                )?;
+            }
+        }
+        fleet_protocol::WirePayload::TaskRejected {
+            job_id,
+            task_id,
+            reason_code,
+            reason,
+        } => {
+            let reason_code = task_rejection_reason_code_to_str(reason_code);
+            let changed = store.update_active_task_assignment_status(
+                &task_id,
+                AssignmentStatus::Rejected,
+                agent_message_time,
+                Some(&reason),
+            )?;
+            if changed {
+                apply_job_aggregate_after_assignment_update(store, &job_id, agent_message_time)?;
+                audit_job(
+                    store,
+                    "task_rejected",
+                    &job_id,
+                    AuditValue::Plain(format!(
+                        "agent_id={agent_id},task_id={task_id},assignment_status=rejected,reason_code={reason_code},reason={}",
+                        fleet_core::redact_secret(&reason)
+                    )),
+                )?;
+            }
+        }
+        fleet_protocol::WirePayload::TaskCancel {
+            job_id,
+            task_id,
+            reason: _,
+        } => {
+            audit_security_with_value(
+                store,
+                "unexpected_agent_task_cancel",
+                agent_id,
+                AuditValue::Plain(format!("job_id={job_id},task_id={task_id}")),
+            )?;
+        }
         fleet_protocol::WirePayload::TaskResult {
             job_id,
-            task_id: _,
+            task_id,
             exit_code,
+            status,
+            reason,
         } => {
-            let status = if exit_code == 0 {
-                JobStatus::Success
-            } else {
-                JobStatus::Failed
-            };
-            store.update_job_status(&job_id, status)?;
-            audit_job(
-                store,
+            let result_status = status.unwrap_or({
                 if exit_code == 0 {
-                    "job_completed"
+                    fleet_protocol::TaskResultStatus::Succeeded
                 } else {
-                    "job_failed"
-                },
-                &job_id,
-                AuditValue::Plain(format!("agent_id={agent_id},exit_code={exit_code}")),
+                    fleet_protocol::TaskResultStatus::Failed
+                }
+            });
+            let (assignment_status, audit_action) = task_result_status_to_domain(result_status);
+            let last_error = task_result_last_error(exit_code, &reason);
+            let changed = store.update_active_task_assignment_status(
+                &task_id,
+                assignment_status,
+                agent_message_time,
+                Some(&last_error),
             )?;
+            if changed {
+                apply_job_aggregate_after_assignment_update(store, &job_id, agent_message_time)?;
+                audit_job(
+                    store,
+                    audit_action,
+                    &job_id,
+                    AuditValue::Plain(format!(
+                        "agent_id={agent_id},task_id={task_id},assignment_status={},exit_code={exit_code},reason={}",
+                        assignment_status.as_str(),
+                        fleet_core::redact_secret(&reason)
+                    )),
+                )?;
+            } else {
+                audit_job(
+                    store,
+                    "task_result_ignored",
+                    &job_id,
+                    AuditValue::Plain(format!(
+                        "agent_id={agent_id},task_id={task_id},exit_code={exit_code},reason=terminal_assignment"
+                    )),
+                )?;
+            }
         }
         fleet_protocol::WirePayload::SecurityEvent {
             agent_id: event_agent_id,
@@ -1731,6 +2155,8 @@ fn handle_agent_task_data_message(
                 let report = DriftReport {
                     policy_name: "agent-reported".to_owned(),
                     status: parse_drift_status(&status),
+                    severity: DriftSeverity::for_status(parse_drift_status(&status)),
+                    acknowledgement: DriftAcknowledgement::Open,
                     expected,
                     actual,
                 };
@@ -1829,6 +2255,67 @@ fn output_stream_from_wire(stream: fleet_protocol::OutputStream) -> JobOutputStr
     match stream {
         fleet_protocol::OutputStream::Stdout => JobOutputStream::Stdout,
         fleet_protocol::OutputStream::Stderr => JobOutputStream::Stderr,
+    }
+}
+
+fn task_rejection_reason_code_to_str(
+    reason_code: fleet_protocol::TaskRejectionReasonCode,
+) -> &'static str {
+    match reason_code {
+        fleet_protocol::TaskRejectionReasonCode::AgentBusy => "agent_busy",
+        fleet_protocol::TaskRejectionReasonCode::InvalidSignature => "invalid_signature",
+        fleet_protocol::TaskRejectionReasonCode::Expired => "expired",
+        fleet_protocol::TaskRejectionReasonCode::Replay => "replay",
+        fleet_protocol::TaskRejectionReasonCode::TargetMismatch => "target_mismatch",
+        fleet_protocol::TaskRejectionReasonCode::InvalidTask => "invalid_task",
+        fleet_protocol::TaskRejectionReasonCode::CapabilityUnsupported => "capability_unsupported",
+        fleet_protocol::TaskRejectionReasonCode::LocalPolicy => "local_policy",
+        fleet_protocol::TaskRejectionReasonCode::InternalError => "internal_error",
+    }
+}
+
+fn apply_job_aggregate_after_assignment_update(
+    store: &SqliteStore,
+    job_id: &str,
+    now: SystemTime,
+) -> Result<(), ControllerError> {
+    let canceled_count =
+        store.cancel_queued_assignments_after_max_failures(job_id, now, "maxFailures reached")?;
+    if canceled_count > 0 {
+        audit_job(
+            store,
+            "job_max_failures_reached",
+            job_id,
+            AuditValue::Plain(format!(
+                "canceled_queued_count={canceled_count},reason=maxFailures reached"
+            )),
+        )?;
+    }
+    store.recompute_job_status_from_assignments(job_id)?;
+    Ok(())
+}
+
+fn task_result_status_to_domain(
+    status: fleet_protocol::TaskResultStatus,
+) -> (AssignmentStatus, &'static str) {
+    match status {
+        fleet_protocol::TaskResultStatus::Succeeded => {
+            (AssignmentStatus::Succeeded, "job_completed")
+        }
+        fleet_protocol::TaskResultStatus::Failed => (AssignmentStatus::Failed, "job_failed"),
+        fleet_protocol::TaskResultStatus::Canceled => (AssignmentStatus::Canceled, "job_canceled"),
+        fleet_protocol::TaskResultStatus::TimedOut => (AssignmentStatus::Expired, "job_timed_out"),
+    }
+}
+
+fn task_result_last_error(exit_code: i32, reason: &str) -> String {
+    if reason.is_empty() {
+        format!("exit_code={exit_code}")
+    } else {
+        format!(
+            "exit_code={exit_code},reason={}",
+            fleet_core::redact_secret(reason)
+        )
     }
 }
 
@@ -1985,16 +2472,29 @@ fn route_request_with_identity_and_sessions(
         return Ok(admin_static_response(raw_path));
     }
 
-    if route_path.starts_with("/api/")
-        && route_path != "/api/agents/enroll"
-        && !authorized(request, store)?
-    {
-        return Ok(response(
-            401,
-            "application/json",
-            "{\"error\":\"unauthorized\"}\n",
-        ));
-    }
+    let protected_api = route_path.starts_with("/api/")
+        && !matches!(route_path, "/api/agents/enroll" | "/api/agents/ws");
+    let admin_context = if protected_api {
+        let Some(context) = authenticate_admin_request(request, store)? else {
+            return Ok(response(
+                401,
+                "application/json",
+                "{\"error\":\"unauthorized\"}\n",
+            ));
+        };
+        if let Some(permission) = required_permission_for_route(method, route_path)
+            && !context.allows(permission)
+        {
+            return Ok(forbidden_response(permission));
+        }
+        Some(context)
+    } else {
+        None
+    };
+    let admin_actor = admin_context
+        .as_ref()
+        .map(|context| context.actor_id.as_str())
+        .unwrap_or("anonymous");
 
     match (method, route_path) {
         ("POST", "/api/agents/enroll") => {
@@ -2026,18 +2526,39 @@ fn route_request_with_identity_and_sessions(
             }
         }
         ("POST", "/api/enrollment-tokens") => {
-            match create_enrollment_token(request_body(request), store) {
+            match create_enrollment_token(request_body(request), store, admin_actor) {
                 Ok(body) => Ok(response(201, "application/json", &format!("{body}\n"))),
                 Err(ControllerError::Json(message)) => Ok(response(
                     400,
                     "application/json",
                     &format!("{{\"error\":\"{}\"}}\n", json_escape(&message)),
                 )),
+                Err(ControllerError::Store(fleet_store::StoreError::NotFound)) => Ok(response(
+                    404,
+                    "application/json",
+                    "{\"error\":\"not_found\"}\n",
+                )),
+                Err(error) => Err(error),
+            }
+        }
+        ("POST", "/api/selectors/preview") => {
+            match preview_selector(request_body(request), store) {
+                Ok(body) => Ok(response(200, "application/json", &format!("{body}\n"))),
+                Err(ControllerError::Json(message)) => Ok(response(
+                    400,
+                    "application/json",
+                    &format!("{{\"error\":\"{}\"}}\n", json_escape(&message)),
+                )),
+                Err(ControllerError::Store(fleet_store::StoreError::NotFound)) => Ok(response(
+                    404,
+                    "application/json",
+                    "{\"error\":\"not_found\"}\n",
+                )),
                 Err(error) => Err(error),
             }
         }
         ("POST", "/api/jobs/command") => {
-            match create_command_job(request_body(request), store, identity) {
+            match create_command_job(request_body(request), store, identity, admin_actor) {
                 Ok(output) => {
                     if let Some(sessions) = sessions {
                         dispatch_pending_assignments_for_created_job(
@@ -2066,7 +2587,7 @@ fn route_request_with_identity_and_sessions(
             }
         }
         ("POST", "/api/jobs/drift-check") => {
-            match create_drift_check_job(request_body(request), store, identity) {
+            match create_drift_check_job(request_body(request), store, identity, admin_actor) {
                 Ok(output) => {
                     if let Some(sessions) = sessions {
                         dispatch_pending_assignments_for_created_job(
@@ -2095,7 +2616,7 @@ fn route_request_with_identity_and_sessions(
             }
         }
         ("POST", "/api/jobs/runbook") => {
-            match create_runbook_job(request_body(request), store, identity) {
+            match create_runbook_job(request_body(request), store, identity, admin_actor) {
                 Ok(output) => {
                     if let Some(sessions) = sessions {
                         dispatch_pending_assignments_for_created_job(
@@ -2127,6 +2648,59 @@ fn route_request_with_identity_and_sessions(
             let body = list_jobs(store, sessions)?;
             Ok(response(200, "application/json", &format!("{body}\n")))
         }
+        ("GET", "/api/approvals") => {
+            let body = list_approvals(raw_path, store)?;
+            Ok(response(200, "application/json", &format!("{body}\n")))
+        }
+        ("POST", "/api/approvals/expire") => match expire_approvals(store) {
+            Ok(body) => Ok(response(200, "application/json", &format!("{body}\n"))),
+            Err(error) => Err(error),
+        },
+        ("POST", path) if path.starts_with("/api/approvals/") && path.ends_with("/approve") => {
+            let approval_id = path
+                .trim_start_matches("/api/approvals/")
+                .trim_end_matches("/approve")
+                .trim_end_matches('/');
+            match approve_approval(approval_id, request_body(request), store, admin_actor) {
+                Ok(Some((body, job_id))) => {
+                    if let Some(sessions) = sessions {
+                        dispatch_pending_assignments_for_created_job(store, sessions, &job_id)?;
+                    }
+                    Ok(response(200, "application/json", &format!("{body}\n")))
+                }
+                Ok(None) => Ok(response(
+                    404,
+                    "application/json",
+                    "{\"error\":\"not_found\"}\n",
+                )),
+                Err(ControllerError::Json(message)) => Ok(response(
+                    400,
+                    "application/json",
+                    &format!("{{\"error\":\"{}\"}}\n", json_escape(&message)),
+                )),
+                Err(error) => Err(error),
+            }
+        }
+        ("POST", path) if path.starts_with("/api/approvals/") && path.ends_with("/reject") => {
+            let approval_id = path
+                .trim_start_matches("/api/approvals/")
+                .trim_end_matches("/reject")
+                .trim_end_matches('/');
+            match reject_approval(approval_id, request_body(request), store, admin_actor) {
+                Ok(Some(body)) => Ok(response(200, "application/json", &format!("{body}\n"))),
+                Ok(None) => Ok(response(
+                    404,
+                    "application/json",
+                    "{\"error\":\"not_found\"}\n",
+                )),
+                Err(ControllerError::Json(message)) => Ok(response(
+                    400,
+                    "application/json",
+                    &format!("{{\"error\":\"{}\"}}\n", json_escape(&message)),
+                )),
+                Err(error) => Err(error),
+            }
+        }
         ("GET", path) if path.starts_with("/api/jobs/") && path.ends_with("/output") => {
             let job_id = path
                 .trim_start_matches("/api/jobs/")
@@ -2134,6 +2708,26 @@ fn route_request_with_identity_and_sessions(
                 .trim_end_matches('/');
             let body = list_job_output(job_id, store)?;
             Ok(response(200, "application/json", &format!("{body}\n")))
+        }
+        ("POST", path) if path.starts_with("/api/jobs/") && path.ends_with("/cancel") => {
+            let job_id = path
+                .trim_start_matches("/api/jobs/")
+                .trim_end_matches("/cancel")
+                .trim_end_matches('/');
+            match cancel_job(job_id, request_body(request), store, sessions) {
+                Ok(Some(body)) => Ok(response(200, "application/json", &format!("{body}\n"))),
+                Ok(None) => Ok(response(
+                    404,
+                    "application/json",
+                    "{\"error\":\"not_found\"}\n",
+                )),
+                Err(ControllerError::Json(message)) => Ok(response(
+                    400,
+                    "application/json",
+                    &format!("{{\"error\":\"{}\"}}\n", json_escape(&message)),
+                )),
+                Err(error) => Err(error),
+            }
         }
         ("GET", path) if path.starts_with("/api/jobs/") => {
             let job_id = path.trim_start_matches("/api/jobs/").trim_end_matches('/');
@@ -2150,8 +2744,78 @@ fn route_request_with_identity_and_sessions(
             let body = list_agents(store, sessions)?;
             Ok(response(200, "application/json", &format!("{body}\n")))
         }
+        ("GET", "/api/policies") => {
+            let body = list_policies(store)?;
+            Ok(response(200, "application/json", &format!("{body}\n")))
+        }
+        ("POST", "/api/policies") => match save_policy(request_body(request), store, admin_actor) {
+            Ok(body) => Ok(response(201, "application/json", &format!("{body}\n"))),
+            Err(ControllerError::Json(message)) => Ok(response(
+                400,
+                "application/json",
+                &format!("{{\"error\":\"{}\"}}\n", json_escape(&message)),
+            )),
+            Err(ControllerError::Store(fleet_store::StoreError::Domain(message))) => Ok(response(
+                400,
+                "application/json",
+                &format!("{{\"error\":\"{}\"}}\n", json_escape(&message)),
+            )),
+            Err(error) => Err(error),
+        },
+        ("POST", path) if path.starts_with("/api/policies/") && path.ends_with("/assignments") => {
+            let policy_id = path
+                .trim_start_matches("/api/policies/")
+                .trim_end_matches("/assignments")
+                .trim_end_matches('/');
+            match assign_policy(policy_id, request_body(request), store, admin_actor) {
+                Ok(body) => Ok(response(201, "application/json", &format!("{body}\n"))),
+                Err(ControllerError::Json(message)) => Ok(response(
+                    400,
+                    "application/json",
+                    &format!("{{\"error\":\"{}\"}}\n", json_escape(&message)),
+                )),
+                Err(ControllerError::Store(fleet_store::StoreError::NotFound)) => Ok(response(
+                    404,
+                    "application/json",
+                    "{\"error\":\"not_found\"}\n",
+                )),
+                Err(error) => Err(error),
+            }
+        }
+        ("POST", path) if path.starts_with("/api/policies/") && path.ends_with("/schedules") => {
+            let policy_id = path
+                .trim_start_matches("/api/policies/")
+                .trim_end_matches("/schedules")
+                .trim_end_matches('/');
+            match schedule_policy_drift(policy_id, request_body(request), store, admin_actor) {
+                Ok(body) => Ok(response(201, "application/json", &format!("{body}\n"))),
+                Err(ControllerError::Json(message)) => Ok(response(
+                    400,
+                    "application/json",
+                    &format!("{{\"error\":\"{}\"}}\n", json_escape(&message)),
+                )),
+                Err(ControllerError::Store(fleet_store::StoreError::NotFound)) => Ok(response(
+                    404,
+                    "application/json",
+                    "{\"error\":\"not_found\"}\n",
+                )),
+                Err(error) => Err(error),
+            }
+        }
+        ("GET", "/api/drift/scheduled") => {
+            let body = list_due_scheduled_drift(store)?;
+            Ok(response(200, "application/json", &format!("{body}\n")))
+        }
         ("GET", "/api/audit") => {
             let body = list_audit_events(store)?;
+            Ok(response(200, "application/json", &format!("{body}\n")))
+        }
+        ("GET", path) if path.starts_with("/api/agents/") && path.ends_with("/policies") => {
+            let agent_id = path
+                .trim_start_matches("/api/agents/")
+                .trim_end_matches("/policies")
+                .trim_end_matches('/');
+            let body = list_agent_policies(agent_id, store)?;
             Ok(response(200, "application/json", &format!("{body}\n")))
         }
         ("GET", path) if path.starts_with("/api/agents/") && path.ends_with("/facts/latest") => {
@@ -2204,6 +2868,21 @@ fn route_request_with_identity_and_sessions(
                 Err(error) => Err(error),
             }
         }
+        ("GET", path) if path.starts_with("/api/agents/") && path.ends_with("/logs") => {
+            let agent_id = path
+                .trim_start_matches("/api/agents/")
+                .trim_end_matches("/logs")
+                .trim_end_matches('/');
+            match list_agent_logs(agent_id, raw_path, store) {
+                Ok(body) => Ok(response(200, "application/json", &format!("{body}\n"))),
+                Err(ControllerError::Json(message)) => Ok(response(
+                    400,
+                    "application/json",
+                    &format!("{{\"error\":\"{}\"}}\n", json_escape(&message)),
+                )),
+                Err(error) => Err(error),
+            }
+        }
         ("GET", path) if path.starts_with("/api/agents/") && path.ends_with("/drift/latest") => {
             let agent_id = path
                 .trim_start_matches("/api/agents/")
@@ -2234,7 +2913,7 @@ fn route_request_with_identity_and_sessions(
                 .trim_start_matches("/api/agents/")
                 .trim_end_matches("/revoke-key")
                 .trim_end_matches('/');
-            match revoke_agent_key(agent_id, store, sessions) {
+            match revoke_agent_key(agent_id, store, sessions, admin_actor) {
                 Ok(Some(body)) => Ok(response(200, "application/json", &format!("{body}\n"))),
                 Ok(None) => Ok(response(
                     404,
@@ -2267,7 +2946,13 @@ fn route_request_with_identity_and_sessions(
                 .trim_start_matches("/api/agents/")
                 .trim_end_matches("/labels")
                 .trim_end_matches('/');
-            match update_agent_labels(agent_id, request_body(request), store, sessions) {
+            match update_agent_labels(
+                agent_id,
+                request_body(request),
+                store,
+                sessions,
+                admin_actor,
+            ) {
                 Ok(Some(body)) => Ok(response(200, "application/json", &format!("{body}\n"))),
                 Ok(None) => Ok(response(
                     404,
@@ -2295,7 +2980,7 @@ fn route_request_with_identity_and_sessions(
         }
         ("DELETE", path) if path.starts_with("/api/enrollment-tokens/") => {
             let id = path.trim_start_matches("/api/enrollment-tokens/");
-            if revoke_enrollment_token(id, store)? {
+            if revoke_enrollment_token(id, store, admin_actor)? {
                 Ok(response(204, "application/json", ""))
             } else {
                 Ok(response(
@@ -2445,7 +3130,11 @@ struct CreateJobHttpOutput {
     body: String,
 }
 
-fn create_enrollment_token(body: &str, store: &SqliteStore) -> Result<String, ControllerError> {
+fn create_enrollment_token(
+    body: &str,
+    store: &SqliteStore,
+    actor: &str,
+) -> Result<String, ControllerError> {
     let request = parse_create_enrollment_token_request(body)?;
     if request.max_uses == 0 {
         return Err(ControllerError::Json(
@@ -2472,6 +3161,7 @@ fn create_enrollment_token(body: &str, store: &SqliteStore) -> Result<String, Co
             default_labels: request.default_labels,
             expires_at: now + Duration::from_secs(request.expires_in_seconds),
             max_uses: request.max_uses,
+            actor: actor.to_owned(),
             occurred_at: now,
         },
     )
@@ -2515,7 +3205,11 @@ fn list_enrollment_tokens(store: &SqliteStore) -> Result<String, ControllerError
         .join(","))
 }
 
-fn revoke_enrollment_token(id: &str, store: &SqliteStore) -> Result<bool, ControllerError> {
+fn revoke_enrollment_token(
+    id: &str,
+    store: &SqliteStore,
+    actor: &str,
+) -> Result<bool, ControllerError> {
     let mut repo = ControllerEnrollmentTokenRepository { store };
     let mut audit = ControllerAuditWriter { store };
     let output = RevokeEnrollmentToken::execute(
@@ -2523,6 +3217,7 @@ fn revoke_enrollment_token(id: &str, store: &SqliteStore) -> Result<bool, Contro
         &mut audit,
         RevokeEnrollmentTokenInput {
             id: id.to_owned(),
+            actor: actor.to_owned(),
             occurred_at: SystemTime::now(),
         },
     )
@@ -2539,10 +3234,54 @@ fn map_enrollment_token_use_case_error(
     }
 }
 
+fn preview_selector(body: &str, store: &SqliteStore) -> Result<String, ControllerError> {
+    let request: SelectorPreviewRequest =
+        serde_json::from_str(body).map_err(|error| ControllerError::Json(error.to_string()))?;
+    let selector = selector_from_parts(request.selector.as_deref(), request.match_labels.as_ref())
+        .map_err(ControllerError::Json)?
+        .ok_or_else(|| {
+            ControllerError::Json("selector preview requires selector or matchLabels".to_owned())
+        })?;
+    mark_stale_agents_offline_for_inventory(store)?;
+    let repo = ControllerAgentInventoryRepository { store };
+    let output = PreviewSelector::execute(&repo, SelectorPreviewInput { selector })?;
+    let response = SelectorPreviewResponse {
+        matched_count: output.matched_count,
+        selected_count: output.selected_count,
+        disabled_count: output.disabled_count,
+        offline_count: output.offline_count,
+        warnings: output
+            .warnings
+            .into_iter()
+            .map(|warning| SelectorPreviewWarningResponse {
+                code: warning.code,
+                message: warning.message,
+            })
+            .collect(),
+        agents: output
+            .agents
+            .into_iter()
+            .map(|agent| SelectorPreviewAgentResponse {
+                agent_id: agent.agent_id,
+                name: agent.name,
+                status: agent.status,
+                labels: agent
+                    .labels
+                    .into_iter()
+                    .map(|(key, value)| AgentLabelResponse { key, value })
+                    .collect(),
+                selected_for_dispatch: agent.selected_for_dispatch,
+            })
+            .collect(),
+    };
+    serde_json::to_string(&response).map_err(|error| ControllerError::Json(error.to_string()))
+}
+
 fn create_command_job(
     body: &str,
     store: &SqliteStore,
     identity: &ControllerIdentity,
+    actor: &str,
 ) -> Result<CreateJobHttpOutput, CreateCommandJobHttpError> {
     let request: CreateCommandJobRequest = serde_json::from_str(body)
         .map_err(|error| CreateCommandJobHttpError::BadRequest(error.to_string()))?;
@@ -2550,12 +3289,22 @@ fn create_command_job(
     let expires_at = issued_at + Duration::from_secs(request.expires_in_seconds);
     let job_id = request.job_id.clone();
     let target_agent_ids = resolve_command_targets(store, &request)?;
+    let selector_snapshot = job_selector_snapshot(
+        &request.target_agent_ids,
+        request.selector.as_deref(),
+        request.match_labels.as_ref(),
+        &target_agent_ids,
+    )?;
+    let strategy = normalize_job_strategy(request.strategy.as_ref())?;
     let nonce_prefix = match request.nonce_prefix {
         Some(prefix) => prefix,
         None => fleet_core::generate_prefixed_ulid("nonce").map_err(|error| {
             CreateCommandJobHttpError::Internal(ControllerError::Json(error.to_string()))
         })?,
     };
+    let approval_request_id = fleet_core::generate_prefixed_ulid("approval").map_err(|error| {
+        CreateCommandJobHttpError::Internal(ControllerError::Json(error.to_string()))
+    })?;
     let input = CreateCommandJobInput {
         job_id: request.job_id,
         target_agent_ids,
@@ -2563,10 +3312,12 @@ fn create_command_job(
         args: request.args,
         timeout: Duration::from_secs(request.timeout_seconds),
         confirmed_high_risk: request.confirmed_high_risk,
-        confirmed_by: request.confirmed_by,
+        confirmed_by: actor.to_owned(),
         issued_at,
         expires_at,
         nonce_prefix,
+        approval_request_id,
+        approval_expires_at: expires_at,
     };
     let mut job_repo = ControllerJobRepository { store };
     let mut audit_writer = ControllerAuditWriter { store };
@@ -2576,10 +3327,18 @@ fn create_command_job(
 
     let output = CreateCommandJob::execute(&mut job_repo, &mut audit_writer, &mut signer, input)
         .map_err(map_create_command_job_error)?;
+    persist_job_strategy(store, &job_id, strategy)?;
+    persist_job_selector_snapshot(store, &job_id, selector_snapshot)?;
     let body = serde_json::to_string(&CreateCommandJobResponse {
         job_id: job_id.clone(),
         target_count: output.targets.len(),
         assignment_count: output.envelopes.len(),
+        status: if output.approval_request.is_some() {
+            "pending_approval".to_owned()
+        } else {
+            "queued".to_owned()
+        },
+        approval_request_id: output.approval_request.map(|approval| approval.id),
     })
     .map_err(|error| {
         CreateCommandJobHttpError::Internal(ControllerError::Json(error.to_string()))
@@ -2591,6 +3350,7 @@ fn create_drift_check_job(
     body: &str,
     store: &SqliteStore,
     identity: &ControllerIdentity,
+    actor: &str,
 ) -> Result<CreateJobHttpOutput, CreateCommandJobHttpError> {
     let request: CreateDriftCheckJobRequest = serde_json::from_str(body)
         .map_err(|error| CreateCommandJobHttpError::BadRequest(error.to_string()))?;
@@ -2600,21 +3360,33 @@ fn create_drift_check_job(
     let expires_at = issued_at + Duration::from_secs(request.expires_in_seconds);
     let job_id = request.job_id.clone();
     let target_agent_ids = resolve_drift_check_targets(store, &request)?;
+    let selector_snapshot = job_selector_snapshot(
+        &request.target_agent_ids,
+        request.selector.as_deref(),
+        request.match_labels.as_ref(),
+        &target_agent_ids,
+    )?;
+    let strategy = normalize_job_strategy(request.strategy.as_ref())?;
     let nonce_prefix = match request.nonce_prefix {
         Some(prefix) => prefix,
         None => fleet_core::generate_prefixed_ulid("nonce").map_err(|error| {
             CreateCommandJobHttpError::Internal(ControllerError::Json(error.to_string()))
         })?,
     };
+    let approval_request_id = fleet_core::generate_prefixed_ulid("approval").map_err(|error| {
+        CreateCommandJobHttpError::Internal(ControllerError::Json(error.to_string()))
+    })?;
     let input = CreateDriftCheckJobInput {
         job_id: request.job_id,
         target_agent_ids,
         policy_document: request.policy_document,
         timeout: Duration::from_secs(request.timeout_seconds),
-        created_by: request.created_by,
+        created_by: actor.to_owned(),
         issued_at,
         expires_at,
         nonce_prefix,
+        approval_request_id,
+        approval_expires_at: expires_at,
     };
     let mut job_repo = ControllerJobRepository { store };
     let mut audit_writer = ControllerAuditWriter { store };
@@ -2624,10 +3396,18 @@ fn create_drift_check_job(
 
     let output = CreateDriftCheckJob::execute(&mut job_repo, &mut audit_writer, &mut signer, input)
         .map_err(map_create_drift_check_job_error)?;
+    persist_job_strategy(store, &job_id, strategy)?;
+    persist_job_selector_snapshot(store, &job_id, selector_snapshot)?;
     let body = serde_json::to_string(&CreateDriftCheckJobResponse {
         job_id: job_id.clone(),
         target_count: output.targets.len(),
         assignment_count: output.envelopes.len(),
+        status: if output.approval_request.is_some() {
+            "pending_approval".to_owned()
+        } else {
+            "queued".to_owned()
+        },
+        approval_request_id: output.approval_request.map(|approval| approval.id),
     })
     .map_err(|error| {
         CreateCommandJobHttpError::Internal(ControllerError::Json(error.to_string()))
@@ -2639,31 +3419,39 @@ fn create_runbook_job(
     body: &str,
     store: &SqliteStore,
     identity: &ControllerIdentity,
+    actor: &str,
 ) -> Result<CreateJobHttpOutput, CreateCommandJobHttpError> {
     let request: CreateRunbookJobRequest = serde_json::from_str(body)
         .map_err(|error| CreateCommandJobHttpError::BadRequest(error.to_string()))?;
-    fleet_domain::parse_runbook_document(&request.runbook_document)
+    let runbook = fleet_domain::parse_runbook_document(&request.runbook_document)
         .map_err(|error| CreateCommandJobHttpError::BadRequest(error.to_string()))?;
     let issued_at = SystemTime::now();
     let expires_at = issued_at + Duration::from_secs(request.expires_in_seconds);
     let job_id = request.job_id.clone();
-    let target_agent_ids = resolve_runbook_targets(store, &request)?;
+    let (target_agent_ids, selector_snapshot) =
+        resolve_runbook_targets_and_snapshot(store, &request, &runbook.target_selector)?;
+    let strategy = normalize_job_strategy(request.strategy.as_ref())?;
     let nonce_prefix = match request.nonce_prefix {
         Some(prefix) => prefix,
         None => fleet_core::generate_prefixed_ulid("nonce").map_err(|error| {
             CreateCommandJobHttpError::Internal(ControllerError::Json(error.to_string()))
         })?,
     };
+    let approval_request_id = fleet_core::generate_prefixed_ulid("approval").map_err(|error| {
+        CreateCommandJobHttpError::Internal(ControllerError::Json(error.to_string()))
+    })?;
     let input = CreateRunbookJobInput {
         job_id: request.job_id,
         target_agent_ids,
         runbook_document: request.runbook_document,
         timeout: Duration::from_secs(request.timeout_seconds),
         confirmed_high_risk: request.confirmed_high_risk,
-        confirmed_by: request.confirmed_by,
+        confirmed_by: actor.to_owned(),
         issued_at,
         expires_at,
         nonce_prefix,
+        approval_request_id,
+        approval_expires_at: expires_at,
     };
     let mut job_repo = ControllerJobRepository { store };
     let mut audit_writer = ControllerAuditWriter { store };
@@ -2673,10 +3461,18 @@ fn create_runbook_job(
 
     let output = CreateRunbookJob::execute(&mut job_repo, &mut audit_writer, &mut signer, input)
         .map_err(map_create_runbook_job_error)?;
+    persist_job_strategy(store, &job_id, strategy)?;
+    persist_job_selector_snapshot(store, &job_id, selector_snapshot)?;
     let body = serde_json::to_string(&CreateRunbookJobResponse {
         job_id: job_id.clone(),
         target_count: output.targets.len(),
         assignment_count: output.envelopes.len(),
+        status: if output.approval_request.is_some() {
+            "pending_approval".to_owned()
+        } else {
+            "queued".to_owned()
+        },
+        approval_request_id: output.approval_request.map(|approval| approval.id),
     })
     .map_err(|error| {
         CreateCommandJobHttpError::Internal(ControllerError::Json(error.to_string()))
@@ -2688,54 +3484,88 @@ fn resolve_command_targets(
     store: &SqliteStore,
     request: &CreateCommandJobRequest,
 ) -> Result<Vec<String>, CreateCommandJobHttpError> {
-    if !request.target_agent_ids.is_empty() {
-        return Ok(request.target_agent_ids.clone());
-    }
-    let Some(selector) = request.selector.as_deref() else {
-        return Ok(Vec::new());
-    };
-    let selector = Selector::parse(selector)
-        .map_err(|error| CreateCommandJobHttpError::BadRequest(error.to_string()))?;
-    let repo = ControllerAgentInventoryRepository { store };
-    let agents = ListInventoryAgents::execute(&repo)
-        .map_err(|error| CreateCommandJobHttpError::Internal(ControllerError::Store(error)))?;
-    let selection = select_dispatch_targets(&agents, &selector);
-    tracing::debug!(
-        matched_count = selection.matched_count,
-        selected_count = selection.targets.len(),
-        disabled_count = selection.disabled_count,
-        offline_count = selection.offline_count,
-        "job_selector_resolved"
-    );
-    Ok(selection
-        .targets
-        .into_iter()
-        .map(|agent| agent.id().as_str().to_owned())
-        .collect())
+    resolve_targets_from_parts(
+        store,
+        &request.target_agent_ids,
+        request.selector.as_deref(),
+        request.match_labels.as_ref(),
+        "job_selector_resolved",
+    )
 }
 
 fn resolve_drift_check_targets(
     store: &SqliteStore,
     request: &CreateDriftCheckJobRequest,
 ) -> Result<Vec<String>, CreateCommandJobHttpError> {
-    if !request.target_agent_ids.is_empty() {
-        return Ok(request.target_agent_ids.clone());
+    resolve_targets_from_parts(
+        store,
+        &request.target_agent_ids,
+        request.selector.as_deref(),
+        request.match_labels.as_ref(),
+        "drift_check_selector_resolved",
+    )
+}
+
+fn resolve_runbook_targets_and_snapshot(
+    store: &SqliteStore,
+    request: &CreateRunbookJobRequest,
+    runbook_selector: &Selector,
+) -> Result<(Vec<String>, (String, String)), CreateCommandJobHttpError> {
+    if !request.target_agent_ids.is_empty()
+        || request.selector.is_some()
+        || request.match_labels.is_some()
+    {
+        let target_agent_ids = resolve_targets_from_parts(
+            store,
+            &request.target_agent_ids,
+            request.selector.as_deref(),
+            request.match_labels.as_ref(),
+            "runbook_selector_resolved",
+        )?;
+        let selector_snapshot = job_selector_snapshot(
+            &request.target_agent_ids,
+            request.selector.as_deref(),
+            request.match_labels.as_ref(),
+            &target_agent_ids,
+        )?;
+        return Ok((target_agent_ids, selector_snapshot));
     }
-    let Some(selector) = request.selector.as_deref() else {
+
+    let target_agent_ids = resolve_targets_from_selector(
+        store,
+        runbook_selector,
+        "runbook_document_selector_resolved",
+    )?;
+    let selector_snapshot = runbook_selector_snapshot(runbook_selector)?;
+    Ok((target_agent_ids, selector_snapshot))
+}
+
+fn resolve_targets_from_parts(
+    store: &SqliteStore,
+    target_agent_ids: &[String],
+    selector: Option<&str>,
+    match_labels: Option<&BTreeMap<String, String>>,
+    log_event: &'static str,
+) -> Result<Vec<String>, CreateCommandJobHttpError> {
+    if !target_agent_ids.is_empty() {
+        return Ok(target_agent_ids.to_vec());
+    }
+    let Some(selector) = selector_from_parts(selector, match_labels)
+        .map_err(CreateCommandJobHttpError::BadRequest)?
+    else {
         return Ok(Vec::new());
     };
-    let selector = Selector::parse(selector)
-        .map_err(|error| CreateCommandJobHttpError::BadRequest(error.to_string()))?;
     let repo = ControllerAgentInventoryRepository { store };
     let agents = ListInventoryAgents::execute(&repo)
         .map_err(|error| CreateCommandJobHttpError::Internal(ControllerError::Store(error)))?;
     let selection = select_dispatch_targets(&agents, &selector);
     tracing::debug!(
+        resolution_kind = log_event,
         matched_count = selection.matched_count,
         selected_count = selection.targets.len(),
         disabled_count = selection.disabled_count,
         offline_count = selection.offline_count,
-        "drift_check_selector_resolved"
+        "selector_resolved"
     );
     Ok(selection
         .targets
@@ -2744,34 +3574,143 @@ fn resolve_drift_check_targets(
         .collect())
 }
 
-fn resolve_runbook_targets(
+fn resolve_targets_from_selector(
     store: &SqliteStore,
-    request: &CreateRunbookJobRequest,
+    selector: &Selector,
+    log_event: &'static str,
 ) -> Result<Vec<String>, CreateCommandJobHttpError> {
-    if !request.target_agent_ids.is_empty() {
-        return Ok(request.target_agent_ids.clone());
-    }
-    let Some(selector) = request.selector.as_deref() else {
-        return Ok(Vec::new());
-    };
-    let selector = Selector::parse(selector)
-        .map_err(|error| CreateCommandJobHttpError::BadRequest(error.to_string()))?;
     let repo = ControllerAgentInventoryRepository { store };
     let agents = ListInventoryAgents::execute(&repo)
         .map_err(|error| CreateCommandJobHttpError::Internal(ControllerError::Store(error)))?;
-    let selection = select_dispatch_targets(&agents, &selector);
+    let selection = select_dispatch_targets(&agents, selector);
     tracing::debug!(
+        resolution_kind = log_event,
         matched_count = selection.matched_count,
         selected_count = selection.targets.len(),
         disabled_count = selection.disabled_count,
         offline_count = selection.offline_count,
-        "runbook_selector_resolved"
+        "selector_resolved"
     );
     Ok(selection
         .targets
         .into_iter()
         .map(|agent| agent.id().as_str().to_owned())
         .collect())
+}
+
+fn selector_from_parts(
+    selector: Option<&str>,
+    match_labels: Option<&BTreeMap<String, String>>,
+) -> Result<Option<Selector>, String> {
+    match (selector, match_labels) {
+        (Some(_), Some(_)) => Err("selector and matchLabels cannot be used together".to_owned()),
+        (Some(selector), None) => Selector::parse(selector)
+            .map(Some)
+            .map_err(|error| error.to_string()),
+        (None, Some(labels)) => Selector::from_match_labels(labels.clone())
+            .map(Some)
+            .map_err(|error| error.to_string()),
+        (None, None) => Ok(None),
+    }
+}
+
+fn job_selector_snapshot(
+    explicit_target_agent_ids: &[String],
+    selector: Option<&str>,
+    match_labels: Option<&BTreeMap<String, String>>,
+    resolved_target_agent_ids: &[String],
+) -> Result<(String, String), CreateCommandJobHttpError> {
+    if !explicit_target_agent_ids.is_empty() {
+        return Ok((
+            "explicit_ids".to_owned(),
+            serde_json::to_string(explicit_target_agent_ids).map_err(|error| {
+                CreateCommandJobHttpError::Internal(ControllerError::Json(error.to_string()))
+            })?,
+        ));
+    }
+    match (selector, match_labels) {
+        (Some(selector), None) => Ok(("selector".to_owned(), selector.to_owned())),
+        (None, Some(labels)) => Ok((
+            "matchLabels".to_owned(),
+            serde_json::to_string(labels).map_err(|error| {
+                CreateCommandJobHttpError::Internal(ControllerError::Json(error.to_string()))
+            })?,
+        )),
+        (None, None) => Ok((
+            "resolved_ids".to_owned(),
+            serde_json::to_string(resolved_target_agent_ids).map_err(|error| {
+                CreateCommandJobHttpError::Internal(ControllerError::Json(error.to_string()))
+            })?,
+        )),
+        (Some(_), Some(_)) => Err(CreateCommandJobHttpError::BadRequest(
+            "selector and matchLabels cannot be used together".to_owned(),
+        )),
+    }
+}
+
+fn runbook_selector_snapshot(
+    selector: &Selector,
+) -> Result<(String, String), CreateCommandJobHttpError> {
+    match selector {
+        Selector::Agent(agent) => Ok(("runbook_selector".to_owned(), format!("agent:{agent}"))),
+        Selector::Labels(labels) => {
+            let labels = labels
+                .iter()
+                .map(|label| (label.key().to_owned(), label.value().to_owned()))
+                .collect::<BTreeMap<_, _>>();
+            Ok((
+                "runbook_matchLabels".to_owned(),
+                serde_json::to_string(&labels).map_err(|error| {
+                    CreateCommandJobHttpError::Internal(ControllerError::Json(error.to_string()))
+                })?,
+            ))
+        }
+    }
+}
+
+fn normalize_job_strategy(
+    strategy: Option<&JobStrategyRequest>,
+) -> Result<JobStrategyConfig, CreateCommandJobHttpError> {
+    let concurrency = strategy
+        .and_then(|strategy| strategy.concurrency)
+        .unwrap_or(1);
+    if concurrency == 0 {
+        return Err(CreateCommandJobHttpError::BadRequest(
+            "strategy.concurrency must be greater than zero".to_owned(),
+        ));
+    }
+    let max_failures = strategy.and_then(|strategy| strategy.max_failures);
+    if max_failures == Some(0) {
+        return Err(CreateCommandJobHttpError::BadRequest(
+            "strategy.maxFailures must be greater than zero when provided".to_owned(),
+        ));
+    }
+    Ok(JobStrategyConfig {
+        concurrency,
+        max_failures,
+    })
+}
+
+fn persist_job_strategy(
+    store: &SqliteStore,
+    job_id: &str,
+    strategy: JobStrategyConfig,
+) -> Result<(), CreateCommandJobHttpError> {
+    store
+        .update_job_strategy(job_id, strategy.concurrency, strategy.max_failures)
+        .map_err(|error| CreateCommandJobHttpError::Internal(ControllerError::Store(error)))?;
+    Ok(())
+}
+
+fn persist_job_selector_snapshot(
+    store: &SqliteStore,
+    job_id: &str,
+    selector_snapshot: (String, String),
+) -> Result<(), CreateCommandJobHttpError> {
+    store
+        .update_job_selector_snapshot(job_id, &selector_snapshot.0, &selector_snapshot.1)
+        .map_err(|error| CreateCommandJobHttpError::Internal(ControllerError::Store(error)))?;
+    Ok(())
 }
 
 fn list_job_output(job_id: &str, store: &SqliteStore) -> Result<String, ControllerError> {
@@ -2788,6 +3727,133 @@ fn list_job_output(job_id: &str, store: &SqliteStore) -> Result<String, Controll
         })
         .collect::<Vec<_>>();
     serde_json::to_string(&response).map_err(|error| ControllerError::Json(error.to_string()))
+}
+
+fn cancel_job(
+    job_id: &str,
+    body: &str,
+    store: &SqliteStore,
+    sessions: Option<&Arc<Mutex<AgentSessionRegistry>>>,
+) -> Result<Option<String>, ControllerError> {
+    let Some(job_status) = store.find_job_status_value(job_id)? else {
+        return Ok(None);
+    };
+    let request = if body.trim().is_empty() {
+        CancelJobRequest { reason: None }
+    } else {
+        serde_json::from_str::<CancelJobRequest>(body)
+            .map_err(|error| ControllerError::Json(error.to_string()))?
+    };
+    let reason = request
+        .reason
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "operator requested cancel".to_owned());
+    let now = SystemTime::now();
+    let assignments = store.list_task_assignment_summaries_for_job(job_id)?;
+    let mut canceled_count = 0;
+    let mut cancel_delivered_count = 0;
+    let mut first_canceled_assignment = None;
+
+    for assignment in assignments
+        .iter()
+        .filter(|assignment| assignment_status_accepts_cancel(&assignment.status))
+    {
+        store.update_task_assignment_status(
+            &assignment.task_id,
+            AssignmentStatus::Canceled,
+            now,
+            Some(&reason),
+        )?;
+        canceled_count += 1;
+        if first_canceled_assignment.is_none() {
+            first_canceled_assignment = Some(assignment.clone());
+        }
+        if matches!(
+            assignment.status.as_str(),
+            "dispatched" | "accepted" | "started"
+        ) && deliver_task_cancel(
+            sessions,
+            &assignment.agent_id,
+            &assignment.job_id,
+            &assignment.task_id,
+            &reason,
+        ) {
+            cancel_delivered_count += 1;
+        }
+    }
+
+    if !matches!(
+        job_status.as_str(),
+        "success" | "failed" | "canceled" | "expired"
+    ) {
+        store.recompute_job_status_from_assignments(job_id)?;
+        audit_job(
+            store,
+            "job_canceled",
+            job_id,
+            AuditValue::Plain(format!(
+                "reason={},canceled_count={canceled_count},cancel_delivered_count={cancel_delivered_count}",
+                fleet_core::redact_secret(&reason)
+            )),
+        )?;
+    }
+
+    let current_assignment_status = first_canceled_assignment
+        .as_ref()
+        .and_then(|assignment| store.find_task_assignment_status(&assignment.task_id).ok())
+        .flatten();
+    let final_job_status = store
+        .find_job_status_value(job_id)?
+        .unwrap_or_else(|| job_status.clone());
+    let response = CancelJobResponse {
+        job_id: job_id.to_owned(),
+        status: final_job_status,
+        task_id: first_canceled_assignment
+            .as_ref()
+            .map(|assignment| assignment.task_id.clone()),
+        agent_id: first_canceled_assignment
+            .as_ref()
+            .map(|assignment| assignment.agent_id.clone()),
+        assignment_status: current_assignment_status,
+        canceled_count,
+        cancel_delivered_count,
+        cancel_delivered: cancel_delivered_count > 0,
+    };
+    serde_json::to_string(&response)
+        .map(Some)
+        .map_err(|error| ControllerError::Json(error.to_string()))
+}
+
+fn assignment_status_accepts_cancel(status: &str) -> bool {
+    matches!(status, "queued" | "dispatched" | "accepted" | "started")
+}
+
+fn deliver_task_cancel(
+    sessions: Option<&Arc<Mutex<AgentSessionRegistry>>>,
+    agent_id: &str,
+    job_id: &str,
+    task_id: &str,
+    reason: &str,
+) -> bool {
+    let Some(sessions) = sessions else {
+        return false;
+    };
+    let Ok(sessions) = sessions.lock() else {
+        return false;
+    };
+    let message = fleet_protocol::WireMessage::new(
+        fleet_core::generate_prefixed_ulid("msg").unwrap_or_else(|_| "msg-task-cancel".to_owned()),
+        fleet_core::generate_prefixed_ulid("corr")
+            .unwrap_or_else(|_| "corr-task-cancel".to_owned()),
+        None,
+        system_time_to_millis(SystemTime::now()),
+        fleet_protocol::WirePayload::TaskCancel {
+            job_id: job_id.to_owned(),
+            task_id: task_id.to_owned(),
+            reason: reason.to_owned(),
+        },
+    );
+    sessions.try_send(agent_id, message).is_ok()
 }
 
 fn job_output_stream_to_str(stream: JobOutputStream) -> &'static str {
@@ -2829,6 +3895,156 @@ fn get_agent(
         .map_err(|error| ControllerError::Json(error.to_string()))
 }
 
+fn list_policies(store: &SqliteStore) -> Result<String, ControllerError> {
+    let policies = store
+        .list_policies()?
+        .into_iter()
+        .map(policy_to_response)
+        .collect::<Vec<_>>();
+    serde_json::to_string(&policies).map_err(|error| ControllerError::Json(error.to_string()))
+}
+
+fn save_policy(body: &str, store: &SqliteStore, actor: &str) -> Result<String, ControllerError> {
+    let request: SavePolicyRequest =
+        serde_json::from_str(body).map_err(|error| ControllerError::Json(error.to_string()))?;
+    let now = SystemTime::now();
+    let mut repo = ControllerPolicyRepository { store };
+    let mut audit = ControllerAuditWriter { store };
+    let policy = SavePolicy::execute(
+        &mut repo,
+        &mut audit,
+        SavePolicyInput {
+            source: request.source,
+            actor: actor.to_owned(),
+            now,
+        },
+    )
+    .map_err(map_policy_use_case_error)?;
+    let record = store.find_policy(&policy.id)?.ok_or_else(|| {
+        ControllerError::Store(fleet_store::StoreError::Domain(
+            "saved policy was not readable".to_owned(),
+        ))
+    })?;
+    serde_json::to_string(&policy_to_response(record))
+        .map_err(|error| ControllerError::Json(error.to_string()))
+}
+
+fn assign_policy(
+    policy_id: &str,
+    body: &str,
+    store: &SqliteStore,
+    actor: &str,
+) -> Result<String, ControllerError> {
+    let request: AssignPolicyRequest =
+        serde_json::from_str(body).map_err(|error| ControllerError::Json(error.to_string()))?;
+    let mut repo = ControllerPolicyRepository { store };
+    let mut audit = ControllerAuditWriter { store };
+    let assignment = AssignPolicyToAgent::execute(
+        &mut repo,
+        &mut audit,
+        AssignPolicyToAgentInput {
+            policy_id: policy_id.to_owned(),
+            agent_id: request.agent_id,
+            actor: actor.to_owned(),
+            now: SystemTime::now(),
+        },
+    )
+    .map_err(map_policy_use_case_error)?;
+    serde_json::to_string(&PolicyAssignmentResponse {
+        policy_id: assignment.policy_id,
+        agent_id: assignment.agent_id,
+        assigned_at_ms: system_time_to_millis(assignment.assigned_at),
+    })
+    .map_err(|error| ControllerError::Json(error.to_string()))
+}
+
+fn schedule_policy_drift(
+    policy_id: &str,
+    body: &str,
+    store: &SqliteStore,
+    actor: &str,
+) -> Result<String, ControllerError> {
+    let request: SchedulePolicyDriftRequest =
+        serde_json::from_str(body).map_err(|error| ControllerError::Json(error.to_string()))?;
+    let interval = Duration::from_secs(request.interval_seconds);
+    if interval.is_zero() {
+        return Err(ControllerError::Json(
+            "interval_seconds must be positive".to_owned(),
+        ));
+    }
+    let now = SystemTime::now();
+    let next_due_at = now + interval;
+    let mut repo = ControllerPolicyRepository { store };
+    let mut audit = ControllerAuditWriter { store };
+    SchedulePolicyDrift::execute(
+        &mut repo,
+        &mut audit,
+        SchedulePolicyDriftInput {
+            policy_id: policy_id.to_owned(),
+            agent_id: request.agent_id.clone(),
+            interval,
+            next_due_at,
+            actor: actor.to_owned(),
+            now,
+        },
+    )
+    .map_err(map_policy_use_case_error)?;
+    serde_json::to_string(&ScheduledDriftResponse {
+        policy_id: policy_id.to_owned(),
+        agent_id: request.agent_id,
+        interval_seconds: interval.as_secs(),
+        next_due_at_ms: system_time_to_millis(next_due_at),
+        last_checked_at_ms: None,
+    })
+    .map_err(|error| ControllerError::Json(error.to_string()))
+}
+
+fn list_due_scheduled_drift(store: &SqliteStore) -> Result<String, ControllerError> {
+    let repo = ControllerPolicyRepository { store };
+    let records = ListDueScheduledDrift::execute(&repo, SystemTime::now(), 100)?;
+    let response = records
+        .into_iter()
+        .map(scheduled_drift_to_response)
+        .collect::<Vec<_>>();
+    serde_json::to_string(&response).map_err(|error| ControllerError::Json(error.to_string()))
+}
+
+fn list_agent_policies(agent_id: &str, store: &SqliteStore) -> Result<String, ControllerError> {
+    let assignments = store
+        .policies_for_agent(agent_id)?
+        .into_iter()
+        .map(|assignment| PolicyAssignmentResponse {
+            policy_id: assignment.policy_id,
+            agent_id: assignment.agent_id,
+            assigned_at_ms: system_time_to_millis(assignment.assigned_at),
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string(&assignments).map_err(|error| ControllerError::Json(error.to_string()))
+}
+
+fn policy_to_response(record: fleet_store::PolicyRecord) -> PolicyResponse {
+    PolicyResponse {
+        id: record.id,
+        name: record.name,
+        version: record.version,
+        source: record.source,
+        created_at_ms: system_time_to_millis(record.created_at),
+        updated_at_ms: system_time_to_millis(record.updated_at),
+    }
+}
+
+fn scheduled_drift_to_response(
+    record: fleet_application::ScheduledDriftRecord,
+) -> ScheduledDriftResponse {
+    ScheduledDriftResponse {
+        policy_id: record.policy_id,
+        agent_id: record.agent_id,
+        interval_seconds: record.interval_seconds,
+        next_due_at_ms: system_time_to_millis(record.next_due_at),
+        last_checked_at_ms: record.last_checked_at.map(system_time_to_millis),
+    }
+}
+
 fn mark_stale_agents_offline_for_inventory(store: &SqliteStore) -> Result<(), ControllerError> {
     let now = SystemTime::now();
     let cutoff = now
@@ -2846,6 +4062,7 @@ fn update_agent_labels(
     body: &str,
     store: &SqliteStore,
     sessions: Option<&Arc<Mutex<AgentSessionRegistry>>>,
+    actor: &str,
 ) -> Result<Option<String>, ControllerError> {
     let request: UpdateAgentLabelsRequest =
         serde_json::from_str(body).map_err(|error| ControllerError::Json(error.to_string()))?;
@@ -2865,7 +4082,7 @@ fn update_agent_labels(
         UpdateAgentLabelsInput {
             agent_id: agent_id.to_owned(),
             labels,
-            actor: "admin".to_owned(),
+            actor: actor.to_owned(),
             occurred_at: SystemTime::now(),
         },
     )
@@ -2884,6 +4101,7 @@ fn revoke_agent_key(
     agent_id: &str,
     store: &SqliteStore,
     sessions: Option<&Arc<Mutex<AgentSessionRegistry>>>,
+    actor: &str,
 ) -> Result<Option<String>, ControllerError> {
     let mut repo = ControllerAgentInventoryRepository { store };
     let mut audit = ControllerAuditWriter { store };
@@ -2892,7 +4110,7 @@ fn revoke_agent_key(
         &mut audit,
         RevokeAgentKeyInput {
             agent_id: agent_id.to_owned(),
-            actor: "admin".to_owned(),
+            actor: actor.to_owned(),
             occurred_at: SystemTime::now(),
         },
     )
@@ -3001,6 +4219,107 @@ fn get_job(
         .map_err(|error| ControllerError::Json(error.to_string()))
 }
 
+fn list_approvals(raw_path: &str, store: &SqliteStore) -> Result<String, ControllerError> {
+    let status = query_param(raw_path, "status");
+    let repo = ControllerJobRepository { store };
+    let approvals = ListApprovalRequests::execute(&repo, status, 100)?;
+    let response = approvals
+        .into_iter()
+        .map(approval_response)
+        .collect::<Vec<_>>();
+    serde_json::to_string(&response).map_err(|error| ControllerError::Json(error.to_string()))
+}
+
+fn approve_approval(
+    approval_id: &str,
+    body: &str,
+    store: &SqliteStore,
+    actor: &str,
+) -> Result<Option<(String, String)>, ControllerError> {
+    let request: ApprovalDecisionRequest =
+        serde_json::from_str(body).map_err(|error| ControllerError::Json(error.to_string()))?;
+    let mut repo = ControllerJobRepository { store };
+    let mut audit = ControllerAuditWriter { store };
+    let output = ApproveApprovalRequest::execute(
+        &mut repo,
+        &mut audit,
+        ApproveApprovalInput {
+            approval_id: approval_id.to_owned(),
+            approver: actor.to_owned(),
+            reason: request.reason,
+            occurred_at: SystemTime::now(),
+        },
+    )
+    .map_err(map_approval_use_case_error)?;
+    let job_id = output.approval.job_id.clone();
+    let body = serde_json::to_string(&approval_response(output.approval))
+        .map_err(|error| ControllerError::Json(error.to_string()))?;
+    Ok(Some((body, job_id)))
+}
+
+fn reject_approval(
+    approval_id: &str,
+    body: &str,
+    store: &SqliteStore,
+    actor: &str,
+) -> Result<Option<String>, ControllerError> {
+    let request: ApprovalDecisionRequest =
+        serde_json::from_str(body).map_err(|error| ControllerError::Json(error.to_string()))?;
+    let mut repo = ControllerJobRepository { store };
+    let mut audit = ControllerAuditWriter { store };
+    let output = RejectApprovalRequest::execute(
+        &mut repo,
+        &mut audit,
+        RejectApprovalInput {
+            approval_id: approval_id.to_owned(),
+            approver: actor.to_owned(),
+            reason: request.reason,
+            occurred_at: SystemTime::now(),
+        },
+    )
+    .map_err(map_approval_use_case_error)?;
+    serde_json::to_string(&approval_response(output.approval))
+        .map(Some)
+        .map_err(|error| ControllerError::Json(error.to_string()))
+}
+
+fn expire_approvals(store: &SqliteStore) -> Result<String, ControllerError> {
+    let mut repo = ControllerJobRepository { store };
+    let mut audit = ControllerAuditWriter { store };
+    let output = ExpireApprovalRequests::execute(
+        &mut repo,
+        &mut audit,
+        ExpireApprovalsInput {
+            occurred_at: SystemTime::now(),
+        },
+    )
+    .map_err(map_approval_use_case_error)?;
+    let approvals = output
+        .expired
+        .into_iter()
+        .map(approval_response)
+        .collect::<Vec<_>>();
+    serde_json::to_string(&ExpireApprovalsResponse {
+        expired_count: approvals.len(),
+        approvals,
+    })
+    .map_err(|error| ControllerError::Json(error.to_string()))
+}
+
+fn approval_response(record: AppApprovalRequestRecord) -> ApprovalRequestResponse {
+    ApprovalRequestResponse {
+        id: record.id,
+        job_id: record.job_id,
+        requester: record.requester,
+        approver: record.approver,
+        reason: record.reason,
+        status: record.status,
+        expires_at_ms: system_time_to_millis(record.expires_at),
+        created_at_ms: system_time_to_millis(record.created_at),
+        decided_at_ms: record.decided_at.map(system_time_to_millis),
+    }
+}
+
 fn connected_agent_ids(
     sessions: Option<&Arc<Mutex<AgentSessionRegistry>>>,
 ) -> std::collections::BTreeSet<String> {
@@ -3026,10 +4345,23 @@ fn job_summary_response(
         .map(|target| JobTargetSummaryResponse {
             connected: connected_agent_ids.contains(&target.agent_id),
             agent_id: target.agent_id.clone(),
+            name: target.agent_name.clone(),
             status: agent_status_for_job_target(
                 &target.status,
                 connected_agent_ids.contains(&target.agent_id),
             ),
+            snapshot_status: target.status.clone(),
+            labels: target
+                .labels
+                .iter()
+                .map(|(key, value)| AgentLabelResponse {
+                    key: key.clone(),
+                    value: value.clone(),
+                })
+                .collect(),
+            task_id: target.task_id.clone(),
+            assignment_status: target.assignment_status.clone(),
+            last_error: target.last_error.clone(),
             revoked: target.status == "disabled",
         })
         .collect::<Vec<_>>();
@@ -3037,6 +4369,7 @@ fn job_summary_response(
         .iter()
         .map(|target| target.agent_id.clone())
         .collect::<Vec<_>>();
+    let assignment_summary = assignment_summary_for_targets(&target_agents);
     let target_connected = target_agents.iter().any(|target| target.connected);
     let created_at_ms = system_time_to_millis(job.created_at);
     let dispatch_state = job_dispatch_state(&job.status, target_connected);
@@ -3047,15 +4380,62 @@ fn job_summary_response(
         risk: job.risk,
         command_program: job.command_program,
         command_args: job.command_args,
+        selector_kind: job.selector_kind,
+        selector_source: job.selector_source,
+        strategy: JobStrategyResponse {
+            concurrency: job.strategy_concurrency,
+            max_failures: job.strategy_max_failures,
+        },
         target_count: job.target_count,
         target_agent_ids,
         target_agents,
+        assignment_summary,
         target_connected,
         created_at_ms,
         updated_at_ms: created_at_ms,
         expires_at_ms: job.expires_at.map(system_time_to_millis),
         last_error: String::new(),
     }
+}
+
+fn assignment_summary_for_targets(
+    targets: &[JobTargetSummaryResponse],
+) -> JobAssignmentSummaryResponse {
+    let mut summary = JobAssignmentSummaryResponse {
+        queued: 0,
+        dispatched: 0,
+        accepted: 0,
+        started: 0,
+        succeeded: 0,
+        failed: 0,
+        rejected: 0,
+        canceled: 0,
+        expired: 0,
+        skipped: 0,
+        unknown: 0,
+    };
+
+    for target in targets {
+        match target.assignment_status.as_deref() {
+            Some("queued") => summary.queued += 1,
+            Some("dispatched") => summary.dispatched += 1,
+            Some("accepted") => summary.accepted += 1,
+            Some("started") => summary.started += 1,
+            Some("succeeded") => summary.succeeded += 1,
+            Some("failed") => summary.failed += 1,
+            Some("rejected") => summary.rejected += 1,
+            Some("canceled") => {
+                summary.canceled += 1;
+                if target.last_error.contains("maxFailures") {
+                    summary.skipped += 1;
+                }
+            }
+            Some("expired") => summary.expired += 1,
+            _ => summary.unknown += 1,
+        }
+    }
+
+    summary
 }
 
 fn job_dispatch_state(status: &str, target_connected: bool) -> String {
@@ -3066,7 +4446,7 @@ fn job_dispatch_state(status: &str, target_connected: bool) -> String {
         "success" => "completed",
         "failed" => "failed",
         "expired" => "expired",
-        "canceled" => "rejected",
+        "canceled" => "canceled",
         value => value,
     }
     .to_owned()
@@ -3146,6 +4526,32 @@ fn list_metrics_snapshots(
         .map_err(|error| ControllerError::Json(error.to_string()))
 }
 
+fn list_agent_logs(
+    agent_id: &str,
+    raw_path: &str,
+    store: &SqliteStore,
+) -> Result<String, ControllerError> {
+    let page = parse_snapshot_page_request(raw_path)?;
+    let repo = ControllerAgentLogRepository { store };
+    let mut chunks = ListAgentLogChunks::execute(&repo, agent_id, page.fetch_limit(), page.before)?;
+    let has_more = chunks.len() > page.limit;
+    if has_more {
+        chunks.truncate(page.limit);
+    }
+    let next_cursor = next_snapshot_cursor(chunks.last().map(|chunk| chunk.cursor), has_more);
+    let items = chunks
+        .into_iter()
+        .map(|chunk| AgentLogChunkItemResponse {
+            agent_id: chunk.agent_id,
+            collected_at_ms: system_time_to_millis(chunk.collected_at),
+            line: chunk.line,
+            cursor: encode_snapshot_page_cursor(chunk.cursor),
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string(&AgentLogChunkPageResponse { items, next_cursor })
+        .map_err(|error| ControllerError::Json(error.to_string()))
+}
+
 fn latest_drift_report(
     agent_id: &str,
     store: &SqliteStore,
@@ -3160,6 +4566,18 @@ fn latest_drift_report(
         agent_system_time_ms: system_time_to_millis(record.checked_at),
         policy_name: record.report.policy_name,
         status: drift_status_to_str(&record.report.status).to_owned(),
+        severity: drift_severity_to_str(record.report.severity).to_owned(),
+        acknowledged: record.report.acknowledgement.is_acknowledged(),
+        acknowledged_by: drift_acknowledged_by(&record.report.acknowledgement),
+        acknowledged_at_ms: drift_acknowledged_at(&record.report.acknowledgement)
+            .map(system_time_to_millis),
+        resolved: matches!(
+            record.report.acknowledgement,
+            DriftAcknowledgement::Resolved { .. }
+        ),
+        resolution_job_id: drift_resolution_job_id(&record.report.acknowledgement),
+        resolved_at_ms: drift_resolved_at(&record.report.acknowledgement)
+            .map(system_time_to_millis),
         expected: record.report.expected,
         actual: record.report.actual,
     })
@@ -3188,6 +4606,18 @@ fn list_drift_reports(
             agent_system_time_ms: system_time_to_millis(record.checked_at),
             policy_name: record.report.policy_name,
             status: drift_status_to_str(&record.report.status).to_owned(),
+            severity: drift_severity_to_str(record.report.severity).to_owned(),
+            acknowledged: record.report.acknowledgement.is_acknowledged(),
+            acknowledged_by: drift_acknowledged_by(&record.report.acknowledgement),
+            acknowledged_at_ms: drift_acknowledged_at(&record.report.acknowledgement)
+                .map(system_time_to_millis),
+            resolved: matches!(
+                record.report.acknowledgement,
+                DriftAcknowledgement::Resolved { .. }
+            ),
+            resolution_job_id: drift_resolution_job_id(&record.report.acknowledgement),
+            resolved_at_ms: drift_resolved_at(&record.report.acknowledgement)
+                .map(system_time_to_millis),
             expected: record.report.expected,
             actual: record.report.actual,
             cursor: encode_snapshot_page_cursor(record.cursor),
@@ -3243,10 +4673,12 @@ fn agent_to_response_with_latest_facts(
     let summary = store
         .latest_facts_snapshot(agent.id().as_str())?
         .and_then(|record| agent_facts_summary(&record.body));
+    let assigned_policy_ids = store.assigned_policy_ids_for_agent(agent.id().as_str())?;
     Ok(agent_to_response(
         agent,
         summary.as_ref(),
         connected_agent_ids,
+        assigned_policy_ids,
     ))
 }
 
@@ -3276,6 +4708,7 @@ fn agent_to_response(
     agent: &Agent,
     facts: Option<&AgentFactsSummary>,
     connected_agent_ids: &std::collections::BTreeSet<String>,
+    assigned_policy_ids: Vec<String>,
 ) -> AgentResponse {
     let last_seen_at = agent.last_seen_at();
     let revoked = agent.status() == AgentStatus::Disabled;
@@ -3295,6 +4728,7 @@ fn agent_to_response(
                 value: label.value().to_owned(),
             })
             .collect(),
+        assigned_policy_ids,
         last_seen_at_ms: last_seen_at.map(system_time_to_millis),
         last_seen_age_seconds: last_seen_at.map(system_time_age_seconds),
         hostname: facts.and_then(|summary| summary.hostname.clone()),
@@ -3361,6 +4795,43 @@ fn drift_status_to_str(status: &DriftStatus) -> &'static str {
         DriftStatus::Compliant => "compliant",
         DriftStatus::Drifted => "drifted",
         DriftStatus::Unknown => "unknown",
+    }
+}
+
+fn drift_severity_to_str(severity: DriftSeverity) -> &'static str {
+    match severity {
+        DriftSeverity::None => "none",
+        DriftSeverity::Warning => "warning",
+        DriftSeverity::Critical => "critical",
+        DriftSeverity::Unknown => "unknown",
+    }
+}
+
+fn drift_acknowledged_by(acknowledgement: &DriftAcknowledgement) -> Option<String> {
+    match acknowledgement {
+        DriftAcknowledgement::Acknowledged { by, .. } => Some(by.clone()),
+        _ => None,
+    }
+}
+
+fn drift_acknowledged_at(acknowledgement: &DriftAcknowledgement) -> Option<SystemTime> {
+    match acknowledgement {
+        DriftAcknowledgement::Acknowledged { at, .. } => Some(*at),
+        _ => None,
+    }
+}
+
+fn drift_resolution_job_id(acknowledgement: &DriftAcknowledgement) -> Option<String> {
+    match acknowledgement {
+        DriftAcknowledgement::Resolved { job_id, .. } => Some(job_id.clone()),
+        _ => None,
+    }
+}
+
+fn drift_resolved_at(acknowledgement: &DriftAcknowledgement) -> Option<SystemTime> {
+    match acknowledgement {
+        DriftAcknowledgement::Resolved { at, .. } => Some(*at),
+        _ => None,
     }
 }
 
@@ -3454,6 +4925,18 @@ fn map_create_runbook_job_error(
     }
 }
 
+fn map_approval_use_case_error(
+    error: ApprovalUseCaseError<fleet_store::StoreError, fleet_store::StoreError>,
+) -> ControllerError {
+    match error {
+        ApprovalUseCaseError::Domain(error) => ControllerError::Json(error.to_string()),
+        ApprovalUseCaseError::NotFound => ControllerError::Store(fleet_store::StoreError::NotFound),
+        ApprovalUseCaseError::Repository(error) | ApprovalUseCaseError::Audit(error) => {
+            ControllerError::Store(error)
+        }
+    }
+}
+
 fn map_update_agent_labels_error(
     error: UpdateAgentLabelsError<fleet_store::StoreError, fleet_store::StoreError>,
 ) -> ControllerError {
@@ -3476,6 +4959,19 @@ fn map_revoke_agent_key_error(
     }
 }
 
+fn map_policy_use_case_error(
+    error: fleet_application::PolicyUseCaseError<fleet_store::StoreError, fleet_store::StoreError>,
+) -> ControllerError {
+    match error {
+        fleet_application::PolicyUseCaseError::Domain(message) => ControllerError::Json(message),
+        fleet_application::PolicyUseCaseError::NotFound(_) => {
+            ControllerError::Store(fleet_store::StoreError::NotFound)
+        }
+        fleet_application::PolicyUseCaseError::Repository(error)
+        | fleet_application::PolicyUseCaseError::Audit(error) => ControllerError::Store(error),
+    }
+}
+
 struct ControllerAdminTokenRepository<'a> {
     store: &'a SqliteStore,
 }
@@ -3493,6 +4989,13 @@ impl AdminTokenRepository for ControllerAdminTokenRepository<'_> {
 
     fn verify_admin_token_hash(&self, token_hash: &str) -> Result<bool, Self::Error> {
         self.store.verify_admin_token_hash(token_hash)
+    }
+
+    fn find_admin_token_record(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<fleet_application::AdminTokenRecord>, Self::Error> {
+        self.store.find_admin_token_record(token_hash)
     }
 }
 
@@ -3624,6 +5127,33 @@ impl MetricsRepository for ControllerMetricsRepository<'_> {
     }
 }
 
+struct ControllerAgentLogRepository<'a> {
+    store: &'a SqliteStore,
+}
+
+impl AgentLogRepository for ControllerAgentLogRepository<'_> {
+    type Error = fleet_store::StoreError;
+
+    fn list_agent_log_chunks(
+        &self,
+        agent_id: &str,
+        limit: usize,
+        before: Option<SnapshotPageCursor>,
+    ) -> Result<Vec<fleet_application::AgentLogChunkPageRecord>, Self::Error> {
+        Ok(self
+            .store
+            .list_agent_log_chunks_page(agent_id, limit, before)?
+            .into_iter()
+            .map(|record| fleet_application::AgentLogChunkPageRecord {
+                agent_id: record.agent_id,
+                line: record.line,
+                collected_at: record.collected_at,
+                cursor: record.cursor,
+            })
+            .collect())
+    }
+}
+
 struct ControllerDriftRepository<'a> {
     store: &'a SqliteStore,
 }
@@ -3670,6 +5200,146 @@ impl DriftRepository for ControllerDriftRepository<'_> {
                 cursor: record.cursor,
             })
             .collect())
+    }
+}
+
+struct ControllerPolicyRepository<'a> {
+    store: &'a SqliteStore,
+}
+
+impl AppPolicyRepository for ControllerPolicyRepository<'_> {
+    type Error = fleet_store::StoreError;
+
+    fn save_policy_source(
+        &mut self,
+        policy_id: &str,
+        name: &str,
+        version: u32,
+        source: &str,
+    ) -> Result<(), Self::Error> {
+        self.store
+            .save_policy_source(policy_id, name, version, source)
+    }
+
+    fn list_policies(&self) -> Result<Vec<fleet_application::PolicyRecord>, Self::Error> {
+        Ok(self
+            .store
+            .list_policies()?
+            .into_iter()
+            .map(|record| fleet_application::PolicyRecord {
+                id: record.id,
+                name: record.name,
+                version: record.version,
+                source: record.source,
+                created_at: record.created_at,
+                updated_at: record.updated_at,
+            })
+            .collect())
+    }
+
+    fn find_policy(
+        &self,
+        policy_id: &str,
+    ) -> Result<Option<fleet_application::PolicyRecord>, Self::Error> {
+        Ok(self
+            .store
+            .find_policy(policy_id)?
+            .map(|record| fleet_application::PolicyRecord {
+                id: record.id,
+                name: record.name,
+                version: record.version,
+                source: record.source,
+                created_at: record.created_at,
+                updated_at: record.updated_at,
+            }))
+    }
+
+    fn assign_policy_to_agent(
+        &mut self,
+        policy_id: &str,
+        agent_id: &str,
+        assigned_at: SystemTime,
+    ) -> Result<(), Self::Error> {
+        self.store
+            .assign_policy_to_agent(policy_id, agent_id, assigned_at)
+    }
+
+    fn policies_for_agent(
+        &self,
+        agent_id: &str,
+    ) -> Result<Vec<fleet_application::PolicyAssignmentRecord>, Self::Error> {
+        Ok(self
+            .store
+            .policies_for_agent(agent_id)?
+            .into_iter()
+            .map(|record| fleet_application::PolicyAssignmentRecord {
+                policy_id: record.policy_id,
+                agent_id: record.agent_id,
+                assigned_at: record.assigned_at,
+            })
+            .collect())
+    }
+
+    fn upsert_policy_schedule(
+        &mut self,
+        policy_id: &str,
+        agent_id: &str,
+        interval: Duration,
+        next_due_at: SystemTime,
+    ) -> Result<(), Self::Error> {
+        self.store
+            .upsert_policy_schedule(policy_id, agent_id, interval, next_due_at)
+    }
+
+    fn due_scheduled_drift_checks(
+        &self,
+        now: SystemTime,
+        limit: usize,
+    ) -> Result<Vec<fleet_application::ScheduledDriftRecord>, Self::Error> {
+        Ok(self
+            .store
+            .due_scheduled_drift_checks(now, limit)?
+            .into_iter()
+            .map(|record| fleet_application::ScheduledDriftRecord {
+                policy_id: record.policy_id,
+                agent_id: record.agent_id,
+                interval_seconds: record.interval_seconds,
+                next_due_at: record.next_due_at,
+                last_checked_at: record.last_checked_at,
+            })
+            .collect())
+    }
+
+    fn record_scheduled_drift_check(
+        &mut self,
+        policy_id: &str,
+        agent_id: &str,
+        checked_at: SystemTime,
+    ) -> Result<(), Self::Error> {
+        self.store
+            .record_scheduled_drift_check(policy_id, agent_id, checked_at)
+    }
+
+    fn acknowledge_latest_drift_report(
+        &mut self,
+        agent_id: &str,
+        policy_name: &str,
+        actor: &str,
+        acknowledged_at: SystemTime,
+    ) -> Result<bool, Self::Error> {
+        self.store
+            .acknowledge_latest_drift_report(agent_id, policy_name, actor, acknowledged_at)
+    }
+
+    fn mark_latest_drift_resolved(
+        &mut self,
+        agent_id: &str,
+        policy_name: &str,
+        job_id: &str,
+        resolved_at: SystemTime,
+    ) -> Result<bool, Self::Error> {
+        self.store
+            .mark_latest_drift_resolved(agent_id, policy_name, job_id, resolved_at)
     }
 }
 
@@ -3811,13 +5481,22 @@ impl JobQueryRepository for ControllerJobQueryRepository<'_> {
                 risk: record.risk,
                 command_program: record.command_program,
                 command_args: record.command_args,
+                selector_kind: record.selector_kind,
+                selector_source: record.selector_source,
+                strategy_concurrency: record.strategy_concurrency,
+                strategy_max_failures: record.strategy_max_failures,
                 target_count: record.target_count,
                 target_agents: record
                     .target_agents
                     .into_iter()
                     .map(|target| fleet_application::JobTargetSummaryRecord {
                         agent_id: target.agent_id,
+                        agent_name: target.agent_name,
                         status: target.status,
+                        labels: target.labels,
+                        task_id: target.task_id,
+                        assignment_status: target.assignment_status,
+                        last_error: target.last_error,
                     })
                     .collect(),
                 created_at: record.created_at,
@@ -3839,13 +5518,22 @@ impl JobQueryRepository for ControllerJobQueryRepository<'_> {
                 risk: record.risk,
                 command_program: record.command_program,
                 command_args: record.command_args,
+                selector_kind: record.selector_kind,
+                selector_source: record.selector_source,
+                strategy_concurrency: record.strategy_concurrency,
+                strategy_max_failures: record.strategy_max_failures,
                 target_count: record.target_count,
                 target_agents: record
                     .target_agents
                     .into_iter()
                     .map(|target| fleet_application::JobTargetSummaryRecord {
                         agent_id: target.agent_id,
+                        agent_name: target.agent_name,
                         status: target.status,
+                        labels: target.labels,
+                        task_id: target.task_id,
+                        assignment_status: target.assignment_status,
+                        last_error: target.last_error,
                     })
                     .collect(),
                 created_at: record.created_at,
@@ -3870,12 +5558,60 @@ impl TaskAssignmentRepository for ControllerJobRepository<'_> {
     }
 }
 
+impl AppApprovalRepository for ControllerJobRepository<'_> {
+    type Error = fleet_store::StoreError;
+
+    fn insert_approval_request(
+        &mut self,
+        request: AppApprovalRequestRecord,
+    ) -> Result<(), Self::Error> {
+        self.store.insert_approval_request(request)
+    }
+
+    fn find_approval_request(
+        &self,
+        approval_id: &str,
+    ) -> Result<Option<AppApprovalRequestRecord>, Self::Error> {
+        self.store.find_approval_request(approval_id)
+    }
+
+    fn find_pending_approval_for_job(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<AppApprovalRequestRecord>, Self::Error> {
+        self.store.find_pending_approval_for_job(job_id)
+    }
+
+    fn list_approval_requests(
+        &self,
+        status: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<AppApprovalRequestRecord>, Self::Error> {
+        self.store.list_approval_requests(status, limit)
+    }
+
+    fn update_approval_request(
+        &mut self,
+        request: AppApprovalRequestRecord,
+    ) -> Result<bool, Self::Error> {
+        self.store.update_approval_request(request)
+    }
+
+    fn update_job_status_for_approval(
+        &mut self,
+        job_id: &str,
+        status: JobStatus,
+    ) -> Result<bool, Self::Error> {
+        self.store.update_job_status(job_id, status)
+    }
+}
+
 impl CommandJobRepository for ControllerJobRepository<'_> {
     fn save_command_job(
         &mut self,
         job: Job,
         task: &fleet_domain::CommandTask,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), <Self as TaskAssignmentRepository>::Error> {
         self.store.save_command_job_record(&job, task)
     }
 }
@@ -3885,7 +5621,7 @@ impl fleet_application::DriftCheckJobRepository for ControllerJobRepository<'_> 
         &mut self,
         job: Job,
         task: &fleet_domain::DriftCheckTask,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), <Self as TaskAssignmentRepository>::Error> {
         self.store.save_drift_check_job_record(&job, task)
     }
 }
@@ -3895,7 +5631,7 @@ impl RunbookJobRepository for ControllerJobRepository<'_> {
         &mut self,
         job: Job,
         task: &fleet_domain::RunbookExecutionTask,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), <Self as TaskAssignmentRepository>::Error> {
         self.store.save_runbook_job_record(&job, task)
     }
 }
@@ -3915,6 +5651,37 @@ impl DispatchAssignmentRepository for ControllerJobRepository<'_> {
 
     fn find_dispatch_agent(&self, agent_id: &AgentId) -> Result<Option<Agent>, Self::Error> {
         self.store.find_agent_by_id(agent_id.as_str())
+    }
+
+    fn dispatch_gate(&self, job_id: &JobId) -> Result<JobDispatchGate, Self::Error> {
+        let gate = self.store.job_dispatch_gate(job_id.as_str())?.unwrap_or(
+            fleet_store::JobDispatchGateRecord {
+                concurrency: 1,
+                max_failures: None,
+                active_count: 0,
+                failure_count: 0,
+            },
+        );
+        Ok(JobDispatchGate {
+            concurrency: gate.concurrency as usize,
+            max_failures: gate.max_failures,
+            active_count: gate.active_count,
+            failure_count: gate.failure_count,
+        })
+    }
+
+    fn mark_assignment_dispatched(
+        &mut self,
+        task_id: &fleet_domain::TaskId,
+        now: SystemTime,
+    ) -> Result<(), Self::Error> {
+        self.store.update_task_assignment_status(
+            task_id.as_str(),
+            AssignmentStatus::Dispatched,
+            now,
+            None,
+        )?;
+        Ok(())
     }
 
     fn mark_job_running(&mut self, job_id: &JobId, _now: SystemTime) -> Result<(), Self::Error> {
@@ -4032,12 +5799,83 @@ fn request_body(request: &str) -> &str {
     request.split("\r\n\r\n").nth(1).unwrap_or_default()
 }
 
-fn authorized(request: &str, store: &SqliteStore) -> Result<bool, ControllerError> {
+fn authenticate_admin_request(
+    request: &str,
+    store: &SqliteStore,
+) -> Result<Option<AdminRequestContext>, ControllerError> {
     let Some(token) = bearer_token(request) else {
-        return Ok(false);
+        return Ok(None);
     };
     let repo = ControllerAdminTokenRepository { store };
-    VerifyAdminToken::execute(&repo, &hash_token(token)).map_err(ControllerError::from)
+    let Some(record) = AuthenticateAdminToken::execute(&repo, &hash_token(token))
+        .map_err(ControllerError::from)?
+    else {
+        return Ok(None);
+    };
+    let role = AdminRole::parse(&record.role).ok_or_else(|| {
+        ControllerError::Store(fleet_store::StoreError::Domain(format!(
+            "invalid admin role stored for actor {}",
+            record.actor_id
+        )))
+    })?;
+    Ok(Some(AdminRequestContext {
+        actor_id: record.actor_id,
+        role,
+    }))
+}
+
+fn required_permission_for_route(method: &str, route_path: &str) -> Option<AdminPermission> {
+    match (method, route_path) {
+        ("GET", "/api/agents") => Some(AdminPermission::AgentRead),
+        ("GET", path) if path.starts_with("/api/agents/") => Some(AdminPermission::AgentRead),
+        ("PATCH", path) if path.starts_with("/api/agents/") && path.ends_with("/labels") => {
+            Some(AdminPermission::AgentWrite)
+        }
+        ("POST", path) if path.starts_with("/api/agents/") && path.ends_with("/revoke-key") => {
+            Some(AdminPermission::AgentRevoke)
+        }
+        ("POST", "/api/selectors/preview") => Some(AdminPermission::AgentRead),
+        ("GET", "/api/jobs") => Some(AdminPermission::JobRead),
+        ("GET", path) if path.starts_with("/api/jobs/") => Some(AdminPermission::JobRead),
+        ("POST", "/api/jobs/command")
+        | ("POST", "/api/jobs/drift-check")
+        | ("POST", "/api/jobs/runbook") => Some(AdminPermission::JobCreate),
+        ("POST", path) if path.starts_with("/api/jobs/") && path.ends_with("/cancel") => {
+            Some(AdminPermission::JobCancel)
+        }
+        ("GET", "/api/approvals") => Some(AdminPermission::ApprovalRead),
+        ("POST", "/api/approvals/expire") => Some(AdminPermission::JobApprove),
+        ("POST", path) if path.starts_with("/api/approvals/") && path.ends_with("/approve") => {
+            Some(AdminPermission::JobApprove)
+        }
+        ("POST", path) if path.starts_with("/api/approvals/") && path.ends_with("/reject") => {
+            Some(AdminPermission::JobApprove)
+        }
+        ("GET", "/api/enrollment-tokens") => Some(AdminPermission::EnrollmentTokenRead),
+        ("POST", "/api/enrollment-tokens") => Some(AdminPermission::EnrollmentTokenCreate),
+        ("DELETE", path) if path.starts_with("/api/enrollment-tokens/") => {
+            Some(AdminPermission::EnrollmentTokenRevoke)
+        }
+        ("GET", "/api/audit") => Some(AdminPermission::AuditRead),
+        ("GET", "/api/policies") => Some(AdminPermission::PolicyRead),
+        ("GET", path) if path.starts_with("/api/agents/") && path.ends_with("/policies") => {
+            Some(AdminPermission::PolicyRead)
+        }
+        ("GET", "/api/drift/scheduled") => Some(AdminPermission::PolicyRead),
+        ("POST", path) if path.starts_with("/api/policies") => Some(AdminPermission::PolicyWrite),
+        _ => None,
+    }
+}
+
+fn forbidden_response(permission: AdminPermission) -> String {
+    response(
+        403,
+        "application/json",
+        &format!(
+            "{{\"error\":\"forbidden\",\"required_permission\":\"{}\"}}\n",
+            permission.as_str()
+        ),
+    )
 }
 
 fn bearer_token(request: &str) -> Option<&str> {
@@ -4058,6 +5896,7 @@ fn response(status: u16, content_type: &str, body: &str) -> String {
         204 => "No Content",
         400 => "Bad Request",
         401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
         409 => "Conflict",
         _ => "Internal Server Error",
@@ -4784,6 +6623,231 @@ mod tests {
         assert!(missing.starts_with("HTTP/1.1 404"));
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ApiSurface {
+        Public,
+        Admin,
+        AgentProtocol,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct RestApiRouteContract {
+        method: &'static str,
+        path: &'static str,
+        surface: ApiSurface,
+    }
+
+    const REST_API_ROUTE_CONTRACT: &[RestApiRouteContract] = &[
+        RestApiRouteContract {
+            method: "GET",
+            path: "/healthz",
+            surface: ApiSurface::Public,
+        },
+        RestApiRouteContract {
+            method: "GET",
+            path: "/openapi.json",
+            surface: ApiSurface::Public,
+        },
+        RestApiRouteContract {
+            method: "GET",
+            path: "/swagger-ui",
+            surface: ApiSurface::Public,
+        },
+        RestApiRouteContract {
+            method: "GET",
+            path: "/api/controller/identity",
+            surface: ApiSurface::Public,
+        },
+        RestApiRouteContract {
+            method: "POST",
+            path: "/api/agents/enroll",
+            surface: ApiSurface::AgentProtocol,
+        },
+        RestApiRouteContract {
+            method: "GET",
+            path: "/api/agents",
+            surface: ApiSurface::Admin,
+        },
+        RestApiRouteContract {
+            method: "GET",
+            path: "/api/agents/{agent_id}",
+            surface: ApiSurface::Admin,
+        },
+        RestApiRouteContract {
+            method: "PATCH",
+            path: "/api/agents/{agent_id}/labels",
+            surface: ApiSurface::Admin,
+        },
+        RestApiRouteContract {
+            method: "POST",
+            path: "/api/agents/{agent_id}/revoke-key",
+            surface: ApiSurface::Admin,
+        },
+        RestApiRouteContract {
+            method: "GET",
+            path: "/api/agents/{agent_id}/facts/latest",
+            surface: ApiSurface::Admin,
+        },
+        RestApiRouteContract {
+            method: "GET",
+            path: "/api/agents/{agent_id}/facts",
+            surface: ApiSurface::Admin,
+        },
+        RestApiRouteContract {
+            method: "GET",
+            path: "/api/agents/{agent_id}/metrics/latest",
+            surface: ApiSurface::Admin,
+        },
+        RestApiRouteContract {
+            method: "GET",
+            path: "/api/agents/{agent_id}/metrics",
+            surface: ApiSurface::Admin,
+        },
+        RestApiRouteContract {
+            method: "GET",
+            path: "/api/agents/{agent_id}/logs",
+            surface: ApiSurface::Admin,
+        },
+        RestApiRouteContract {
+            method: "GET",
+            path: "/api/agents/{agent_id}/drift/latest",
+            surface: ApiSurface::Admin,
+        },
+        RestApiRouteContract {
+            method: "GET",
+            path: "/api/agents/{agent_id}/drift",
+            surface: ApiSurface::Admin,
+        },
+        RestApiRouteContract {
+            method: "GET",
+            path: "/api/agents/{agent_id}/policies",
+            surface: ApiSurface::Admin,
+        },
+        RestApiRouteContract {
+            method: "GET",
+            path: "/api/policies",
+            surface: ApiSurface::Admin,
+        },
+        RestApiRouteContract {
+            method: "POST",
+            path: "/api/policies",
+            surface: ApiSurface::Admin,
+        },
+        RestApiRouteContract {
+            method: "POST",
+            path: "/api/policies/{policy_id}/assignments",
+            surface: ApiSurface::Admin,
+        },
+        RestApiRouteContract {
+            method: "POST",
+            path: "/api/policies/{policy_id}/schedules",
+            surface: ApiSurface::Admin,
+        },
+        RestApiRouteContract {
+            method: "GET",
+            path: "/api/drift/scheduled",
+            surface: ApiSurface::Admin,
+        },
+        RestApiRouteContract {
+            method: "GET",
+            path: "/api/jobs",
+            surface: ApiSurface::Admin,
+        },
+        RestApiRouteContract {
+            method: "GET",
+            path: "/api/jobs/{job_id}",
+            surface: ApiSurface::Admin,
+        },
+        RestApiRouteContract {
+            method: "POST",
+            path: "/api/jobs/command",
+            surface: ApiSurface::Admin,
+        },
+        RestApiRouteContract {
+            method: "POST",
+            path: "/api/jobs/drift-check",
+            surface: ApiSurface::Admin,
+        },
+        RestApiRouteContract {
+            method: "POST",
+            path: "/api/jobs/runbook",
+            surface: ApiSurface::Admin,
+        },
+        RestApiRouteContract {
+            method: "POST",
+            path: "/api/jobs/{job_id}/cancel",
+            surface: ApiSurface::Admin,
+        },
+        RestApiRouteContract {
+            method: "GET",
+            path: "/api/jobs/{job_id}/output",
+            surface: ApiSurface::Admin,
+        },
+        RestApiRouteContract {
+            method: "GET",
+            path: "/api/approvals",
+            surface: ApiSurface::Admin,
+        },
+        RestApiRouteContract {
+            method: "POST",
+            path: "/api/approvals/expire",
+            surface: ApiSurface::Admin,
+        },
+        RestApiRouteContract {
+            method: "POST",
+            path: "/api/approvals/{approval_id}/approve",
+            surface: ApiSurface::Admin,
+        },
+        RestApiRouteContract {
+            method: "POST",
+            path: "/api/approvals/{approval_id}/reject",
+            surface: ApiSurface::Admin,
+        },
+        RestApiRouteContract {
+            method: "GET",
+            path: "/api/audit",
+            surface: ApiSurface::Admin,
+        },
+        RestApiRouteContract {
+            method: "GET",
+            path: "/api/enrollment-tokens",
+            surface: ApiSurface::Admin,
+        },
+        RestApiRouteContract {
+            method: "POST",
+            path: "/api/enrollment-tokens",
+            surface: ApiSurface::Admin,
+        },
+        RestApiRouteContract {
+            method: "DELETE",
+            path: "/api/enrollment-tokens/{id}",
+            surface: ApiSurface::Admin,
+        },
+        RestApiRouteContract {
+            method: "POST",
+            path: "/api/selectors/preview",
+            surface: ApiSurface::Admin,
+        },
+    ];
+
+    fn openapi_operation_pointer(path: &str, method: &str) -> String {
+        let escaped_path = path.replace('~', "~0").replace('/', "~1");
+        format!("/paths/{escaped_path}/{}", method.to_ascii_lowercase())
+    }
+
+    fn openapi_has_bearer_auth(operation: &serde_json::Value) -> bool {
+        operation
+            .get("security")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|entries| {
+                entries.iter().any(|entry| {
+                    entry
+                        .as_object()
+                        .is_some_and(|object| object.contains_key("bearerAuth"))
+                })
+            })
+    }
+
     #[test]
     fn openapi_and_swagger_ui_are_public() {
         let store = SqliteStore::in_memory().unwrap();
@@ -4801,6 +6865,17 @@ mod tests {
                 .pointer("/components/securitySchemes/bearerAuth/type")
                 .and_then(serde_json::Value::as_str),
             Some("http")
+        );
+        assert!(
+            document
+                .pointer("/components/responses/Forbidden")
+                .is_some()
+        );
+        assert_eq!(
+            document
+                .pointer("/components/schemas/ApprovalDecisionRequest/required")
+                .and_then(serde_json::Value::as_array),
+            None
         );
         assert!(document.pointer("/paths/~1healthz").is_some());
         assert!(document.pointer("/paths/~1api~1agents").is_some());
@@ -4821,6 +6896,11 @@ mod tests {
         );
         assert!(
             document
+                .pointer("/paths/~1api~1agents~1{agent_id}~1logs")
+                .is_some()
+        );
+        assert!(
+            document
                 .pointer("/paths/~1api~1agents~1{agent_id}~1drift")
                 .is_some()
         );
@@ -4835,11 +6915,335 @@ mod tests {
     }
 
     #[test]
+    fn openapi_documents_public_admin_and_agent_rest_contract() {
+        let document: serde_json::Value = serde_json::from_str(OPENAPI_JSON).unwrap();
+        let mut public_routes = 0;
+        let mut admin_routes = 0;
+        let mut agent_protocol_routes = 0;
+
+        for route in REST_API_ROUTE_CONTRACT {
+            let pointer = openapi_operation_pointer(route.path, route.method);
+            let operation = document.pointer(&pointer).unwrap_or_else(|| {
+                panic!(
+                    "OpenAPI must document {} {} at pointer {pointer}",
+                    route.method, route.path
+                )
+            });
+
+            match route.surface {
+                ApiSurface::Public => {
+                    public_routes += 1;
+                    assert!(
+                        !openapi_has_bearer_auth(operation),
+                        "public route must not require bearer auth: {} {}",
+                        route.method,
+                        route.path
+                    );
+                }
+                ApiSurface::Admin => {
+                    admin_routes += 1;
+                    assert!(
+                        openapi_has_bearer_auth(operation),
+                        "admin route must require bearer auth: {} {}",
+                        route.method,
+                        route.path
+                    );
+                }
+                ApiSurface::AgentProtocol => {
+                    agent_protocol_routes += 1;
+                    assert!(
+                        !openapi_has_bearer_auth(operation),
+                        "agent protocol route must not use admin bearer auth: {} {}",
+                        route.method,
+                        route.path
+                    );
+                }
+            }
+        }
+
+        assert!(public_routes >= 4);
+        assert!(admin_routes >= 30);
+        assert_eq!(agent_protocol_routes, 1);
+        assert!(
+            document.pointer("/paths/~1api~1agents~1ws").is_none(),
+            "WebSocket protocol is documented in docs/protocol.md, not REST OpenAPI"
+        );
+        assert!(
+            document.pointer("/paths/~1admin").is_none(),
+            "Web Admin static assets are not public REST API"
+        );
+    }
+
+    #[test]
+    fn openapi_documents_common_error_latest_and_paging_contracts() {
+        let document: serde_json::Value = serde_json::from_str(OPENAPI_JSON).unwrap();
+
+        assert_eq!(
+            document.pointer("/components/schemas/ErrorResponse/required/0"),
+            Some(&serde_json::Value::String("error".to_owned()))
+        );
+        assert!(
+            document
+                .pointer("/components/responses/Unauthorized/content/application~1json/schema/$ref")
+                .is_some()
+        );
+        assert!(
+            document
+                .pointer("/components/responses/Forbidden/content/application~1json/schema/$ref")
+                .is_some()
+        );
+        assert!(
+            document
+                .pointer("/components/responses/NotFound/content/application~1json/schema/$ref")
+                .is_some()
+        );
+        assert!(
+            document
+                .pointer("/components/responses/Conflict/content/application~1json/schema/$ref")
+                .is_some()
+        );
+
+        for path in [
+            "/api/agents/{agent_id}/facts/latest",
+            "/api/agents/{agent_id}/metrics/latest",
+            "/api/agents/{agent_id}/drift/latest",
+        ] {
+            let pointer = format!(
+                "{}/responses/200/content/application~1json/schema/anyOf/1/type",
+                openapi_operation_pointer(path, "GET")
+            );
+            assert_eq!(
+                document.pointer(&pointer),
+                Some(&serde_json::Value::String("null".to_owned())),
+                "{path} latest response must document empty latest result as 200 null"
+            );
+        }
+
+        for path in [
+            "/api/agents/{agent_id}/facts",
+            "/api/agents/{agent_id}/metrics",
+            "/api/agents/{agent_id}/logs",
+            "/api/agents/{agent_id}/drift",
+        ] {
+            let operation_pointer = openapi_operation_pointer(path, "GET");
+            let parameters = document
+                .pointer(&format!("{operation_pointer}/parameters"))
+                .and_then(serde_json::Value::as_array)
+                .unwrap_or_else(|| panic!("{path} must document query parameters"));
+            assert!(
+                parameters.iter().any(|parameter| {
+                    parameter.get("name").and_then(serde_json::Value::as_str) == Some("limit")
+                        && parameter
+                            .pointer("/schema/minimum")
+                            .and_then(serde_json::Value::as_i64)
+                            == Some(1)
+                        && parameter
+                            .pointer("/schema/maximum")
+                            .and_then(serde_json::Value::as_i64)
+                            == Some(500)
+                }),
+                "{path} must document bounded limit paging"
+            );
+            assert!(
+                parameters.iter().any(|parameter| {
+                    parameter.get("name").and_then(serde_json::Value::as_str) == Some("before")
+                }),
+                "{path} must document cursor paging"
+            );
+        }
+
+        for schema in [
+            "FactsSnapshotPage",
+            "MetricsSnapshotPage",
+            "AgentLogChunkPage",
+            "DriftReportPage",
+        ] {
+            assert_eq!(
+                document.pointer(&format!("/components/schemas/{schema}/required/0")),
+                Some(&serde_json::Value::String("items".to_owned()))
+            );
+            assert_eq!(
+                document.pointer(&format!("/components/schemas/{schema}/required/1")),
+                Some(&serde_json::Value::String("next_cursor".to_owned()))
+            );
+        }
+
+        for (path, method, field) in [
+            ("/api/agents/enroll", "POST", "token"),
+            ("/api/enrollment-tokens", "POST", "labels"),
+            ("/api/jobs/command", "POST", "job_id"),
+            ("/api/jobs/runbook", "POST", "runbook_document"),
+            ("/api/jobs/drift-check", "POST", "policy_document"),
+            ("/api/policies", "POST", "source"),
+            ("/api/policies/{policy_id}/assignments", "POST", "agent_id"),
+            (
+                "/api/policies/{policy_id}/schedules",
+                "POST",
+                "interval_seconds",
+            ),
+        ] {
+            let pointer = format!(
+                "{}/requestBody/content/application~1json/example/{field}",
+                openapi_operation_pointer(path, method)
+            );
+            assert!(
+                document.pointer(&pointer).is_some(),
+                "{method} {path} must document request example field {field}"
+            );
+        }
+    }
+
+    #[test]
     fn protected_api_requires_admin_token() {
         let store = SqliteStore::in_memory().unwrap();
         let response =
             route_request("POST /api/enrollment-tokens HTTP/1.1\r\n\r\n", &store).unwrap();
         assert!(response.starts_with("HTTP/1.1 401"));
+        assert!(response.contains("\"error\":\"unauthorized\""));
+    }
+
+    #[test]
+    fn latest_optional_resources_return_null_instead_of_not_found() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .insert_admin_token_hash(&hash_token("admin-token"))
+            .unwrap();
+
+        for path in [
+            "/api/agents/agent-missing/facts/latest",
+            "/api/agents/agent-missing/metrics/latest",
+            "/api/agents/agent-missing/drift/latest",
+        ] {
+            let response = route_request(
+                &format!("GET {path} HTTP/1.1\r\nAuthorization: Bearer admin-token\r\n\r\n"),
+                &store,
+            )
+            .unwrap();
+            assert!(response.starts_with("HTTP/1.1 200"), "{path}");
+            assert_eq!(response.split("\r\n\r\n").nth(1), Some("null\n"));
+        }
+
+        let missing_agent = route_request(
+            "GET /api/agents/agent-missing HTTP/1.1\r\nAuthorization: Bearer admin-token\r\n\r\n",
+            &store,
+        )
+        .unwrap();
+        assert!(missing_agent.starts_with("HTTP/1.1 404"));
+        assert!(missing_agent.contains("\"error\":\"not_found\""));
+    }
+
+    #[test]
+    fn admin_token_maps_to_bootstrap_actor() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .insert_admin_token_hash(&hash_token("admin-token"))
+            .unwrap();
+
+        let context = authenticate_admin_request(
+            "GET /api/agents HTTP/1.1\r\nAuthorization: Bearer admin-token\r\n\r\n",
+            &store,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(context.actor_id, "bootstrap-admin");
+        assert_eq!(context.role, AdminRole::Owner);
+        assert!(context.allows(AdminPermission::AgentRevoke));
+        assert!(context.allows(AdminPermission::EnrollmentTokenCreate));
+    }
+
+    #[test]
+    fn permission_matrix_allows_operator_execution_but_denies_agent_revoke() {
+        let operator = AdminRequestContext {
+            actor_id: "operator-1".to_owned(),
+            role: AdminRole::Operator,
+        };
+        let viewer = AdminRequestContext {
+            actor_id: "viewer-1".to_owned(),
+            role: AdminRole::Viewer,
+        };
+
+        assert!(operator.allows(AdminPermission::JobCreate));
+        assert!(operator.allows(AdminPermission::JobApprove));
+        assert!(operator.allows(AdminPermission::JobCancel));
+        assert!(!operator.allows(AdminPermission::AgentRevoke));
+        assert!(!operator.allows(AdminPermission::EnrollmentTokenCreate));
+        assert!(viewer.allows(AdminPermission::AgentRead));
+        assert!(viewer.allows(AdminPermission::JobRead));
+        assert!(!viewer.allows(AdminPermission::JobCreate));
+        assert!(!viewer.allows(AdminPermission::JobApprove));
+    }
+
+    #[test]
+    fn forbidden_response_contract_names_required_permission() {
+        let response = forbidden_response(AdminPermission::JobApprove);
+
+        assert!(response.starts_with("HTTP/1.1 403 Forbidden"));
+        assert!(response.contains("\"error\":\"forbidden\""));
+        assert!(response.contains("\"required_permission\":\"job_approve\""));
+    }
+
+    #[test]
+    fn approval_approve_requires_permission() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .insert_admin_token_hash_with_identity(
+                &hash_token("viewer-token"),
+                "viewer-1",
+                "viewer",
+            )
+            .unwrap();
+
+        let response = route_request(
+            "POST /api/approvals/approval-1/approve HTTP/1.1\r\nAuthorization: Bearer viewer-token\r\nContent-Length: 2\r\n\r\n{}",
+            &store,
+        )
+        .unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 403"));
+        assert!(response.contains("\"required_permission\":\"job_approve\""));
+    }
+
+    #[test]
+    fn enrollment_token_create_requires_permission() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .insert_admin_token_hash_with_identity(
+                &hash_token("viewer-token"),
+                "viewer-1",
+                "viewer",
+            )
+            .unwrap();
+
+        let response = route_request(
+            "POST /api/enrollment-tokens HTTP/1.1\r\nAuthorization: Bearer viewer-token\r\n\r\n",
+            &store,
+        )
+        .unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 403"));
+        assert!(response.contains("\"required_permission\":\"enrollment_token_create\""));
+    }
+
+    #[test]
+    fn agent_revoke_requires_permission() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .insert_admin_token_hash_with_identity(
+                &hash_token("viewer-token"),
+                "viewer-1",
+                "viewer",
+            )
+            .unwrap();
+
+        let response = route_request(
+            "POST /api/agents/agent-1/revoke-key HTTP/1.1\r\nAuthorization: Bearer viewer-token\r\n\r\n",
+            &store,
+        )
+        .unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 403"));
+        assert!(response.contains("\"required_permission\":\"agent_revoke\""));
     }
 
     #[test]
@@ -4858,6 +7262,34 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 201"));
         assert!(response.contains("\"token\":\"enroll-"));
         assert_eq!(store.list_enrollment_tokens().unwrap().len(), 1);
+        let audits = store
+            .list_audit_events_by_category(AuditCategory::Enrollment, 10)
+            .unwrap();
+        assert_eq!(audits[0].actor.as_str(), "bootstrap-admin");
+    }
+
+    #[test]
+    fn custom_admin_token_actor_is_used_in_audit() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .insert_admin_token_hash_with_identity(
+                &hash_token("admin-token"),
+                "ops-admin-1",
+                "admin",
+            )
+            .unwrap();
+
+        let response = route_request(
+            "POST /api/enrollment-tokens HTTP/1.1\r\nAuthorization: Bearer admin-token\r\n\r\n",
+            &store,
+        )
+        .unwrap();
+        let audits = store
+            .list_audit_events_by_category(AuditCategory::Enrollment, 10)
+            .unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 201"));
+        assert_eq!(audits[0].actor.as_str(), "ops-admin-1");
     }
 
     #[test]
@@ -4962,6 +7394,8 @@ mod tests {
             job_id: "job-1".to_owned(),
             target_agent_ids: vec!["agent-1".to_owned()],
             selector: None,
+            match_labels: None,
+            strategy: None,
             program: "uptime".to_owned(),
             args: Vec::new(),
             timeout_seconds: 30,
@@ -4987,11 +7421,11 @@ mod tests {
         assert!(response.contains("\"assignment_count\":1"));
         assert_eq!(audits.len(), 1);
         assert_eq!(audits[0].action, "job_created");
-        assert_eq!(audits[0].actor.as_str(), "operator-1");
+        assert_eq!(audits[0].actor.as_str(), "bootstrap-admin");
         assert_eq!(
             audits[0].value,
             AuditValue::Plain(
-                "confirmed_high_risk=true,confirmed_by=operator-1,target_count=1".to_owned()
+                "confirmed_high_risk=true,confirmed_by=bootstrap-admin,target_count=1".to_owned()
             )
         );
     }
@@ -5019,6 +7453,19 @@ mod tests {
             .try_recv()
             .expect("task assignment should be queued");
         let status = store.find_job_status_value("job-1").unwrap().unwrap();
+        let task_id = match &sent {
+            AgentSessionOutboundMessage::Wire(message) => match &message.payload {
+                fleet_protocol::WirePayload::TaskAssignment { envelope, .. } => {
+                    envelope.task_id.clone()
+                }
+                _ => panic!("expected task assignment"),
+            },
+            _ => panic!("expected task assignment"),
+        };
+        let assignment_status = store
+            .find_task_assignment_status(&task_id)
+            .unwrap()
+            .unwrap();
         let audits = store
             .list_audit_events_by_category(AuditCategory::Job, 10)
             .unwrap();
@@ -5030,6 +7477,7 @@ mod tests {
                 if matches!(&message.payload, fleet_protocol::WirePayload::TaskAssignment { .. })
         ));
         assert_eq!(status, "running");
+        assert_eq!(assignment_status, "dispatched");
         assert!(audits.iter().any(|event| event.action == "job_created"));
         assert!(audits.iter().any(|event| event.action == "task_dispatched"));
     }
@@ -5075,6 +7523,7 @@ mod tests {
             &sessions,
         )
         .unwrap();
+        approve_pending_job_with_sessions(&store, &sessions, "job-runbook");
 
         assert!(runbook_response.starts_with("HTTP/1.1 201"));
         assert!(drift_response.starts_with("HTTP/1.1 201"));
@@ -5137,6 +7586,165 @@ mod tests {
         assert_eq!(status, "queued");
         assert_eq!(pending.len(), 1);
         assert!(!audits.iter().any(|event| event.action == "task_dispatched"));
+    }
+
+    #[test]
+    fn fanout_command_job_creates_assignment_per_target_snapshot() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .insert_admin_token_hash(&hash_token("admin-token"))
+            .unwrap();
+        save_test_agent_with_labels(&store, "agent-1", vec![("role", "web")]);
+        save_test_agent_with_labels(&store, "agent-2", vec![("role", "web")]);
+        let sessions = Arc::new(Mutex::new(AgentSessionRegistry::default()));
+        let request = command_selector_job_request(
+            "job-fanout",
+            "label:role=web",
+            Some(JobStrategyRequest {
+                concurrency: Some(2),
+                max_failures: Some(1),
+            }),
+        );
+
+        let response = route_request_with_sessions(&request, &store, &sessions).unwrap();
+        let summary = store.find_job_summary("job-fanout").unwrap().unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 201"));
+        assert!(response.contains("\"target_count\":2"));
+        assert!(response.contains("\"assignment_count\":2"));
+        assert_eq!(summary.target_count, 2);
+        assert_eq!(summary.strategy_concurrency, 2);
+        assert_eq!(summary.strategy_max_failures, Some(1));
+        assert_eq!(
+            summary
+                .target_agents
+                .iter()
+                .filter(|target| target.assignment_status.as_deref() == Some("queued"))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn fanout_concurrency_one_dispatches_only_one_active_target() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .insert_admin_token_hash(&hash_token("admin-token"))
+            .unwrap();
+        save_test_agent_with_labels(&store, "agent-1", vec![("role", "web")]);
+        save_test_agent_with_labels(&store, "agent-2", vec![("role", "web")]);
+        let (handle_1, mut receiver_1) = session_handle(
+            "agent-1",
+            "conn-1",
+            SystemTime::UNIX_EPOCH,
+            vec!["persistent_session".to_owned()],
+            Some(64),
+        );
+        let (handle_2, mut receiver_2) = session_handle(
+            "agent-2",
+            "conn-2",
+            SystemTime::UNIX_EPOCH,
+            vec!["persistent_session".to_owned()],
+            Some(64),
+        );
+        let sessions = Arc::new(Mutex::new(AgentSessionRegistry::default()));
+        {
+            let mut registry = sessions.lock().unwrap();
+            registry.register(handle_1);
+            registry.register(handle_2);
+        }
+        let request = command_selector_job_request(
+            "job-concurrency-one",
+            "label:role=web",
+            Some(JobStrategyRequest {
+                concurrency: Some(1),
+                max_failures: None,
+            }),
+        );
+
+        let response = route_request_with_sessions(&request, &store, &sessions).unwrap();
+        approve_pending_job_with_sessions(&store, &sessions, "job-concurrency-one");
+        let first = receiver_1.try_recv().ok();
+        let second = receiver_2.try_recv().ok();
+        let delivered_count = usize::from(first.is_some()) + usize::from(second.is_some());
+        let summary = store
+            .find_job_summary("job-concurrency-one")
+            .unwrap()
+            .unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 201"));
+        assert_eq!(delivered_count, 1);
+        assert_eq!(
+            summary
+                .target_agents
+                .iter()
+                .filter(|target| target.assignment_status.as_deref() == Some("dispatched"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            summary
+                .target_agents
+                .iter()
+                .filter(|target| target.assignment_status.as_deref() == Some("queued"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn fanout_concurrency_n_dispatches_at_most_n_targets() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .insert_admin_token_hash(&hash_token("admin-token"))
+            .unwrap();
+        for agent_id in ["agent-1", "agent-2", "agent-3"] {
+            save_test_agent_with_labels(&store, agent_id, vec![("role", "web")]);
+        }
+        let sessions = Arc::new(Mutex::new(AgentSessionRegistry::default()));
+        let mut receivers = Vec::new();
+        for agent_id in ["agent-1", "agent-2", "agent-3"] {
+            let (handle, receiver) = session_handle(
+                agent_id,
+                &format!("conn-{agent_id}"),
+                SystemTime::UNIX_EPOCH,
+                vec!["persistent_session".to_owned()],
+                Some(64),
+            );
+            sessions.lock().unwrap().register(handle);
+            receivers.push(receiver);
+        }
+        let request = command_selector_job_request(
+            "job-concurrency-two",
+            "label:role=web",
+            Some(JobStrategyRequest {
+                concurrency: Some(2),
+                max_failures: None,
+            }),
+        );
+
+        let response = route_request_with_sessions(&request, &store, &sessions).unwrap();
+        approve_pending_job_with_sessions(&store, &sessions, "job-concurrency-two");
+        let mut delivered_count = 0;
+        for receiver in &mut receivers {
+            if receiver.try_recv().is_ok() {
+                delivered_count += 1;
+            }
+        }
+
+        assert!(response.starts_with("HTTP/1.1 201"));
+        assert_eq!(delivered_count, 2);
+        assert_eq!(
+            store
+                .find_job_summary("job-concurrency-two")
+                .unwrap()
+                .unwrap()
+                .target_agents
+                .iter()
+                .filter(|target| target.assignment_status.as_deref() == Some("queued"))
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -5265,7 +7873,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_does_not_bypass_high_risk_confirmation() {
+    fn dispatch_does_not_bypass_pending_approval() {
         let store = SqliteStore::in_memory().unwrap();
         store
             .insert_admin_token_hash(&hash_token("admin-token"))
@@ -5281,21 +7889,226 @@ mod tests {
         let sessions = Arc::new(Mutex::new(AgentSessionRegistry::default()));
         sessions.lock().unwrap().register(handle);
 
-        let response = route_request_with_sessions(
-            &command_job_request("job-needs-confirmation", "agent-1", false),
+        let body = serde_json::to_string(&CreateCommandJobRequest {
+            job_id: "job-needs-approval".to_owned(),
+            target_agent_ids: vec!["agent-1".to_owned()],
+            selector: None,
+            match_labels: None,
+            strategy: None,
+            program: "bash".to_owned(),
+            args: vec!["-lc".to_owned(), "uptime".to_owned()],
+            timeout_seconds: 30,
+            confirmed_high_risk: false,
+            confirmed_by: "operator-1".to_owned(),
+            expires_in_seconds: 60,
+            nonce_prefix: Some("nonce-needs-approval".to_owned()),
+        })
+        .unwrap();
+        let request = format!(
+            "POST /api/jobs/command HTTP/1.1\r\nAuthorization: Bearer admin-token\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+
+        let response = route_request_with_sessions(&request, &store, &sessions).unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 201"));
+        assert!(response.contains("\"status\":\"pending_approval\""));
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(
+            store
+                .find_job_status_value("job-needs-approval")
+                .unwrap()
+                .unwrap(),
+            "pending_approval"
+        );
+        assert!(
+            store
+                .find_pending_approval_for_job("job-needs-approval")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn admin_can_list_and_approve_pending_approval_then_dispatch() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .insert_admin_token_hash(&hash_token("admin-token"))
+            .unwrap();
+        save_test_agent(&store, "agent-1");
+        let (handle, mut receiver) = session_handle(
+            "agent-1",
+            "conn-1",
+            SystemTime::UNIX_EPOCH,
+            vec!["persistent_session".to_owned()],
+            Some(64),
+        );
+        let sessions = Arc::new(Mutex::new(AgentSessionRegistry::default()));
+        sessions.lock().unwrap().register(handle);
+
+        let create_response = route_request_with_sessions(
+            &high_risk_command_job_request("job-approval", "agent-1", "bash"),
             &store,
             &sessions,
         )
         .unwrap();
+        let list_response = route_request(
+            "GET /api/approvals?status=pending HTTP/1.1\r\nAuthorization: Bearer admin-token\r\n\r\n",
+            &store,
+        )
+        .unwrap();
+        let approval = store
+            .find_pending_approval_for_job("job-approval")
+            .unwrap()
+            .expect("pending approval should exist");
+        let body = "{\"reason\":\"approved maintenance window\"}".to_owned();
+        let approve_request = format!(
+            "POST /api/approvals/{}/approve HTTP/1.1\r\nAuthorization: Bearer admin-token\r\nContent-Length: {}\r\n\r\n{}",
+            approval.id,
+            body.len(),
+            body
+        );
 
-        assert!(response.starts_with("HTTP/1.1 400"));
-        assert!(response.contains("high-risk task requires approval"));
-        assert!(receiver.try_recv().is_err());
-        assert!(
+        let approve_response =
+            route_request_with_sessions(&approve_request, &store, &sessions).unwrap();
+        let sent = receiver
+            .try_recv()
+            .expect("approved assignment should dispatch over active session");
+        let audits = store
+            .list_audit_events_by_category(AuditCategory::Approval, 10)
+            .unwrap();
+
+        assert!(create_response.starts_with("HTTP/1.1 201"));
+        assert!(create_response.contains("\"status\":\"pending_approval\""));
+        assert!(list_response.starts_with("HTTP/1.1 200"));
+        assert!(list_response.contains("\"status\":\"pending\""));
+        assert!(approve_response.starts_with("HTTP/1.1 200"));
+        assert!(approve_response.contains("\"status\":\"approved\""));
+        assert!(approve_response.contains("\"approver\":\"bootstrap-admin\""));
+        assert!(matches!(
+            sent,
+            AgentSessionOutboundMessage::Wire(message)
+                if matches!(&message.payload, fleet_protocol::WirePayload::TaskAssignment { .. })
+        ));
+        assert_eq!(
             store
-                .find_job_status_value("job-needs-confirmation")
+                .find_job_status_value("job-approval")
                 .unwrap()
-                .is_none()
+                .unwrap(),
+            "running"
+        );
+        assert!(
+            audits
+                .iter()
+                .any(|event| event.action == "approval_requested")
+        );
+        assert!(
+            audits
+                .iter()
+                .any(|event| event.action == "approval_approved"
+                    && event.actor.as_str() == "bootstrap-admin")
+        );
+    }
+
+    #[test]
+    fn admin_can_reject_pending_approval_without_dispatch() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .insert_admin_token_hash(&hash_token("admin-token"))
+            .unwrap();
+        save_test_agent(&store, "agent-1");
+        route_request(
+            &high_risk_command_job_request("job-reject-approval", "agent-1", "bash"),
+            &store,
+        )
+        .unwrap();
+        let approval = store
+            .find_pending_approval_for_job("job-reject-approval")
+            .unwrap()
+            .expect("pending approval should exist");
+        let body = serde_json::to_string(&ApprovalDecisionRequest {
+            actor: "manager-1".to_owned(),
+            reason: "outside maintenance window".to_owned(),
+        })
+        .unwrap();
+        let reject_request = format!(
+            "POST /api/approvals/{}/reject HTTP/1.1\r\nAuthorization: Bearer admin-token\r\nContent-Length: {}\r\n\r\n{}",
+            approval.id,
+            body.len(),
+            body
+        );
+
+        let response = route_request(&reject_request, &store).unwrap();
+        let pending = store
+            .list_pending_command_assignments_for_agent("agent-1")
+            .unwrap();
+        let audits = store
+            .list_audit_events_by_category(AuditCategory::Approval, 10)
+            .unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 200"));
+        assert!(response.contains("\"status\":\"rejected\""));
+        assert_eq!(
+            store
+                .find_job_status_value("job-reject-approval")
+                .unwrap()
+                .unwrap(),
+            "failed"
+        );
+        assert!(pending.is_empty());
+        assert!(
+            audits
+                .iter()
+                .any(|event| event.action == "approval_rejected"
+                    && event.actor.as_str() == "bootstrap-admin")
+        );
+    }
+
+    #[test]
+    fn admin_can_expire_due_approval_requests() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .insert_admin_token_hash(&hash_token("admin-token"))
+            .unwrap();
+        save_test_job(&store, "job-expire-approval");
+        store
+            .insert_approval_request(AppApprovalRequestRecord {
+                id: "approval-expired".to_owned(),
+                job_id: "job-expire-approval".to_owned(),
+                requester: "admin".to_owned(),
+                approver: None,
+                reason: "approval required".to_owned(),
+                status: "pending".to_owned(),
+                expires_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+                created_at: SystemTime::UNIX_EPOCH,
+                decided_at: None,
+            })
+            .unwrap();
+
+        let response = route_request(
+            "POST /api/approvals/expire HTTP/1.1\r\nAuthorization: Bearer admin-token\r\n\r\n",
+            &store,
+        )
+        .unwrap();
+        let audits = store
+            .list_audit_events_by_category(AuditCategory::Approval, 10)
+            .unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 200"));
+        assert!(response.contains("\"expired_count\":1"));
+        assert!(response.contains("\"status\":\"expired\""));
+        assert_eq!(
+            store
+                .find_job_status_value("job-expire-approval")
+                .unwrap()
+                .unwrap(),
+            "expired"
+        );
+        assert!(
+            audits
+                .iter()
+                .any(|event| event.action == "approval_expired")
         );
     }
 
@@ -5310,6 +8123,8 @@ mod tests {
             job_id: "job-runbook-1".to_owned(),
             target_agent_ids: vec!["agent-1".to_owned()],
             selector: None,
+            match_labels: None,
+            strategy: None,
             runbook_document: r#"
 apiVersion: fleet.sponzey.dev/v1alpha1
 kind: Runbook
@@ -5342,21 +8157,80 @@ spec:
         let assignments = store
             .list_pending_runbook_assignments_for_agent("agent-1")
             .unwrap();
-        let audits = store
+        let approval_audits = store
+            .list_audit_events_by_category(AuditCategory::Approval, 10)
+            .unwrap();
+        let job_audits = store
             .list_audit_events_by_category(AuditCategory::Job, 10)
             .unwrap();
 
         assert!(response.starts_with("HTTP/1.1 201"));
         assert!(response.contains("\"target_count\":1"));
-        assert_eq!(assignments.len(), 1);
-        assert!(
-            assignments[0]
-                .runbook
-                .runbook_document()
-                .contains("kind: Runbook")
+        assert!(response.contains("\"status\":\"pending_approval\""));
+        assert_eq!(assignments.len(), 0);
+        assert_eq!(
+            store
+                .find_job_status_value("job-runbook-1")
+                .unwrap()
+                .unwrap(),
+            "pending_approval"
         );
-        assert_eq!(audits.len(), 1);
-        assert_eq!(audits[0].action, "runbook_job_created");
+        assert_eq!(approval_audits.len(), 1);
+        assert_eq!(approval_audits[0].action, "approval_requested");
+        assert_eq!(job_audits.len(), 1);
+        assert_eq!(job_audits[0].action, "runbook_job_created");
+    }
+
+    #[test]
+    fn runbook_job_uses_document_selector_when_request_has_no_target() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .insert_admin_token_hash(&hash_token("admin-token"))
+            .unwrap();
+        save_test_agent_with_labels(&store, "agent-web", vec![("role", "web")]);
+        save_test_agent_with_labels(&store, "agent-db", vec![("role", "db")]);
+        let body = serde_json::to_string(&CreateRunbookJobRequest {
+            job_id: "job-runbook-selector".to_owned(),
+            target_agent_ids: Vec::new(),
+            selector: None,
+            match_labels: None,
+            strategy: None,
+            runbook_document: r#"
+apiVersion: fleet.sponzey.dev/v1alpha1
+kind: Runbook
+name: nginx-basic
+matchLabels:
+  role: web
+steps:
+  - id: nginx-package
+    package:
+      name: nginx
+      state: present
+"#
+            .to_owned(),
+            timeout_seconds: 30,
+            confirmed_high_risk: true,
+            confirmed_by: "operator-1".to_owned(),
+            expires_in_seconds: 60,
+            nonce_prefix: Some("nonce-runbook-selector".to_owned()),
+        })
+        .unwrap();
+        let request = format!(
+            "POST /api/jobs/runbook HTTP/1.1\r\nAuthorization: Bearer admin-token\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+
+        let response = route_request(&request, &store).unwrap();
+        let summary = store
+            .find_job_summary("job-runbook-selector")
+            .unwrap()
+            .unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 201"));
+        assert!(response.contains("\"target_count\":1"));
+        assert_eq!(summary.selector_kind, "runbook_matchLabels");
+        assert!(summary.selector_source.contains("\"role\":\"web\""));
     }
 
     #[test]
@@ -5370,6 +8244,8 @@ spec:
             job_id: "job-1".to_owned(),
             target_agent_ids: Vec::new(),
             selector: Some("role=web".to_owned()),
+            match_labels: None,
+            strategy: None,
             program: "uptime".to_owned(),
             args: Vec::new(),
             timeout_seconds: 30,
@@ -5399,6 +8275,87 @@ spec:
     }
 
     #[test]
+    fn selector_preview_reports_matches_and_warnings() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .insert_admin_token_hash(&hash_token("admin-token"))
+            .unwrap();
+        save_test_agent_with_labels(&store, "agent-enabled", vec![("role", "web")]);
+        save_disabled_test_agent_with_labels(&store, "agent-disabled", vec![("role", "web")]);
+        let body = serde_json::to_string(&SelectorPreviewRequest {
+            selector: Some("label:role=web".to_owned()),
+            match_labels: None,
+        })
+        .unwrap();
+        let request = format!(
+            "POST /api/selectors/preview HTTP/1.1\r\nAuthorization: Bearer admin-token\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+
+        let response = route_request(&request, &store).unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 200"));
+        assert!(response.contains("\"matched_count\":2"));
+        assert!(response.contains("\"selected_count\":1"));
+        assert!(response.contains("\"disabled_agents_excluded\""));
+        assert!(response.contains("\"selected_for_dispatch\":false"));
+    }
+
+    #[test]
+    fn command_job_can_target_agents_by_match_labels_selector() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .insert_admin_token_hash(&hash_token("admin-token"))
+            .unwrap();
+        save_test_agent_with_labels(&store, "agent-1", vec![("role", "web"), ("env", "prod")]);
+        save_test_agent_with_labels(&store, "agent-2", vec![("role", "web"), ("env", "dev")]);
+        let mut match_labels = BTreeMap::new();
+        match_labels.insert("role".to_owned(), "web".to_owned());
+        match_labels.insert("env".to_owned(), "prod".to_owned());
+        let body = serde_json::to_string(&CreateCommandJobRequest {
+            job_id: "job-match-labels".to_owned(),
+            target_agent_ids: Vec::new(),
+            selector: None,
+            match_labels: Some(match_labels),
+            strategy: None,
+            program: "uptime".to_owned(),
+            args: Vec::new(),
+            timeout_seconds: 30,
+            confirmed_high_risk: true,
+            confirmed_by: "operator-1".to_owned(),
+            expires_in_seconds: 60,
+            nonce_prefix: Some("nonce-match-labels".to_owned()),
+        })
+        .unwrap();
+        let request = format!(
+            "POST /api/jobs/command HTTP/1.1\r\nAuthorization: Bearer admin-token\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+
+        let response = route_request(&request, &store).unwrap();
+        let summary = store.find_job_summary("job-match-labels").unwrap().unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 201"));
+        assert_eq!(summary.selector_kind, "matchLabels");
+        assert!(summary.selector_source.contains("\"env\":\"prod\""));
+        assert_eq!(
+            store
+                .list_pending_command_assignments_for_agent("agent-1")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .list_pending_command_assignments_for_agent("agent-2")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn admin_can_create_drift_check_job_with_signed_assignment() {
         let store = SqliteStore::in_memory().unwrap();
         store
@@ -5424,6 +8381,8 @@ spec:
             job_id: "drift-job-1".to_owned(),
             target_agent_ids: Vec::new(),
             selector: Some("role=web".to_owned()),
+            match_labels: None,
+            strategy: None,
             policy_document: policy_document.to_owned(),
             timeout_seconds: 30,
             created_by: "operator-1".to_owned(),
@@ -5458,7 +8417,7 @@ spec:
         );
         assert_eq!(audits.len(), 1);
         assert_eq!(audits[0].action, "drift_check_job_created");
-        assert_eq!(audits[0].actor.as_str(), "operator-1");
+        assert_eq!(audits[0].actor.as_str(), "bootstrap-admin");
     }
 
     #[test]
@@ -5473,6 +8432,8 @@ spec:
             job_id: "job-1".to_owned(),
             target_agent_ids: Vec::new(),
             selector: Some("role=web".to_owned()),
+            match_labels: None,
+            strategy: None,
             program: "uptime".to_owned(),
             args: Vec::new(),
             timeout_seconds: 30,
@@ -5508,7 +8469,7 @@ spec:
     }
 
     #[test]
-    fn command_job_requires_high_risk_confirmation() {
+    fn safe_command_without_confirmation_queues_normally() {
         let store = SqliteStore::in_memory().unwrap();
         store
             .insert_admin_token_hash(&hash_token("admin-token"))
@@ -5518,6 +8479,8 @@ spec:
             job_id: "job-1".to_owned(),
             target_agent_ids: vec!["agent-1".to_owned()],
             selector: None,
+            match_labels: None,
+            strategy: None,
             program: "uptime".to_owned(),
             args: Vec::new(),
             timeout_seconds: 30,
@@ -5535,8 +8498,9 @@ spec:
 
         let response = route_request(&request, &store).unwrap();
 
-        assert!(response.starts_with("HTTP/1.1 400"));
-        assert!(response.contains("high-risk task requires approval"));
+        assert!(response.starts_with("HTTP/1.1 201"));
+        assert!(response.contains("\"status\":\"queued\""));
+        assert!(response.contains("\"approval_request_id\":null"));
     }
 
     #[test]
@@ -6013,6 +8977,7 @@ spec:
         let store = SqliteStore::in_memory().unwrap();
         save_test_agent(&store, "agent-1");
         save_test_job(&store, "job-1");
+        save_test_assignment(&store, "job-1", "task-1", "agent-1");
         let message = fleet_protocol::WireMessage::new(
             "msg-result",
             "corr-result",
@@ -6022,18 +8987,594 @@ spec:
                 job_id: "job-1".to_owned(),
                 task_id: "task-1".to_owned(),
                 exit_code: 0,
+                status: Some(fleet_protocol::TaskResultStatus::Succeeded),
+                reason: String::new(),
             },
         );
 
         let finished = handle_agent_task_data_message(&store, "agent-1", message).unwrap();
         let status = store.find_job_status_value("job-1").unwrap().unwrap();
+        let assignment_status = store
+            .find_task_assignment_status("task-1")
+            .unwrap()
+            .unwrap();
         let audits = store
             .list_audit_events_by_category(AuditCategory::Job, 10)
             .unwrap();
 
         assert!(!finished);
         assert_eq!(status, "success");
+        assert_eq!(assignment_status, "succeeded");
         assert_eq!(audits[0].action, "job_completed");
+    }
+
+    #[test]
+    fn task_result_timeout_marks_assignment_expired() {
+        let store = SqliteStore::in_memory().unwrap();
+        save_test_agent(&store, "agent-1");
+        save_test_job(&store, "job-timeout");
+        save_test_assignment(&store, "job-timeout", "task-timeout", "agent-1");
+        store
+            .update_task_assignment_status(
+                "task-timeout",
+                AssignmentStatus::Started,
+                SystemTime::UNIX_EPOCH,
+                None,
+            )
+            .unwrap();
+        let message = fleet_protocol::WireMessage::new(
+            "msg-timeout",
+            "corr-timeout",
+            Some("agent-1".to_owned()),
+            1,
+            fleet_protocol::WirePayload::TaskResult {
+                job_id: "job-timeout".to_owned(),
+                task_id: "task-timeout".to_owned(),
+                exit_code: -1,
+                status: Some(fleet_protocol::TaskResultStatus::TimedOut),
+                reason: "command timed out".to_owned(),
+            },
+        );
+
+        handle_agent_task_data_message(&store, "agent-1", message).unwrap();
+
+        assert_eq!(
+            store.find_job_status_value("job-timeout").unwrap().unwrap(),
+            "expired"
+        );
+        assert_eq!(
+            store
+                .find_task_assignment_status("task-timeout")
+                .unwrap()
+                .unwrap(),
+            "expired"
+        );
+    }
+
+    #[test]
+    fn max_failures_cancels_remaining_queued_assignments_and_marks_failed() {
+        let store = SqliteStore::in_memory().unwrap();
+        for agent_id in ["agent-1", "agent-2", "agent-3"] {
+            save_test_agent(&store, agent_id);
+        }
+        save_test_job(&store, "job-maxfail");
+        store
+            .update_job_strategy("job-maxfail", 1, Some(1))
+            .unwrap();
+        save_test_assignment(&store, "job-maxfail", "task-1", "agent-1");
+        save_test_assignment(&store, "job-maxfail", "task-2", "agent-2");
+        save_test_assignment(&store, "job-maxfail", "task-3", "agent-3");
+
+        handle_agent_task_data_message(
+            &store,
+            "agent-1",
+            fleet_protocol::WireMessage::new(
+                "msg-failed",
+                "corr-failed",
+                Some("agent-1".to_owned()),
+                1,
+                fleet_protocol::WirePayload::TaskResult {
+                    job_id: "job-maxfail".to_owned(),
+                    task_id: "task-1".to_owned(),
+                    exit_code: 1,
+                    status: Some(fleet_protocol::TaskResultStatus::Failed),
+                    reason: "command failed".to_owned(),
+                },
+            ),
+        )
+        .unwrap();
+
+        let assignments = store
+            .list_task_assignment_summaries_for_job("job-maxfail")
+            .unwrap();
+        let audits = store
+            .list_audit_events_by_category(AuditCategory::Job, 10)
+            .unwrap();
+
+        assert_eq!(
+            store.find_job_status_value("job-maxfail").unwrap().unwrap(),
+            "failed"
+        );
+        assert_eq!(
+            assignments
+                .iter()
+                .map(|assignment| assignment.status.as_str())
+                .collect::<Vec<_>>(),
+            vec!["failed", "canceled", "canceled"]
+        );
+        let repo = ControllerJobQueryRepository { store: &store };
+        let job_record = repo
+            .list_job_summaries(10)
+            .unwrap()
+            .into_iter()
+            .find(|job| job.id == "job-maxfail")
+            .unwrap();
+        let response = job_summary_response(job_record, &std::collections::BTreeSet::new());
+        assert_eq!(response.assignment_summary.failed, 1);
+        assert_eq!(response.assignment_summary.canceled, 2);
+        assert_eq!(response.assignment_summary.skipped, 2);
+        assert!(
+            audits
+                .iter()
+                .any(|event| event.action == "job_max_failures_reached")
+        );
+    }
+
+    #[test]
+    fn mixed_fanout_results_mark_job_partial_success() {
+        let store = SqliteStore::in_memory().unwrap();
+        save_test_agent(&store, "agent-1");
+        save_test_agent(&store, "agent-2");
+        save_test_job(&store, "job-partial");
+        save_test_assignment(&store, "job-partial", "task-1", "agent-1");
+        save_test_assignment(&store, "job-partial", "task-2", "agent-2");
+
+        handle_agent_task_data_message(
+            &store,
+            "agent-1",
+            fleet_protocol::WireMessage::new(
+                "msg-success",
+                "corr-success",
+                Some("agent-1".to_owned()),
+                1,
+                fleet_protocol::WirePayload::TaskResult {
+                    job_id: "job-partial".to_owned(),
+                    task_id: "task-1".to_owned(),
+                    exit_code: 0,
+                    status: Some(fleet_protocol::TaskResultStatus::Succeeded),
+                    reason: String::new(),
+                },
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            store.find_job_status_value("job-partial").unwrap().unwrap(),
+            "running"
+        );
+
+        handle_agent_task_data_message(
+            &store,
+            "agent-2",
+            fleet_protocol::WireMessage::new(
+                "msg-failed",
+                "corr-failed",
+                Some("agent-2".to_owned()),
+                2,
+                fleet_protocol::WirePayload::TaskResult {
+                    job_id: "job-partial".to_owned(),
+                    task_id: "task-2".to_owned(),
+                    exit_code: 1,
+                    status: Some(fleet_protocol::TaskResultStatus::Failed),
+                    reason: "command failed".to_owned(),
+                },
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            store.find_job_status_value("job-partial").unwrap().unwrap(),
+            "partial_success"
+        );
+    }
+
+    #[test]
+    fn late_success_result_does_not_override_canceled_assignment() {
+        let store = SqliteStore::in_memory().unwrap();
+        save_test_agent(&store, "agent-1");
+        save_test_job(&store, "job-canceled");
+        save_test_assignment(&store, "job-canceled", "task-canceled", "agent-1");
+        store
+            .update_task_assignment_status(
+                "task-canceled",
+                AssignmentStatus::Canceled,
+                SystemTime::UNIX_EPOCH,
+                Some("operator requested cancel"),
+            )
+            .unwrap();
+        store
+            .update_job_status("job-canceled", JobStatus::Canceled)
+            .unwrap();
+
+        handle_agent_task_data_message(
+            &store,
+            "agent-1",
+            fleet_protocol::WireMessage::new(
+                "msg-late-success",
+                "corr-late-success",
+                Some("agent-1".to_owned()),
+                1,
+                fleet_protocol::WirePayload::TaskResult {
+                    job_id: "job-canceled".to_owned(),
+                    task_id: "task-canceled".to_owned(),
+                    exit_code: 0,
+                    status: Some(fleet_protocol::TaskResultStatus::Succeeded),
+                    reason: String::new(),
+                },
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            store
+                .find_job_status_value("job-canceled")
+                .unwrap()
+                .unwrap(),
+            "canceled"
+        );
+        assert_eq!(
+            store
+                .find_task_assignment_status("task-canceled")
+                .unwrap()
+                .unwrap(),
+            "canceled"
+        );
+    }
+
+    #[test]
+    fn cancel_job_cancels_queued_assignment_without_session() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .insert_admin_token_hash(&hash_token("admin-token"))
+            .unwrap();
+        save_test_agent(&store, "agent-1");
+        save_test_job(&store, "job-cancel-queued");
+        save_test_assignment(&store, "job-cancel-queued", "task-cancel-queued", "agent-1");
+
+        let response = route_request(
+            "POST /api/jobs/job-cancel-queued/cancel HTTP/1.1\r\nAuthorization: Bearer admin-token\r\nContent-Length: 0\r\n\r\n",
+            &store,
+        )
+        .unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 200"));
+        assert!(response.contains("\"status\":\"canceled\""));
+        assert!(response.contains("\"cancel_delivered\":false"));
+        assert_eq!(
+            store
+                .find_task_assignment_status("task-cancel-queued")
+                .unwrap()
+                .unwrap(),
+            "canceled"
+        );
+    }
+
+    #[test]
+    fn cancel_job_sends_cancel_to_dispatched_session() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .insert_admin_token_hash(&hash_token("admin-token"))
+            .unwrap();
+        save_test_agent(&store, "agent-1");
+        save_test_job(&store, "job-cancel-dispatched");
+        save_test_assignment(
+            &store,
+            "job-cancel-dispatched",
+            "task-cancel-dispatched",
+            "agent-1",
+        );
+        store
+            .update_task_assignment_status(
+                "task-cancel-dispatched",
+                AssignmentStatus::Dispatched,
+                SystemTime::UNIX_EPOCH,
+                None,
+            )
+            .unwrap();
+        let sessions = Arc::new(Mutex::new(AgentSessionRegistry::default()));
+        let (handle, mut receiver) = session_handle(
+            "agent-1",
+            "conn-1",
+            SystemTime::UNIX_EPOCH,
+            vec!["persistent_session".to_owned()],
+            Some(8),
+        );
+        sessions.lock().unwrap().register(handle);
+
+        let response = route_request_with_sessions(
+            "POST /api/jobs/job-cancel-dispatched/cancel HTTP/1.1\r\nAuthorization: Bearer admin-token\r\nContent-Length: 0\r\n\r\n",
+            &store,
+            &sessions,
+        )
+        .unwrap();
+        let outbound = receiver.try_recv().unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 200"));
+        assert!(response.contains("\"cancel_delivered\":true"));
+        assert!(matches!(
+            outbound,
+            AgentSessionOutboundMessage::Wire(message)
+                if matches!(
+                    message.payload,
+                    fleet_protocol::WirePayload::TaskCancel { ref task_id, .. }
+                        if task_id == "task-cancel-dispatched"
+                )
+        ));
+        assert_eq!(
+            store
+                .find_task_assignment_status("task-cancel-dispatched")
+                .unwrap()
+                .unwrap(),
+            "canceled"
+        );
+    }
+
+    #[test]
+    fn cancel_job_sends_cancel_to_started_session() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .insert_admin_token_hash(&hash_token("admin-token"))
+            .unwrap();
+        save_test_agent(&store, "agent-1");
+        save_test_job(&store, "job-cancel-started");
+        save_test_assignment(
+            &store,
+            "job-cancel-started",
+            "task-cancel-started",
+            "agent-1",
+        );
+        store
+            .update_task_assignment_status(
+                "task-cancel-started",
+                AssignmentStatus::Started,
+                SystemTime::UNIX_EPOCH,
+                None,
+            )
+            .unwrap();
+        let sessions = Arc::new(Mutex::new(AgentSessionRegistry::default()));
+        let (handle, mut receiver) = session_handle(
+            "agent-1",
+            "conn-1",
+            SystemTime::UNIX_EPOCH,
+            vec!["persistent_session".to_owned()],
+            Some(8),
+        );
+        sessions.lock().unwrap().register(handle);
+
+        let response = route_request_with_sessions(
+            "POST /api/jobs/job-cancel-started/cancel HTTP/1.1\r\nAuthorization: Bearer admin-token\r\nContent-Length: 0\r\n\r\n",
+            &store,
+            &sessions,
+        )
+        .unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 200"));
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            AgentSessionOutboundMessage::Wire(message)
+                if matches!(
+                    message.payload,
+                    fleet_protocol::WirePayload::TaskCancel { ref task_id, .. }
+                        if task_id == "task-cancel-started"
+                )
+        ));
+        assert_eq!(
+            store
+                .find_task_assignment_status("task-cancel-started")
+                .unwrap()
+                .unwrap(),
+            "canceled"
+        );
+    }
+
+    #[test]
+    fn cancel_job_after_controller_restart_uses_persisted_assignment_state() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .insert_admin_token_hash(&hash_token("admin-token"))
+            .unwrap();
+        save_test_agent(&store, "agent-1");
+        save_test_job(&store, "job-restart-cancel");
+        save_test_assignment(
+            &store,
+            "job-restart-cancel",
+            "task-restart-cancel",
+            "agent-1",
+        );
+        store
+            .update_task_assignment_status(
+                "task-restart-cancel",
+                AssignmentStatus::Dispatched,
+                SystemTime::UNIX_EPOCH,
+                None,
+            )
+            .unwrap();
+
+        let response = route_request(
+            "POST /api/jobs/job-restart-cancel/cancel HTTP/1.1\r\nAuthorization: Bearer admin-token\r\nContent-Length: 0\r\n\r\n",
+            &store,
+        )
+        .unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 200"));
+        assert!(response.contains("\"cancel_delivered\":false"));
+        assert_eq!(
+            store
+                .find_task_assignment_status("task-restart-cancel")
+                .unwrap()
+                .unwrap(),
+            "canceled"
+        );
+    }
+
+    #[test]
+    fn disconnect_does_not_mark_dispatched_assignment_success() {
+        let store = SqliteStore::in_memory().unwrap();
+        save_test_agent(&store, "agent-1");
+        save_test_job(&store, "job-disconnect");
+        save_test_assignment(&store, "job-disconnect", "task-disconnect", "agent-1");
+        store
+            .update_task_assignment_status(
+                "task-disconnect",
+                AssignmentStatus::Dispatched,
+                SystemTime::UNIX_EPOCH,
+                None,
+            )
+            .unwrap();
+        let mut sessions = AgentSessionRegistry::default();
+        let (handle, _receiver) = session_handle(
+            "agent-1",
+            "conn-1",
+            SystemTime::UNIX_EPOCH,
+            Vec::new(),
+            Some(8),
+        );
+        sessions.register(handle);
+        sessions.unregister("agent-1", "conn-1", AgentSessionCloseReason::NormalShutdown);
+
+        assert_eq!(
+            store
+                .find_task_assignment_status("task-disconnect")
+                .unwrap()
+                .unwrap(),
+            "dispatched"
+        );
+        assert_ne!(
+            store
+                .find_job_status_value("job-disconnect")
+                .unwrap()
+                .unwrap(),
+            "success"
+        );
+    }
+
+    #[test]
+    fn task_ack_started_and_rejected_update_assignment_status() {
+        let store = SqliteStore::in_memory().unwrap();
+        save_test_agent(&store, "agent-1");
+        save_test_job(&store, "job-ack");
+        save_test_assignment(&store, "job-ack", "task-ack", "agent-1");
+        save_test_job(&store, "job-reject");
+        save_test_assignment(&store, "job-reject", "task-reject", "agent-1");
+
+        handle_agent_task_data_message(
+            &store,
+            "agent-1",
+            fleet_protocol::WireMessage::new(
+                "msg-ack",
+                "corr-ack",
+                Some("agent-1".to_owned()),
+                1,
+                fleet_protocol::WirePayload::TaskAck {
+                    job_id: "job-ack".to_owned(),
+                    task_id: "task-ack".to_owned(),
+                },
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            store.find_task_assignment_status("task-ack").unwrap(),
+            Some("accepted".to_owned())
+        );
+
+        handle_agent_task_data_message(
+            &store,
+            "agent-1",
+            fleet_protocol::WireMessage::new(
+                "msg-started",
+                "corr-started",
+                Some("agent-1".to_owned()),
+                2,
+                fleet_protocol::WirePayload::TaskStarted {
+                    job_id: "job-ack".to_owned(),
+                    task_id: "task-ack".to_owned(),
+                },
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            store.find_task_assignment_status("task-ack").unwrap(),
+            Some("started".to_owned())
+        );
+
+        handle_agent_task_data_message(
+            &store,
+            "agent-1",
+            fleet_protocol::WireMessage::new(
+                "msg-rejected",
+                "corr-rejected",
+                Some("agent-1".to_owned()),
+                3,
+                fleet_protocol::WirePayload::TaskRejected {
+                    job_id: "job-reject".to_owned(),
+                    task_id: "task-reject".to_owned(),
+                    reason_code: fleet_protocol::TaskRejectionReasonCode::InvalidSignature,
+                    reason: "invalid signature".to_owned(),
+                },
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            store.find_task_assignment_status("task-reject").unwrap(),
+            Some("rejected".to_owned())
+        );
+        assert_eq!(
+            store.find_job_status_value("job-reject").unwrap(),
+            Some("failed".to_owned())
+        );
+    }
+
+    #[test]
+    fn output_chunk_does_not_mark_assignment_success() {
+        let store = SqliteStore::in_memory().unwrap();
+        save_test_agent(&store, "agent-1");
+        save_test_job(&store, "job-output");
+        save_test_assignment(&store, "job-output", "task-output", "agent-1");
+        store
+            .update_task_assignment_status(
+                "task-output",
+                AssignmentStatus::Started,
+                SystemTime::UNIX_EPOCH,
+                None,
+            )
+            .unwrap();
+
+        handle_agent_task_data_message(
+            &store,
+            "agent-1",
+            fleet_protocol::WireMessage::new(
+                "msg-output",
+                "corr-output",
+                Some("agent-1".to_owned()),
+                1,
+                fleet_protocol::WirePayload::OutputChunk {
+                    job_id: "job-output".to_owned(),
+                    task_id: "task-output".to_owned(),
+                    stream: fleet_protocol::OutputStream::Stdout,
+                    sequence: 0,
+                    data: "partial output".to_owned(),
+                },
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            store.find_task_assignment_status("task-output").unwrap(),
+            Some("started".to_owned())
+        );
+        assert_eq!(
+            store.find_job_status_value("job-output").unwrap(),
+            Some("queued".to_owned())
+        );
     }
 
     #[test]
@@ -6270,6 +9811,8 @@ spec:
                 &DriftReport {
                     policy_name: "nginx-running".to_owned(),
                     status: DriftStatus::Drifted,
+                    severity: DriftSeverity::Warning,
+                    acknowledgement: DriftAcknowledgement::Open,
                     expected: "service nginx running".to_owned(),
                     actual: "stopped".to_owned(),
                 },
@@ -6288,7 +9831,85 @@ spec:
         assert!(response.contains("\"checked_at_ms\":1000"));
         assert!(response.contains("\"agent_system_time_ms\":1000"));
         assert!(response.contains("\"status\":\"drifted\""));
+        assert!(response.contains("\"severity\":\"warning\""));
         assert!(response.contains("\"actual\":\"stopped\""));
+    }
+
+    #[test]
+    fn admin_can_save_assign_and_schedule_policy() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .insert_admin_token_hash(&hash_token("admin-token"))
+            .unwrap();
+        save_test_agent_with_labels(&store, "agent-1", vec![("role", "web")]);
+        let policy_source = r#"
+apiVersion: fleet.sponzey.dev/v1alpha1
+kind: Policy
+metadata:
+  name: nginx-running
+spec:
+  selector:
+    matchLabels:
+      role: web
+  checks:
+    - id: nginx-service
+      service:
+        name: nginx
+        state: running
+"#;
+        let save_body = serde_json::json!({ "source": policy_source }).to_string();
+        let save_request = format!(
+            "POST /api/policies HTTP/1.1\r\nAuthorization: Bearer admin-token\r\nContent-Length: {}\r\n\r\n{}",
+            save_body.len(),
+            save_body
+        );
+
+        let save_response = route_request(&save_request, &store).unwrap();
+
+        assert!(save_response.starts_with("HTTP/1.1 201"));
+        assert!(save_response.contains("\"id\":\"nginx-running\""));
+
+        let list_response = route_request(
+            "GET /api/policies HTTP/1.1\r\nAuthorization: Bearer admin-token\r\n\r\n",
+            &store,
+        )
+        .unwrap();
+        assert!(list_response.contains("\"name\":\"nginx-running\""));
+
+        let assign_body = serde_json::json!({ "agent_id": "agent-1" }).to_string();
+        let assign_request = format!(
+            "POST /api/policies/nginx-running/assignments HTTP/1.1\r\nAuthorization: Bearer admin-token\r\nContent-Length: {}\r\n\r\n{}",
+            assign_body.len(),
+            assign_body
+        );
+        let assign_response = route_request(&assign_request, &store).unwrap();
+        assert!(assign_response.starts_with("HTTP/1.1 201"));
+        assert!(assign_response.contains("\"policy_id\":\"nginx-running\""));
+
+        let agent_response = route_request(
+            "GET /api/agents/agent-1 HTTP/1.1\r\nAuthorization: Bearer admin-token\r\n\r\n",
+            &store,
+        )
+        .unwrap();
+        assert!(agent_response.contains("\"assigned_policy_ids\":[\"nginx-running\"]"));
+
+        let agent_policies_response = route_request(
+            "GET /api/agents/agent-1/policies HTTP/1.1\r\nAuthorization: Bearer admin-token\r\n\r\n",
+            &store,
+        )
+        .unwrap();
+        assert!(agent_policies_response.contains("\"policy_id\":\"nginx-running\""));
+
+        let schedule_body =
+            serde_json::json!({ "agent_id": "agent-1", "interval_seconds": 300 }).to_string();
+        let schedule_request = format!(
+            "POST /api/policies/nginx-running/schedules HTTP/1.1\r\nAuthorization: Bearer admin-token\r\nContent-Length: {}\r\n\r\n{}",
+            schedule_body.len(),
+            schedule_body
+        );
+        let schedule_response = route_request(&schedule_request, &store).unwrap();
+        assert!(schedule_response.starts_with("HTTP/1.1 201"));
+        assert!(schedule_response.contains("\"interval_seconds\":300"));
     }
 
     #[test]
@@ -6318,7 +9939,7 @@ spec:
     }
 
     #[test]
-    fn admin_can_page_facts_metrics_and_drift_reports() {
+    fn admin_can_page_facts_metrics_logs_and_drift_reports() {
         let store = SqliteStore::in_memory().unwrap();
         store
             .insert_admin_token_hash(&hash_token("admin-token"))
@@ -6346,6 +9967,19 @@ spec:
                 )
                 .unwrap();
         }
+        for (seconds, line) in [
+            (1, "level=info event=agent_log_uploaded sequence=1"),
+            (2, "level=info event=agent_log_uploaded sequence=2"),
+            (3, "level=info event=agent_log_uploaded sequence=3"),
+        ] {
+            store
+                .insert_agent_log_chunk(
+                    "agent-1",
+                    line,
+                    SystemTime::UNIX_EPOCH + Duration::from_secs(seconds),
+                )
+                .unwrap();
+        }
         for (seconds, status, actual) in [
             (1, DriftStatus::Unknown, "unknown"),
             (2, DriftStatus::Compliant, "running"),
@@ -6356,6 +9990,8 @@ spec:
                     "agent-1",
                     &DriftReport {
                         policy_name: "nginx-running".to_owned(),
+                        severity: DriftSeverity::for_status(status.clone()),
+                        acknowledgement: DriftAcknowledgement::Open,
                         status,
                         expected: "service nginx running".to_owned(),
                         actual: actual.to_owned(),
@@ -6413,6 +10049,33 @@ spec:
         assert_eq!(
             metrics_second["items"][0]["body"]["cpu"]["logical_count"],
             1
+        );
+
+        let logs_first = route_request(
+            "GET /api/agents/agent-1/logs?limit=2 HTTP/1.1\r\nAuthorization: Bearer admin-token\r\n\r\n",
+            &store,
+        )
+        .unwrap();
+        let logs_first: serde_json::Value =
+            serde_json::from_str(logs_first.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(
+            logs_first["items"][0]["line"],
+            "level=info event=agent_log_uploaded sequence=3"
+        );
+        assert_eq!(logs_first["items"][0]["collected_at_ms"], 3000);
+        let logs_cursor = logs_first["next_cursor"].as_str().unwrap();
+        let logs_second = route_request(
+            &format!(
+                "GET /api/agents/agent-1/logs?limit=2&before={logs_cursor} HTTP/1.1\r\nAuthorization: Bearer admin-token\r\n\r\n"
+            ),
+            &store,
+        )
+        .unwrap();
+        let logs_second: serde_json::Value =
+            serde_json::from_str(logs_second.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(
+            logs_second["items"][0]["line"],
+            "level=info event=agent_log_uploaded sequence=1"
         );
 
         let drift_first = route_request(
@@ -6529,6 +10192,8 @@ spec:
             job_id: "job-history-1".to_owned(),
             target_agent_ids: vec!["agent-1".to_owned()],
             selector: None,
+            match_labels: None,
+            strategy: None,
             program: "uptime".to_owned(),
             args: vec!["-a".to_owned()],
             timeout_seconds: 30,
@@ -6565,9 +10230,17 @@ spec:
         assert_eq!(job["status"], "queued");
         assert_eq!(job["dispatch_state"], "queued");
         assert_eq!(job["command_program"], "uptime");
+        assert_eq!(job["strategy"]["concurrency"], 1);
+        assert_eq!(job["strategy"]["maxFailures"], serde_json::Value::Null);
+        assert_eq!(job["assignment_summary"]["queued"], 1);
+        assert_eq!(job["assignment_summary"]["canceled"], 0);
+        assert_eq!(job["assignment_summary"]["expired"], 0);
+        assert_eq!(job["assignment_summary"]["skipped"], 0);
         assert_eq!(job["target_count"], 1);
         assert_eq!(job["target_agent_ids"], serde_json::json!(["agent-1"]));
         assert_eq!(job["target_agents"][0]["agent_id"], "agent-1");
+        assert_eq!(job["target_agents"][0]["assignment_status"], "queued");
+        assert_eq!(job["target_agents"][0]["last_error"], "");
         assert_eq!(job["target_agents"][0]["connected"], false);
         assert!(job["expires_at_ms"].as_u64().is_some());
     }
@@ -6611,6 +10284,8 @@ spec:
         assert_eq!(job["target_connected"], true);
         assert_eq!(job["target_agents"][0]["connected"], true);
         assert_eq!(job["target_agents"][0]["status"], "online");
+        assert_eq!(job["target_agents"][0]["assignment_status"], "dispatched");
+        assert!(job["target_agents"][0]["task_id"].as_str().is_some());
         assert_eq!(job["last_error"], "");
     }
 
@@ -7326,15 +11001,91 @@ spec:
         )
     }
 
+    fn approve_pending_job_with_sessions(
+        store: &SqliteStore,
+        sessions: &Arc<Mutex<AgentSessionRegistry>>,
+        job_id: &str,
+    ) {
+        let approval = store
+            .find_pending_approval_for_job(job_id)
+            .unwrap()
+            .expect("pending approval should exist");
+        let body = serde_json::to_string(&ApprovalDecisionRequest {
+            actor: "approver-1".to_owned(),
+            reason: "approved in test".to_owned(),
+        })
+        .unwrap();
+        let request = format!(
+            "POST /api/approvals/{}/approve HTTP/1.1\r\nAuthorization: Bearer admin-token\r\nContent-Length: {}\r\n\r\n{}",
+            approval.id,
+            body.len(),
+            body
+        );
+        let response = route_request_with_sessions(&request, store, sessions).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"));
+    }
+
     fn command_job_request(job_id: &str, agent_id: &str, confirmed_high_risk: bool) -> String {
         let body = serde_json::to_string(&CreateCommandJobRequest {
             job_id: job_id.to_owned(),
             target_agent_ids: vec![agent_id.to_owned()],
             selector: None,
+            match_labels: None,
+            strategy: None,
             program: "uptime".to_owned(),
             args: Vec::new(),
             timeout_seconds: 30,
             confirmed_high_risk,
+            confirmed_by: "operator-1".to_owned(),
+            expires_in_seconds: 60,
+            nonce_prefix: Some(format!("nonce-{job_id}")),
+        })
+        .unwrap();
+        format!(
+            "POST /api/jobs/command HTTP/1.1\r\nAuthorization: Bearer admin-token\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    }
+
+    fn high_risk_command_job_request(job_id: &str, agent_id: &str, program: &str) -> String {
+        let body = serde_json::to_string(&CreateCommandJobRequest {
+            job_id: job_id.to_owned(),
+            target_agent_ids: vec![agent_id.to_owned()],
+            selector: None,
+            match_labels: None,
+            strategy: None,
+            program: program.to_owned(),
+            args: vec!["-lc".to_owned(), "uptime".to_owned()],
+            timeout_seconds: 30,
+            confirmed_high_risk: false,
+            confirmed_by: "operator-1".to_owned(),
+            expires_in_seconds: 60,
+            nonce_prefix: Some(format!("nonce-{job_id}")),
+        })
+        .unwrap();
+        format!(
+            "POST /api/jobs/command HTTP/1.1\r\nAuthorization: Bearer admin-token\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    }
+
+    fn command_selector_job_request(
+        job_id: &str,
+        selector: &str,
+        strategy: Option<JobStrategyRequest>,
+    ) -> String {
+        let body = serde_json::to_string(&CreateCommandJobRequest {
+            job_id: job_id.to_owned(),
+            target_agent_ids: Vec::new(),
+            selector: Some(selector.to_owned()),
+            match_labels: None,
+            strategy,
+            program: "uptime".to_owned(),
+            args: Vec::new(),
+            timeout_seconds: 30,
+            confirmed_high_risk: true,
             confirmed_by: "operator-1".to_owned(),
             expires_in_seconds: 60,
             nonce_prefix: Some(format!("nonce-{job_id}")),
@@ -7352,6 +11103,8 @@ spec:
             job_id: job_id.to_owned(),
             target_agent_ids: vec![agent_id.to_owned()],
             selector: None,
+            match_labels: None,
+            strategy: None,
             runbook_document: r#"
 apiVersion: fleet.sponzey.dev/v1alpha1
 kind: Runbook
@@ -7386,6 +11139,8 @@ spec:
             job_id: job_id.to_owned(),
             target_agent_ids: vec![agent_id.to_owned()],
             selector: None,
+            match_labels: None,
+            strategy: None,
             policy_document: r#"
 apiVersion: fleet.sponzey.dev/v1alpha1
 kind: Policy
@@ -7517,6 +11272,23 @@ spec:
         );
         job.queue(true).unwrap();
         store.save_job_record(&job).unwrap();
+    }
+
+    fn save_test_assignment(store: &SqliteStore, job_id: &str, task_id: &str, agent_id: &str) {
+        store
+            .save_task_assignment_record(&TaskEnvelope {
+                job_id: JobId::new(job_id).unwrap(),
+                task_id: fleet_domain::TaskId::new(task_id).unwrap(),
+                target_agent_id: AgentId::new(agent_id).unwrap(),
+                issued_at: SystemTime::UNIX_EPOCH,
+                expires_at: fleet_domain::TaskExpiry::new(
+                    SystemTime::UNIX_EPOCH + Duration::from_secs(60),
+                ),
+                nonce: fleet_domain::TaskNonce::new(format!("{task_id}-nonce")).unwrap(),
+                payload_hash: "hash".to_owned(),
+                signature: Some(fleet_domain::TaskSignature::new("sig").unwrap()),
+            })
+            .unwrap();
     }
 
     fn write_test_tls_material(dir: &Path) -> (PathBuf, PathBuf) {

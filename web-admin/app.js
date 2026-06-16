@@ -3,16 +3,20 @@ import { createApiClient, normalizeAdminToken } from "./api-client.js";
 const state = {
   token: "",
   agents: [],
+  policies: [],
   selectedAgentId: "",
+  selectedPolicyId: "",
   lastJobId: "",
   createdEnrollmentToken: null,
+  metricsWindowMs: 5 * 60 * 1000,
 };
 
-const TELEMETRY_WINDOW_MS = 5 * 60 * 1000;
+const DEFAULT_TELEMETRY_WINDOW_MS = 5 * 60 * 1000;
 const TELEMETRY_PAGE_LIMIT = 120;
+const DETAIL_PAGE_LIMIT = 25;
 const JOB_OUTPUT_POLL_ATTEMPTS = 45;
 const JOB_OUTPUT_POLL_INTERVAL_MS = 1000;
-const TERMINAL_DISPATCH_STATES = new Set(["completed", "failed", "expired", "rejected"]);
+const TERMINAL_DISPATCH_STATES = new Set(["completed", "failed", "expired", "rejected", "canceled"]);
 const TERMINAL_JOB_STATUSES = new Set(["success", "failed", "expired", "canceled"]);
 
 const api = createApiClient({
@@ -74,7 +78,7 @@ export function renderAgents(agents, selectedAgentId = "") {
       const session = agent.connected ? "session connected" : "session disconnected";
       const meta = [agent.hostname, platform, session, age].filter(Boolean).join(" · ");
       const selectedClass = agent.id === selectedAgentId ? " selected" : "";
-      const status = agent.revoked ? "offline" : agent.status || "unknown";
+      const status = agentDisplayStatus(agent);
       const revokedBadge = agent.revoked
         ? '<span class="status-pill revoked">revoked</span>'
         : "";
@@ -94,6 +98,49 @@ export function renderAgents(agents, selectedAgentId = "") {
       `;
     })
     .join("");
+}
+
+export function agentDisplayStatus(agent) {
+  if (agent?.revoked) {
+    return "offline";
+  }
+  if (agent?.status === "reconnecting") {
+    return "stale";
+  }
+  return agent?.status || "unknown";
+}
+
+export function renderAgentDetail(agent) {
+  if (!agent) {
+    return '<div class="empty">Select an agent.</div>';
+  }
+  const status = agentDisplayStatus(agent);
+  const policies = Array.isArray(agent.assigned_policy_ids)
+    ? agent.assigned_policy_ids.join(", ")
+    : "";
+  const rows = [
+    ["Status", status],
+    ["Session", agent.connected ? "connected" : "disconnected"],
+    ["Revoked", agent.revoked ? "yes" : "no"],
+    ["Hostname", agent.hostname],
+    ["Platform", [agent.os, agent.arch].filter(Boolean).join("/")],
+    ["Last seen", typeof agent.last_seen_age_seconds === "number" ? `${agent.last_seen_age_seconds}s ago` : ""],
+    ["Assigned policies", policies],
+  ];
+  return `
+    <div class="detail-grid">
+      ${rows
+        .map(
+          ([label, value]) => `
+            <div>
+              <small>${escapeHtml(label)}</small>
+              <strong>${escapeHtml(formatOptional(value))}</strong>
+            </div>
+          `,
+        )
+        .join("")}
+    </div>
+  `;
 }
 
 export function renderSnapshot(snapshot, missingText) {
@@ -154,6 +201,75 @@ export function renderFactsInventory(snapshot, missingText = "No facts snapshot.
   `;
 }
 
+export function renderDiskInventory(snapshot, missingText = "No disk inventory.") {
+  if (!snapshot || !snapshot.body) {
+    return `<div class="empty">${escapeHtml(missingText)}</div>`;
+  }
+  const disk = snapshot.body.disk || {};
+  const devices = Array.isArray(disk.devices) ? disk.devices : [];
+  const mounts = Array.isArray(disk.mounts) ? disk.mounts : [];
+  const deviceRows = devices.flatMap((device) => {
+    const base = [
+      {
+        name: device.name,
+        kind: device.kind,
+        size: formatKilobytes(device.size_kb),
+        mount: "device",
+        fs: "",
+      },
+    ];
+    const partitions = Array.isArray(device.partitions)
+      ? device.partitions.map((partition) => ({
+          name: partition.name,
+          kind: "partition",
+          size: formatKilobytes(partition.size_kb),
+          mount: "",
+          fs: "",
+        }))
+      : [];
+    return base.concat(partitions);
+  });
+  const mountRows = mounts.map((mount) => ({
+    name: mount.source,
+    kind: "mount",
+    size: "",
+    mount: mount.mount_point,
+    fs: mount.fs_type,
+  }));
+  const rows = deviceRows.concat(mountRows);
+  if (rows.length === 0) {
+    return `<div class="empty">${escapeHtml(missingText)}</div>`;
+  }
+  return `
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Source</th>
+          <th>Kind</th>
+          <th>Size</th>
+          <th>Mount</th>
+          <th>FS</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${rows
+          .map(
+            (row) => `
+              <tr>
+                <td>${escapeHtml(formatOptional(row.name))}</td>
+                <td>${escapeHtml(formatOptional(row.kind))}</td>
+                <td>${escapeHtml(row.size || "")}</td>
+                <td>${escapeHtml(row.mount || "")}</td>
+                <td>${escapeHtml(row.fs || "")}</td>
+              </tr>
+            `,
+          )
+          .join("")}
+      </tbody>
+    </table>
+  `;
+}
+
 export function renderDrift(report) {
   if (!report) {
     return '<div class="empty">No drift report.</div>';
@@ -163,12 +279,17 @@ export function renderDrift(report) {
   const timeMeta = [agentTime ? `Agent time ${agentTime}` : "", checkedAt ? `Checked ${checkedAt}` : ""]
     .filter(Boolean)
     .join(" | ");
+  const remediation = [
+    report.acknowledged ? `acknowledged by ${report.acknowledged_by || "operator"}` : "open",
+    report.resolved ? `resolved by ${report.resolution_job_id || "remediation job"}` : "not resolved",
+  ].join(" · ");
   return `
     <div class="drift-summary">
       <span class="status-pill ${escapeHtml(report.status)}">${escapeHtml(report.status)}</span>
       <strong>${escapeHtml(report.policy_name)}</strong>
     </div>
     ${timeMeta ? `<div class="snapshot-time">${escapeHtml(timeMeta)}</div>` : ""}
+    <div class="snapshot-time">${escapeHtml(remediation)}</div>
     <div class="diff-grid">
       <section>
         <h3>Expected</h3>
@@ -180,6 +301,27 @@ export function renderDrift(report) {
       </section>
     </div>
   `;
+}
+
+export function renderDriftHistory(page) {
+      const reports = snapshotItems(page);
+  if (reports.length === 0) {
+    return '<div class="empty">No drift history.</div>';
+  }
+  return reports
+    .map(
+      (report) => `
+        <div class="compact-row">
+          <span class="status-pill ${escapeHtml(report.status || "unknown")}">${escapeHtml(report.status || "unknown")}</span>
+          <span>
+            <strong>${escapeHtml(report.policy_name || "policy")}</strong>
+            <small>${escapeHtml(formatUnixMillis(report.agent_system_time_ms || report.checked_at_ms) || "unknown time")}</small>
+            <small>${escapeHtml(report.resolved ? `resolved by ${report.resolution_job_id || "remediation job"}` : "open")}</small>
+          </span>
+        </div>
+      `,
+    )
+    .join("");
 }
 
 export function formatUnixMillis(value) {
@@ -255,7 +397,7 @@ export function snapshotTimeMs(snapshot) {
   );
 }
 
-export function recentSnapshots(snapshots, windowMs = TELEMETRY_WINDOW_MS) {
+export function recentSnapshots(snapshots, windowMs = DEFAULT_TELEMETRY_WINDOW_MS) {
   const rows = (Array.isArray(snapshots) ? snapshots : [])
     .map((snapshot) => ({ snapshot, time: snapshotTimeMs(snapshot) }))
     .filter((row) => row.time !== null)
@@ -268,8 +410,13 @@ export function recentSnapshots(snapshots, windowMs = TELEMETRY_WINDOW_MS) {
   return rows.filter((row) => row.time >= cutoff).map((row) => row.snapshot);
 }
 
-export function renderTelemetryCharts(snapshots, definitions, emptyText = "No recent telemetry snapshots.") {
-  const recent = recentSnapshots(snapshots);
+export function renderTelemetryCharts(
+  snapshots,
+  definitions,
+  emptyText = "No recent telemetry snapshots.",
+  windowMs = DEFAULT_TELEMETRY_WINDOW_MS,
+) {
+  const recent = recentSnapshots(snapshots, windowMs);
   if (recent.length === 0) {
     return `<div class="empty">${escapeHtml(emptyText)}</div>`;
   }
@@ -281,11 +428,20 @@ export function renderTelemetryCharts(snapshots, definitions, emptyText = "No re
     .join("");
   return `
     <div class="chart-window">
-      <strong>Last 5 minutes</strong>
+      <strong>Last ${escapeHtml(formatDuration(windowMs))}</strong>
       <small>${escapeHtml(range || `${recent.length} sample(s)`)}</small>
     </div>
     <div class="chart-grid">${cards}</div>
   `;
+}
+
+function formatDuration(value) {
+  const milliseconds = asNumber(value);
+  if (milliseconds === null || milliseconds <= 0) {
+    return "5 minutes";
+  }
+  const minutes = Math.round(milliseconds / 60_000);
+  return minutes === 1 ? "1 minute" : `${minutes} minutes`;
 }
 
 function renderChartCard(snapshots, definition) {
@@ -391,6 +547,25 @@ export function renderJobs(jobs) {
         targets.length > 0
           ? `${targets.length} target(s), ${connectedCount} connected`
           : `${job.target_count ?? 0} target(s)`;
+      const assignmentSummarySource =
+        job.assignment_summary && typeof job.assignment_summary === "object" ? job.assignment_summary : null;
+      const assignmentEntries = assignmentSummarySource
+        ? ["queued", "dispatched", "accepted", "started", "succeeded", "failed", "rejected", "canceled", "expired", "skipped"]
+            .map((status) => [status, Number(assignmentSummarySource[status] || 0)])
+            .filter(([, count]) => count > 0)
+        : Array.from(
+            targets.reduce((counts, target) => {
+              const status = target?.assignment_status;
+              if (status) {
+                counts.set(status, (counts.get(status) || 0) + 1);
+              }
+              return counts;
+            }, new Map()),
+          );
+      const assignmentSummary =
+        assignmentEntries.length > 0
+          ? `, ${assignmentEntries.map(([status, count]) => `${count} ${status}`).join(", ")}`
+          : "";
       return `
         <button class="job-row" type="button" data-job-id="${escapeHtml(job.id)}">
           <span>
@@ -401,10 +576,136 @@ export function renderJobs(jobs) {
             <span class="status-pill ${escapeHtml(job.status || "unknown")}">${escapeHtml(job.status || "unknown")}</span>
             <span class="status-pill ${escapeHtml(dispatchState)}">${escapeHtml(dispatchState)}</span>
           </span>
-          <small>${escapeHtml(targetSummary)}</small>
+          <small>${escapeHtml(`${targetSummary}${assignmentSummary}`)}</small>
         </button>
       `;
     })
+    .join("");
+}
+
+export function renderJobTargetTable(job) {
+  const targets = Array.isArray(job?.target_agents) ? job.target_agents : [];
+  if (targets.length === 0) {
+    return '<div class="empty">No target assignment details.</div>';
+  }
+  return `
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Agent</th>
+          <th>Agent state</th>
+          <th>Session</th>
+          <th>Assignment</th>
+          <th>Task</th>
+          <th>Last error</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${targets
+          .map(
+            (target) => `
+              <tr>
+                <td>${escapeHtml(target.agent_id || "agent")}</td>
+                <td>${escapeHtml(target.revoked ? "revoked" : target.status || "unknown")}</td>
+                <td>${escapeHtml(target.connected ? "connected" : "disconnected")}</td>
+                <td>${escapeHtml(target.assignment_status || "not assigned")}</td>
+                <td>${escapeHtml(target.task_id || "")}</td>
+                <td>${escapeHtml(target.last_error || "")}</td>
+              </tr>
+            `,
+          )
+          .join("")}
+      </tbody>
+    </table>
+  `;
+}
+
+export function renderApprovals(approvals, jobs = []) {
+  if (!Array.isArray(approvals) || approvals.length === 0) {
+    return '<div class="empty">No pending approvals.</div>';
+  }
+  return approvals
+    .map((approval) => {
+      const expires = formatUnixMillis(approval.expires_at_ms) || "unknown expiry";
+      const job = Array.isArray(jobs) ? jobs.find((item) => item.id === approval.job_id) : null;
+      const targets = Array.isArray(job?.target_agents) ? job.target_agents : [];
+      const targetText =
+        targets.length > 0
+          ? targets.map((target) => `${target.agent_id || "agent"}:${target.assignment_status || "pending"}`).join(", ")
+          : `${job?.target_count ?? 0} target(s)`;
+      return `
+        <div class="approval-row">
+          <span class="status-pill ${escapeHtml(approval.status || "pending")}">${escapeHtml(approval.status || "pending")}</span>
+          <span>
+            <strong>${escapeHtml(approval.job_id || approval.id)}</strong>
+            <small>${escapeHtml(approval.reason || "approval required")}</small>
+            <small>${escapeHtml(targetText)}</small>
+            <small>expires ${escapeHtml(expires)}</small>
+          </span>
+          <button type="button" data-approve-approval-id="${escapeHtml(approval.id)}">Approve</button>
+          <button type="button" data-reject-approval-id="${escapeHtml(approval.id)}">Reject</button>
+        </div>
+      `;
+    })
+    .join("");
+}
+
+export function renderPolicies(policies, selectedPolicyId = "") {
+  if (!Array.isArray(policies) || policies.length === 0) {
+    return '<div class="empty">No policies saved.</div>';
+  }
+  return policies
+    .map((policy) => {
+      const selectedClass = policy.id === selectedPolicyId ? " selected" : "";
+      return `
+        <button class="policy-row${selectedClass}" type="button" data-policy-id="${escapeHtml(policy.id)}">
+          <span>
+            <strong>${escapeHtml(policy.name || policy.id)}</strong>
+            <small>${escapeHtml(policy.id)}</small>
+          </span>
+          <span class="status-pill active">v${escapeHtml(policy.version || 1)}</span>
+        </button>
+      `;
+    })
+    .join("");
+}
+
+export function renderAgentPolicies(assignments, selectedAgentId = "") {
+  if (!selectedAgentId) {
+    return '<div class="empty">Select an agent to view assigned policies.</div>';
+  }
+  if (!Array.isArray(assignments) || assignments.length === 0) {
+    return '<div class="empty">No policies assigned to this agent.</div>';
+  }
+  return assignments
+    .map(
+      (assignment) => `
+        <div class="compact-row">
+          <span class="status-pill active">assigned</span>
+          <span>
+            <strong>${escapeHtml(assignment.policy_id || "policy")}</strong>
+            <small>${escapeHtml(formatUnixMillis(assignment.assigned_at_ms) || selectedAgentId)}</small>
+          </span>
+        </div>
+      `,
+    )
+    .join("");
+}
+
+export function renderAgentLogs(page) {
+  const chunks = snapshotItems(page);
+  if (chunks.length === 0) {
+    return '<div class="empty">No agent logs.</div>';
+  }
+  return chunks
+    .map(
+      (chunk) => `
+        <div class="log-row">
+          <small>${escapeHtml(formatUnixMillis(chunk.collected_at_ms) || "unknown time")}</small>
+          <code>${escapeHtml(chunk.line || "")}</code>
+        </div>
+      `,
+    )
     .join("");
 }
 
@@ -434,6 +735,62 @@ export function renderEnrollmentTokens(tokens) {
       `;
     })
     .join("");
+}
+
+export function buildRunbookJobRequest({ agentId, document, confirmed }) {
+  if (!agentId) {
+    throw new Error("Select an agent from the Agents list before creating a runbook job.");
+  }
+  const runbookDocument = String(document ?? "").trim();
+  if (!runbookDocument) {
+    throw new Error("Paste a runbook document before creating a job.");
+  }
+  if (!confirmed) {
+    throw new Error("Check Confirm runbook execution before creating the job.");
+  }
+  const jobId = `job-runbook-ui-${Date.now()}`;
+  return {
+    job_id: jobId,
+    target_agent_ids: [agentId],
+    runbook_document: runbookDocument,
+    timeout_seconds: 180,
+    confirmed_high_risk: true,
+    confirmed_by: "web-admin",
+    expires_in_seconds: 300,
+    nonce_prefix: jobId,
+  };
+}
+
+export function buildPolicySaveRequest({ source }) {
+  const policySource = String(source ?? "").trim();
+  if (!policySource) {
+    throw new Error("Paste a policy document before saving.");
+  }
+  return { source: policySource };
+}
+
+export function buildPolicyAssignmentRequest({ policyId, agentId }) {
+  if (!policyId) {
+    throw new Error("Select a policy first.");
+  }
+  if (!agentId) {
+    throw new Error("Select an agent first.");
+  }
+  return { agent_id: agentId };
+}
+
+export function buildPolicyScheduleRequest({ policyId, agentId, intervalSeconds }) {
+  if (!policyId) {
+    throw new Error("Select a policy first.");
+  }
+  if (!agentId) {
+    throw new Error("Select an agent first.");
+  }
+  const interval_seconds = Number.parseInt(intervalSeconds, 10);
+  if (!Number.isInteger(interval_seconds) || interval_seconds < 1) {
+    throw new Error("Drift interval must be at least 1 second.");
+  }
+  return { agent_id: agentId, interval_seconds };
 }
 
 export function renderCreatedEnrollmentToken(result, controllerUrl = "", agentName = "") {
@@ -574,6 +931,9 @@ export function jobStatusMessage(job) {
   const status = String(job?.status || "").toLowerCase();
   const dispatchState = String(job?.dispatch_state || "").toLowerCase();
   const reason = job?.last_error ? ` Reason: ${job.last_error}` : "";
+  if (status === "pending_approval") {
+    return `Approval required before dispatch.${reason}`;
+  }
   if (dispatchState === "created") {
     return "Job created. Checking dispatch state.";
   }
@@ -589,7 +949,10 @@ export function jobStatusMessage(job) {
   if (dispatchState === "expired" || status === "expired") {
     return `Expired before delivery or completion.${reason} Create a new job after the agent reconnects.`;
   }
-  if (dispatchState === "rejected" || status === "canceled") {
+  if (dispatchState === "canceled" || status === "canceled") {
+    return `Canceled before completion.${reason} Check audit entries before retrying.`;
+  }
+  if (dispatchState === "rejected") {
     return `Rejected by controller policy.${reason} Review confirmation, target state, or audit entries before retrying.`;
   }
   if (dispatchState === "failed" || status === "failed") {
@@ -619,8 +982,17 @@ function jobTargetSummary(job) {
 }
 
 export function formatApiError(path, status) {
-  if (status === 401 || status === 403) {
-    return "Controller rejected this request. Check the admin token and permissions.";
+  if (status === 401) {
+    return "Admin authentication expired or missing. Paste the admin token and refresh.";
+  }
+  if (status === 403) {
+    return "Controller rejected this request. Check the admin token permissions.";
+  }
+  if (status === 404) {
+    return `${path} was not found. Refresh the list and select an existing resource.`;
+  }
+  if (status === 409) {
+    return `${path} conflicted with existing controller state. Refresh before retrying.`;
   }
   return `${path} returned ${status}`;
 }
@@ -679,12 +1051,24 @@ function selectedAgent() {
 function syncAgentActions() {
   const revokeButton = document.querySelector("#revoke-agent-key");
   const refreshButton = document.querySelector("#refresh-telemetry");
+  const assignButton = document.querySelector("#assign-policy");
+  const scheduleButton = document.querySelector("#schedule-policy");
   const agent = selectedAgent();
   if (revokeButton) {
     revokeButton.disabled = !agent || Boolean(agent.revoked);
   }
   if (refreshButton) {
     refreshButton.disabled = !agent;
+  }
+  if (assignButton) {
+    assignButton.disabled = !agent || !state.selectedPolicyId;
+  }
+  if (scheduleButton) {
+    scheduleButton.disabled = !agent || !state.selectedPolicyId;
+  }
+  const detail = document.querySelector("#agent-detail");
+  if (detail) {
+    detail.innerHTML = renderAgentDetail(agent);
   }
 }
 
@@ -693,11 +1077,14 @@ async function refreshSelectedAgent() {
   if (!agentId) {
     return;
   }
-  const [facts, metrics, drift, metricsHistory] = await Promise.all([
+  const [facts, metrics, drift, metricsHistory, driftHistory, logs, agentPolicies] = await Promise.all([
     readOptionalAgentData("facts", () => api.getLatestFacts(agentId)),
     readOptionalAgentData("metrics", () => api.getLatestMetrics(agentId)),
     readOptionalAgentData("drift", () => api.getLatestDrift(agentId)),
     readOptionalAgentData("metrics history", () => api.listMetrics(agentId, { limit: TELEMETRY_PAGE_LIMIT })),
+    readOptionalAgentData("drift history", () => api.listDrift(agentId, { limit: DETAIL_PAGE_LIMIT })),
+    readOptionalAgentData("agent logs", () => api.listAgentLogs(agentId, { limit: DETAIL_PAGE_LIMIT })),
+    readOptionalAgentData("agent policies", () => api.listAgentPolicies(agentId)),
   ]);
   document.querySelector("#facts-panel").textContent = renderSnapshot(
     facts.value,
@@ -710,12 +1097,29 @@ async function refreshSelectedAgent() {
   document.querySelector("#facts-chart").innerHTML = facts.error
     ? `<div class="empty">${escapeHtml(facts.error)}</div>`
     : renderFactsInventory(facts.value, "No facts snapshot.");
+  document.querySelector("#disk-inventory").innerHTML = facts.error
+    ? `<div class="empty">${escapeHtml(facts.error)}</div>`
+    : renderDiskInventory(facts.value, "No disk inventory.");
   document.querySelector("#metrics-chart").innerHTML = metricsHistory.error
     ? `<div class="empty">${escapeHtml(metricsHistory.error)}</div>`
-    : renderTelemetryCharts(snapshotItems(metricsHistory.value), METRICS_CHARTS, "No metrics snapshots in the recent window.");
+    : renderTelemetryCharts(
+        snapshotItems(metricsHistory.value),
+        METRICS_CHARTS,
+        "No metrics snapshots in the selected window.",
+        state.metricsWindowMs,
+      );
   document.querySelector("#drift-panel").innerHTML = drift.error
     ? `<div class="empty">${escapeHtml(drift.error)}</div>`
     : renderDrift(drift.value);
+  document.querySelector("#drift-history").innerHTML = driftHistory.error
+    ? `<div class="empty">${escapeHtml(driftHistory.error)}</div>`
+    : renderDriftHistory(driftHistory.value);
+  document.querySelector("#agent-logs").innerHTML = logs.error
+    ? `<div class="empty">${escapeHtml(logs.error)}</div>`
+    : renderAgentLogs(logs.value);
+  document.querySelector("#agent-policies").innerHTML = agentPolicies.error
+    ? `<div class="empty">${escapeHtml(agentPolicies.error)}</div>`
+    : renderAgentPolicies(agentPolicies.value, agentId);
 }
 
 function snapshotItems(page) {
@@ -740,10 +1144,12 @@ async function refreshAll() {
   }
   setStatus("Loading controller data...");
   await loadAgents();
-  const [jobs, audit, enrollmentTokens] = await Promise.all([
+  const [jobs, audit, enrollmentTokens, approvals, policies] = await Promise.all([
     api.listJobs(),
     api.listAudit(),
     api.listEnrollmentTokens(),
+    api.listApprovals("pending"),
+    api.listPolicies(),
   ]);
   document.querySelector("#jobs-list").innerHTML = renderJobs(jobs);
   document.querySelectorAll("[data-job-id]").forEach((button) => {
@@ -752,6 +1158,16 @@ async function refreshAll() {
       pollJobOutput(state.lastJobId).catch((error) => setStatus(error.message, "error"));
     });
   });
+  document.querySelector("#approvals-list").innerHTML = renderApprovals(approvals, jobs);
+  wireApprovalButtons();
+  state.policies = Array.isArray(policies) ? policies : [];
+  if (state.selectedPolicyId && !state.policies.some((policy) => policy.id === state.selectedPolicyId)) {
+    state.selectedPolicyId = "";
+  }
+  if (!state.selectedPolicyId) {
+    state.selectedPolicyId = state.policies[0]?.id || "";
+  }
+  renderPolicyList();
   document.querySelector("#enrollment-tokens-list").innerHTML = renderEnrollmentTokens(enrollmentTokens);
   document.querySelectorAll("[data-revoke-token-id]").forEach((button) => {
     button.addEventListener("click", () => {
@@ -760,6 +1176,116 @@ async function refreshAll() {
   });
   document.querySelector("#audit-list").innerHTML = renderAudit(audit);
   setStatus("Loaded latest controller data.", "ok");
+}
+
+function renderPolicyList() {
+  const list = document.querySelector("#policies-list");
+  if (list) {
+    list.innerHTML = renderPolicies(state.policies, state.selectedPolicyId);
+  }
+  syncAgentActions();
+}
+
+function wireApprovalButtons() {
+  document.querySelectorAll("[data-approve-approval-id]").forEach((button) => {
+    button.addEventListener("click", () => {
+      decideApproval(button.dataset.approveApprovalId, "approve").catch((error) =>
+        setStatus(error.message, "error"),
+      );
+    });
+  });
+  document.querySelectorAll("[data-reject-approval-id]").forEach((button) => {
+    button.addEventListener("click", () => {
+      decideApproval(button.dataset.rejectApprovalId, "reject").catch((error) =>
+        setStatus(error.message, "error"),
+      );
+    });
+  });
+}
+
+async function loadApprovalsJobsAndAudit() {
+  const [approvals, jobs, audit] = await Promise.all([
+    api.listApprovals("pending"),
+    api.listJobs(),
+    api.listAudit(),
+  ]);
+  document.querySelector("#approvals-list").innerHTML = renderApprovals(approvals, jobs);
+  wireApprovalButtons();
+  document.querySelector("#jobs-list").innerHTML = renderJobs(jobs);
+  document.querySelector("#audit-list").innerHTML = renderAudit(audit);
+}
+
+async function decideApproval(id, action) {
+  syncAdminTokenFromInput({ requireToken: true });
+  if (!id) {
+    throw new Error("Select an approval request first.");
+  }
+  const reason =
+    typeof globalThis.prompt === "function"
+      ? globalThis.prompt(`${action === "approve" ? "Approve" : "Reject"} reason`, "")
+      : "";
+  if (reason === null) {
+    return;
+  }
+  if (action === "approve") {
+    await api.approveApproval(id, { reason: reason || "" });
+  } else {
+    await api.rejectApproval(id, { reason: reason || "" });
+  }
+  setStatus(`${action === "approve" ? "Approved" : "Rejected"} ${id}.`, "ok");
+  await loadApprovalsJobsAndAudit();
+}
+
+async function expireDueApprovals() {
+  syncAdminTokenFromInput({ requireToken: true });
+  const response = await api.expireApprovals();
+  setStatus(`Expired ${response?.expired_count ?? 0} approval request(s).`, "ok");
+  await loadApprovalsJobsAndAudit();
+}
+
+async function loadPolicies() {
+  const policies = await api.listPolicies();
+  state.policies = Array.isArray(policies) ? policies : [];
+  if (state.selectedPolicyId && !state.policies.some((policy) => policy.id === state.selectedPolicyId)) {
+    state.selectedPolicyId = "";
+  }
+  if (!state.selectedPolicyId) {
+    state.selectedPolicyId = state.policies[0]?.id || "";
+  }
+  renderPolicyList();
+}
+
+async function submitPolicy(form) {
+  syncAdminTokenFromInput({ requireToken: true });
+  const data = new FormData(form);
+  const request = buildPolicySaveRequest({ source: data.get("policy-source") });
+  const saved = await api.savePolicy(request);
+  state.selectedPolicyId = saved.id;
+  setStatus(`Saved policy ${saved.id}.`, "ok");
+  await loadPolicies();
+}
+
+async function assignSelectedPolicy() {
+  syncAdminTokenFromInput({ requireToken: true });
+  const request = buildPolicyAssignmentRequest({
+    policyId: state.selectedPolicyId,
+    agentId: state.selectedAgentId,
+  });
+  await api.assignPolicy(state.selectedPolicyId, request);
+  setStatus(`Assigned policy ${state.selectedPolicyId} to ${state.selectedAgentId}.`, "ok");
+  await refreshSelectedAgent();
+}
+
+async function scheduleSelectedPolicy() {
+  syncAdminTokenFromInput({ requireToken: true });
+  const request = buildPolicyScheduleRequest({
+    policyId: state.selectedPolicyId,
+    agentId: state.selectedAgentId,
+    intervalSeconds: document.querySelector("#policy-schedule-interval")?.value,
+  });
+  await api.schedulePolicyDrift(state.selectedPolicyId, request);
+  setStatus(`Scheduled drift for ${state.selectedPolicyId} on ${state.selectedAgentId}.`, "ok");
+  await refreshSelectedAgent();
 }
 
 async function submitEnrollmentToken(form) {
@@ -833,24 +1359,67 @@ async function submitCommand(form) {
   });
   const response = await api.createCommandJob(request);
   state.lastJobId = response.job_id;
+  const pendingApproval = response.status === "pending_approval" || response.approval_request_id;
   document.querySelector("#job-output").textContent = renderJobOutputStatus(
     {
       id: response.job_id,
-      status: "queued",
+      status: pendingApproval ? "pending_approval" : "queued",
+      dispatch_state: pendingApproval ? "created" : "created",
+      target_count: response.target_count,
+      target_agents: [],
+    },
+    { jobId: response.job_id },
+  );
+  document.querySelector("#job-targets").innerHTML = renderJobTargetTable(null);
+  if (pendingApproval) {
+    setStatus(`Created ${response.job_id}; approval ${response.approval_request_id} is required.`, "ok");
+    await loadApprovalsJobsAndAudit();
+    return;
+  }
+  setStatus(`Created ${response.job_id} for ${response.target_count} target.`, "ok");
+  await pollJobOutput(response.job_id);
+}
+
+async function submitRunbook(form) {
+  syncAdminTokenFromInput({ requireToken: true });
+  const data = new FormData(form);
+  const request = buildRunbookJobRequest({
+    agentId: state.selectedAgentId,
+    document: data.get("runbook-document"),
+    confirmed: data.get("confirm-risk") === "on",
+  });
+  const response = await api.createRunbookJob(request);
+  state.lastJobId = response.job_id;
+  const pendingApproval = response.status === "pending_approval" || response.approval_request_id;
+  const statusText = pendingApproval
+    ? `Runbook job ${response.job_id} requires approval ${response.approval_request_id}.`
+    : `Runbook job ${response.job_id} created.`;
+  document.querySelector("#runbook-result").textContent = statusText;
+  document.querySelector("#job-output").textContent = renderJobOutputStatus(
+    {
+      id: response.job_id,
+      status: pendingApproval ? "pending_approval" : "queued",
       dispatch_state: "created",
       target_count: response.target_count,
       target_agents: [],
     },
     { jobId: response.job_id },
   );
-  setStatus(`Created ${response.job_id} for ${response.target_count} target.`, "ok");
-  await pollJobOutput(response.job_id);
+  setStatus(statusText, "ok");
+  await loadApprovalsJobsAndAudit();
+  if (!pendingApproval) {
+    await pollJobOutput(response.job_id);
+  }
 }
 
 async function pollJobOutput(jobId) {
   const outputElement = document.querySelector("#job-output");
+  const targetElement = document.querySelector("#job-targets");
   for (let attempt = 1; attempt <= JOB_OUTPUT_POLL_ATTEMPTS; attempt += 1) {
     const [job, chunks] = await Promise.all([api.getJob(jobId), api.getJobOutput(jobId)]);
+    if (targetElement) {
+      targetElement.innerHTML = renderJobTargetTable(job);
+    }
     if (Array.isArray(chunks) && chunks.length > 0) {
       outputElement.textContent = renderJobOutput(chunks, { jobId, job });
       if (isTerminalJob(job)) {
@@ -871,6 +1440,9 @@ async function pollJobOutput(jobId) {
     }
   }
   const [job, chunks] = await Promise.all([api.getJob(jobId), api.getJobOutput(jobId)]);
+  if (targetElement) {
+    targetElement.innerHTML = renderJobTargetTable(job);
+  }
   outputElement.textContent =
     Array.isArray(chunks) && chunks.length > 0
       ? renderJobOutput(chunks, { jobId, job })
@@ -916,6 +1488,10 @@ function boot() {
   if (!form) {
     return;
   }
+  const warning = document.querySelector("#transport-warning");
+  if (warning && globalThis.location?.protocol === "http:") {
+    warning.hidden = false;
+  }
   form.addEventListener("submit", (event) => {
     event.preventDefault();
     state.token = readAdminTokenInput();
@@ -928,12 +1504,53 @@ function boot() {
       submitCommand(runForm).catch((error) => setStatus(error.message, "error"));
     });
   }
+  const runbookForm = document.querySelector("#runbook-form");
+  if (runbookForm) {
+    runbookForm.addEventListener("submit", (event) => {
+      event.preventDefault();
+      submitRunbook(runbookForm).catch((error) => setStatus(error.message, "error"));
+    });
+  }
+  const policyForm = document.querySelector("#policy-form");
+  if (policyForm) {
+    policyForm.addEventListener("submit", (event) => {
+      event.preventDefault();
+      submitPolicy(policyForm).catch((error) => setStatus(error.message, "error"));
+    });
+  }
   const agentsList = document.querySelector("#agents-list");
   if (agentsList) {
     agentsList.addEventListener("click", handleAgentsListClick);
   }
+  const policiesList = document.querySelector("#policies-list");
+  if (policiesList) {
+    policiesList.addEventListener("click", (event) => {
+      const button = event.target?.closest?.("[data-policy-id]");
+      if (!button?.dataset?.policyId) {
+        return;
+      }
+      state.selectedPolicyId = button.dataset.policyId;
+      renderPolicyList();
+    });
+  }
   document.querySelector("#revoke-agent-key")?.addEventListener("click", () => {
     revokeSelectedAgentKey().catch((error) => setStatus(error.message, "error"));
+  });
+  document.querySelector("#expire-approvals")?.addEventListener("click", () => {
+    expireDueApprovals().catch((error) => setStatus(error.message, "error"));
+  });
+  document.querySelector("#assign-policy")?.addEventListener("click", () => {
+    assignSelectedPolicy().catch((error) => setStatus(error.message, "error"));
+  });
+  document.querySelector("#schedule-policy")?.addEventListener("click", () => {
+    scheduleSelectedPolicy().catch((error) => setStatus(error.message, "error"));
+  });
+  document.querySelector("#metrics-range")?.addEventListener("change", (event) => {
+    const value = Number.parseInt(event.target?.value || "", 10);
+    state.metricsWindowMs = Number.isInteger(value) && value > 0 ? value : DEFAULT_TELEMETRY_WINDOW_MS;
+    if (state.selectedAgentId) {
+      refreshSelectedAgent().catch((error) => setStatus(error.message, "error"));
+    }
   });
   document.querySelector("#refresh-telemetry")?.addEventListener("click", () => {
     try {

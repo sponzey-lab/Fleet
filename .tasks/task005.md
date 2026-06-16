@@ -1,93 +1,110 @@
-# Task 005 - Agent Persistent Session Loop
+# Task 005: Cancel/Timeout/Reconnect 복구
 
-상태: `[ ] 대기` `[ ] 진행 중` `[x] 완료`
+상태: Completed
+우선순위: P0
+연결 계획: `.tasks/plan.md` Phase 005
+의존성: Task 004
+결과물: 끊김과 취소 상황에서 신뢰 가능한 assignment 처리
 
 ## 목표
 
-Agent가 heartbeat마다 연결을 열고 닫는 구조에서 벗어나, Controller와 WebSocket session을 유지하도록 Agent loop를 전환한다.
+agent disconnect, controller restart, task timeout, operator cancel 상황에서 job/assignment 상태가 일관되게 남도록 만든다. 원격 실행 제품에서 "끊겼는데 성공처럼 보이는 상태"를 허용하지 않는다.
 
-이 task의 핵심은 Agent 내부에서도 single writer queue를 두고, task 실행 중에도 heartbeat/liveness와 session read/write가 막히지 않게 하는 것이다.
+## 기능 묶음
 
-## 기능 범위
+1. cancel protocol과 process boundary
+2. timeout 처리
+3. reconnect/recovery 정책
 
-### 1. Agent session loop 도입
+## 구현 체크리스트
 
-- [x] `run_agent_session_loop` 또는 이에 준하는 persistent session loop를 구현한다.
-- [x] 기존 `run_agent_heartbeat_loop`와 CLI 호환성을 유지한다.
-- [x] `--heartbeat-interval-seconds`는 연결 주기가 아니라 liveness tick interval로 의미를 재정의한다.
+Cancel:
 
-동작:
+- [x] cancel API 또는 기존 cancel 경로를 확인한다.
+- [x] cancel request domain use case를 정리한다.
+- [x] cancel message protocol을 설계한다.
+- [x] queued assignment cancel 처리
+- [x] dispatched but not started assignment cancel 처리
+- [x] running assignment cancel 처리
+- [x] agent process runner kill/terminate 정책 정리
+- [x] cancel result와 failed result를 구분한다.
+- [x] cancel audit event를 남긴다.
 
-```text
-agent start
-  -> load config
-  -> controller identity pinning 확인
-  -> websocket connect
-  -> agent_hello/auth/auth_accepted
-  -> persistent read/write loop
-  -> failure 시 reconnect backoff
+Timeout:
+
+- [x] task timeout 기본값을 확인한다.
+- [x] timeout이 어디에서 결정되는지 확인한다.
+- [x] assignment timeout deadline 저장 여부를 결정한다.
+- [x] timeout 시 agent process 종료 정책을 구현한다.
+- [x] timeout result와 canceled result를 구분한다.
+- [x] timeout audit/log를 남긴다.
+
+Reconnect/Recovery:
+
+- [x] agent disconnect 시 active assignment 상태 처리 정책을 정한다.
+- [x] reconnect 시 agent가 in-flight task 상태를 보고할지 결정한다.
+- [x] controller restart 후 running assignment 복구 정책을 정한다.
+- [x] stale dispatched assignment expiry 정책을 정한다.
+- [x] duplicate session 발생 시 running task 처리 정책을 정한다.
+- [x] recovery path가 active session registry에만 의존하지 않도록 한다.
+
+## 테스트
+
+- [x] cancel before dispatch test
+- [x] cancel after dispatch before start test
+- [x] cancel while running test
+- [x] timeout while running test
+- [x] disconnect while dispatched test
+- [x] disconnect while running test
+- [x] reconnect reports assignment state test
+- [x] controller restart recovery policy test
+- [x] duplicate session does not mark job success test
+
+## 검증 명령
+
+```bash
+cargo fmt --check
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+git diff --check
 ```
 
-체크:
+## 문서 업데이트
 
-- [x] `--once`는 smoke/test 용도로 한 번 연결/처리 후 종료할 수 있어야 한다.
-- [x] network failure는 기본적으로 종료하지 않고 retry한다.
-- [x] controller fingerprint mismatch는 fatal로 유지한다.
-
-### 2. Single outbound writer queue
-
-- [x] Agent 내부 WebSocket writer는 하나만 둔다.
-- [x] heartbeat, facts, metrics, log, output producer는 outbound queue에 message를 넣는다.
-- [x] command output callback이 socket에 직접 쓰지 않게 바꾼다.
-
-필수:
-
-- [x] task worker가 오래 실행되어도 heartbeat가 전송된다.
-- [x] outbound queue가 가득 찰 때 무제한 메모리 증가를 막는다.
-- [x] output limit 초과와 write failure를 task/session failure로 명확히 전환한다.
-
-### 3. Task worker 분리
-
-- [x] read loop는 `task_assignment`를 받고 task worker에 work item을 넘긴다.
-- [x] task worker는 signature/expiry/nonce/target 검증 후 실행한다.
-- [x] output_chunk와 task_result는 outbound queue를 통해 전송한다.
-
-초기 concurrency 정책:
-
-- [x] Agent당 전체 task concurrency는 1로 둔다.
-- [x] busy 상태에서 새 task를 받으면 reject 또는 queued 정책을 명확히 한다.
-- [x] low-risk drift와 high-risk command 동시 실행은 후속 정책으로 미룬다.
-
-## 테스트와 검증
-
-필수:
-
-- [x] session loop reconnect test
-- [x] heartbeat interval test
-- [x] controller close 후 retry test
-- [x] 긴 task 실행 중 heartbeat가 막히지 않는 test
-- [x] task worker가 socket writer에 직접 쓰지 않는 구조 검토
-- [x] `cargo test -p fleet-cli agent_session`
-- [x] `cargo test -p fleet-runner streaming`
-- [x] `cargo fmt --all --check`
-- [x] `git diff --check`
-
-권장:
-
-- [x] outbound queue full fault injection test
-- [ ] revoked/auth rejected 시 retry 정책 test
-- [x] controller fingerprint mismatch fatal test 유지
+- [x] docs/api.md에 cancel/timeout 상태를 문서화한다.
+- [x] README troubleshooting에 agent disconnect/reconnect 기대 동작을 정리한다.
+- [x] Web Admin 상태 표시 문구를 업데이트한다.
 
 ## 완료 기준
 
-- [x] Agent는 정상 상태에서 Controller와 WebSocket을 유지한다.
-- [x] connection failure 시 기본적으로 종료하지 않고 retry한다.
-- [x] task 실행 중 heartbeat/liveness가 막히지 않는다.
-- [x] Agent socket writer는 단일 queue 기반이다.
-- [x] 기존 enrollment, pinning, signature 검증이 유지된다.
+- [x] cancel과 timeout이 서로 다른 terminal result로 남는다.
+- [x] disconnect/reconnect 상황에서 success로 오인하지 않는다.
+- [x] process runner가 cancel/timeout 시 child process를 정리한다.
+- [x] reconnect/recovery 정책이 테스트로 고정된다.
 
-## 비범위
+## 구현 결과
 
-- [x] Controller job 생성 즉시 dispatch 연결하지 않음
-- [x] Web Admin UI 변경하지 않음
-- [x] task cancellation protocol 구현하지 않음
+- `POST /api/jobs/{job_id}/cancel` API를 추가했다.
+- cancel request body는 optional이며, `reason`이 있으면 audit와 assignment `last_error`에 redaction 후 반영한다.
+- `WirePayload::TaskCancel`을 추가해 controller가 active agent session으로 cancel을 보낼 수 있게 했다.
+- `TaskResultStatus`를 추가해 `succeeded`, `failed`, `canceled`, `timed_out`을 구분한다.
+- 구버전 agent가 `status` 없이 `task_result`를 보내면 기존처럼 `exit_code` 기반으로 success/failed fallback 처리한다.
+- `queued` assignment cancel은 DB에서 바로 `canceled` terminal 상태가 된다.
+- `dispatched`, `accepted`, `started` assignment cancel은 DB 상태를 `canceled`로 만들고, active session이 있으면 `task_cancel`을 best-effort로 보낸다.
+- agent persistent session은 현재 task id와 cancel flag를 가진 작은 runtime state를 유지한다.
+- command task는 `run_command_streaming_with_cancel`을 사용해 cancel/timeout 시 child process를 kill한다.
+- cancel result는 `canceled`, timeout result는 `timed_out`으로 controller에 보고된다.
+- controller는 `timed_out`을 assignment/job `expired`로 저장한다.
+- 이미 terminal 상태인 assignment는 늦은 `task_result`로 덮어쓰지 않는다. cancel 후 late success가 와도 job은 `canceled`로 남는다.
+- reconnect 시 별도 in-flight report payload는 추가하지 않았다. 현재 정책은 DB의 assignment 상태를 source of truth로 두고, queued만 reconnect drain 대상이며, dispatched/started terminal 결정은 result/cancel/timeout/expiry/reconciler가 담당한다.
+- controller restart 후 active session registry는 비어 있을 수 있으므로 recovery 판단은 registry만 보지 않고 DB assignment 상태를 기준으로 한다.
+
+## 검증 결과
+
+- `cargo fmt --check`: 통과
+- `cargo test --workspace`: 통과
+- `cargo clippy --workspace --all-targets -- -D warnings`: 통과
+- `git diff --check`: 통과
+- `node web-admin/scripts/test.js`: 통과
+- `node web-admin/scripts/typecheck.js`: 통과
+- `docs/openapi.json`, `web-admin/api.schema.json` JSON parse: 통과

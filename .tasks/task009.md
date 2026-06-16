@@ -1,88 +1,104 @@
-# Task 009 - Revoke/Offline/Session Close 정책
+# Task 009: Admin Auth/RBAC 초안과 Permission Check
 
-상태: `[ ] 대기` `[ ] 진행 중` `[x] 완료`
+상태: Completed
+우선순위: P1
+연결 계획: `.tasks/plan.md` Phase 007
+의존성: Task 008
+결과물: admin token 이후 권한 모델의 최소 기반
 
 ## 목표
 
-persistent session에서 보안 이벤트와 상태 변화가 즉시 반영되도록 revoke, offline, session close 정책을 구현한다.
+현재 admin token 중심 접근을 제품형 admin identity와 permission check로 확장할 수 있는 기반을 만든다. 이번 task는 full OIDC/RBAC 구현이 아니라, approval과 위험 작업을 안전하게 다루기 위한 최소 권한 경계다.
 
-특히 Agent key revoke는 "다음 heartbeat 때 차단"이 아니라 active session close까지 포함해야 한다.
+## 기능 묶음
 
-## 기능 범위
+1. Admin identity/session model 초안
+2. Role/permission matrix 초안
+3. API permission check 적용 지점 정리
 
-### 1. Revoke 즉시 active session close
+## 구현 체크리스트
 
-- [x] revoke agent key API 성공 직후 session registry에서 해당 agent session을 close한다.
-- [x] close reason은 `agent_revoked`로 남긴다.
-- [x] revoked agent에는 새 task dispatch가 막힌다.
+Admin Identity:
 
-정책:
+- [x] 현재 admin token 인증 경로를 조사한다.
+- [x] bootstrap admin token과 product admin identity의 관계를 정한다.
+- [x] admin actor id 개념을 추가한다.
+- [x] API request context에 actor를 명시적으로 전달한다.
+- [x] audit event에 actor를 연결한다.
+- [x] CLI profile/login과의 관계를 정리한다.
 
-- queued assignment는 더 이상 dispatch하지 않는다.
-- running task는 이미 OS process로 실행 중일 수 있으므로 즉시 kill 보장은 하지 않는다.
-- task cancellation protocol 전까지 timeout을 running process boundary로 사용한다.
+RBAC 초안:
 
-문서화:
+- [x] role 후보를 정한다: owner/admin/operator/viewer.
+- [x] permission 후보를 정한다.
+- [x] agent read permission
+- [x] job create permission
+- [x] job approve permission
+- [x] job cancel permission
+- [x] enrollment token create permission
+- [x] agent revoke permission
+- [x] audit read permission
+- [x] policy write permission
+- [x] permission matrix 문서를 작성한다.
 
-- [x] revoke는 추가 task 수신 차단과 session 종료를 보장한다고 설명한다.
-- [x] 이미 실행 중인 local process kill은 별도 cancellation 기능이라고 설명한다.
+Permission Check:
 
-### 2. Offline 판정 재정의
+- [x] API handler에서 permission check가 들어갈 공통 경계를 정한다.
+- [x] UI는 권한을 결정하지 않음을 확인한다.
+- [x] forbidden response model을 정한다.
+- [x] approval approve/reject에 permission check를 적용한다.
+- [x] enrollment token creation에 permission check를 적용한다.
+- [x] agent revoke에 permission check를 적용한다.
 
-- [x] active authenticated session이 있으면 online으로 본다.
-- [x] session은 없지만 last_seen_at이 threshold 이내면 reconnecting 또는 recently_seen으로 볼 수 있다.
-- [x] threshold 초과는 offline이다.
-- [x] revoked/disabled는 offline + revoked로 표시한다.
+## 테스트
 
-필요 설정 후보:
+- [x] admin token maps to bootstrap actor test
+- [x] permission allowed test
+- [x] permission denied test
+- [x] approval approve requires permission test
+- [x] enrollment token create requires permission test
+- [x] agent revoke requires permission test
+- [x] forbidden response contract test
+- [x] audit includes actor test
 
-- `--agent-session-idle-timeout-seconds`
-- `--agent-heartbeat-timeout-seconds`
+## 검증 명령
 
-규칙:
+```bash
+cargo fmt --check
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+git diff --check
+```
 
-- 설정은 bootstrap에서만 받는다.
-- UI/API로 runtime 변경하지 않는다.
+검증 결과:
 
-### 3. Session close reason audit/log
-
-- [x] `agent_session_started`
-- [x] `agent_session_ended`
-- [x] `agent_session_replaced`
-- [x] `agent_session_revoked_closed`
-- [x] `agent_session_auth_failed`
-
-로그 정책:
-
-- Product log는 상태 변화 중심으로 낮은 볼륨 유지.
-- Field debug에는 connection id, close reason, duration, queue depth 포함.
-- token/private key/raw output은 기록하지 않는다.
-
-## 테스트와 검증
-
-필수:
-
-- [x] revoke API가 active session을 제거하는 test
-- [x] revoked agent reconnect 거부 test
-- [x] revoke 직후 새 task dispatch가 막히는 test
-- [x] active session close 후 agent inventory offline+revoked 표시 test
-- [x] duplicate session replacement audit test
-- [x] heartbeat timeout/offline transition test
-- [x] `cargo test -p fleet-controller revoke`
-- [x] `cargo test -p fleet-domain agent`
-- [x] `npm test --workspace web-admin`
+- [x] `cargo fmt --all --check`
+- [x] `cargo test -p fleet-application -p fleet-store -p fleet-controller`
+- [x] `cargo test --workspace`
+- [x] `cargo clippy --workspace --all-targets -- -D warnings`
+- [x] `node web-admin/scripts/test.js`
 - [x] `git diff --check`
+
+## 문서 업데이트
+
+- [x] docs/security.md 또는 README에 admin token과 향후 admin model 관계를 설명한다.
+- [x] docs/api.md에 401/403 response 차이를 문서화한다.
+- [x] Web Admin forbidden message 기준을 정리한다.
 
 ## 완료 기준
 
-- [x] revoked agent는 active session에서 제거된다.
-- [x] revoked agent는 더 이상 task를 받을 수 없다.
-- [x] UI/API는 offline과 revoked를 함께 보여줄 수 있다.
-- [x] session close reason이 audit/log로 남는다.
-- [x] running process kill 한계가 문서화된다.
+- [x] admin 요청에는 actor 개념이 붙는다.
+- [x] 위험 API에는 permission check 경계가 있다.
+- [x] UI가 권한 판단을 하지 않는다.
+- [x] full OIDC/RBAC는 later로 남기되 확장 경로가 막히지 않는다.
 
-## 비범위
+## 구현 결과
 
-- [x] task cancellation protocol 구현하지 않음
-- [x] running OS process 즉시 kill 보장하지 않음
-- [x] multi-controller HA session migration 구현하지 않음
+- Bootstrap admin token은 `bootstrap-admin` actor와 `owner` role로 인증된다.
+- Controller protected API 경계에서 admin token을 `AdminRequestContext`로 변환하고 route별 permission을 검사한다.
+- `owner`/`admin`은 전체 권한, `operator`는 job/approval 중심 권한, `viewer`는 조회 중심 권한으로 정의했다.
+- Approval approve/reject, enrollment token create/revoke, agent revoke, job create/cancel, selector preview 등에 permission check를 적용했다.
+- Enrollment token 생성/폐기, agent label/revoke, approval approve/reject, job 생성 audit은 인증된 admin actor를 사용한다.
+- Approval decision request의 legacy `actor` field는 호환을 위해 허용하지만 audit/authorization에는 사용하지 않는다.
+- Web Admin은 401/403을 권한 문제로 안내하지만 권한 판단은 controller가 한다.
+- `docs/security.md`, `docs/api.md`, `docs/openapi.json`, README를 현재 인증/권한 모델에 맞춰 갱신했다.

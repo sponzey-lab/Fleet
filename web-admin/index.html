@@ -24,6 +24,9 @@
       <section id="status" class="status" aria-live="polite">
         Enter the one-time admin token printed by <code>sponzey controller init</code>.
       </section>
+      <section id="transport-warning" class="warning-banner" hidden>
+        HTTP transport is test-only. Tokens, commands, and operational data are not encrypted.
+      </section>
 
       <section class="layout">
         <article class="panel agents-panel">
@@ -35,6 +38,7 @@
             </div>
           </div>
           <div id="agents-list" class="list empty">No data loaded.</div>
+          <div id="agent-detail" class="detail-panel empty">Select an agent.</div>
         </article>
 
         <article class="panel token-panel">
@@ -68,13 +72,21 @@
             </div>
           </div>
           <div id="facts-chart" class="chart-set empty">Select an agent.</div>
+          <div id="disk-inventory" class="table-view empty">Select an agent.</div>
           <pre id="facts-panel" class="snapshot">Select an agent.</pre>
         </article>
 
         <article class="panel">
           <div class="panel-heading">
             <h2>Metrics</h2>
-            <span class="muted">Usage + 5 minute trend</span>
+            <div class="panel-actions">
+              <label class="inline-control" for="metrics-range">Range</label>
+              <select id="metrics-range">
+                <option value="300000" selected>5 min</option>
+                <option value="900000">15 min</option>
+                <option value="1800000">30 min</option>
+              </select>
+            </div>
           </div>
           <div id="metrics-chart" class="chart-set empty">Select an agent.</div>
           <pre id="metrics-panel" class="snapshot">Select an agent.</pre>
@@ -86,6 +98,7 @@
             <span class="muted">Expected vs actual</span>
           </div>
           <div id="drift-panel" class="diff">Select an agent.</div>
+          <div id="drift-history" class="list compact-list empty">Select an agent.</div>
         </article>
 
         <article class="panel job-panel">
@@ -104,7 +117,42 @@
             </label>
             <button type="submit">Run</button>
           </form>
+          <div id="job-targets" class="table-view empty">Run a command or select a job.</div>
           <pre id="job-output" class="snapshot output-viewer">Run a command or select a job to view output.</pre>
+        </article>
+
+        <article class="panel approval-panel">
+          <div class="panel-heading">
+            <h2>Approvals</h2>
+            <div class="panel-actions">
+              <span class="muted">Pending risky jobs</span>
+              <button id="expire-approvals" type="button">Expire due</button>
+            </div>
+          </div>
+          <div id="approvals-list" class="list empty">No approvals loaded.</div>
+        </article>
+
+        <article class="panel runbook-panel">
+          <div class="panel-heading">
+            <h2>Runbooks</h2>
+            <span class="muted">Signed runbook job</span>
+          </div>
+          <form id="runbook-form" class="runbook-form">
+            <label for="runbook-document">Runbook YAML</label>
+            <textarea id="runbook-document" name="runbook-document" rows="9">apiVersion: fleet.sponzey.dev/v1alpha1
+kind: Runbook
+name: quick-inventory
+steps:
+  - id: collect-facts
+    facts.collect: {}
+</textarea>
+            <label class="checkbox-row">
+              <input name="confirm-risk" type="checkbox" />
+              <span>Confirm runbook execution</span>
+            </label>
+            <button type="submit">Create runbook job</button>
+          </form>
+          <pre id="runbook-result" class="snapshot output-viewer">Create a runbook job to view status here.</pre>
         </article>
 
         <article class="panel">
@@ -113,6 +161,43 @@
             <span class="muted">Recent command history</span>
           </div>
           <div id="jobs-list" class="list empty">No jobs loaded.</div>
+        </article>
+
+        <article class="panel policy-panel">
+          <div class="panel-heading">
+            <h2>Policies</h2>
+            <span class="muted">Source, assignment, schedules</span>
+          </div>
+          <form id="policy-form" class="policy-form">
+            <label for="policy-source">Policy YAML</label>
+            <textarea id="policy-source" name="policy-source" rows="8">apiVersion: fleet.sponzey.dev/v1alpha1
+kind: Policy
+metadata:
+  name: nginx-running
+spec:
+  selector:
+    matchLabels:
+      role: web
+  checks: []
+</textarea>
+            <button type="submit">Save policy</button>
+          </form>
+          <div id="policies-list" class="list empty">No policies loaded.</div>
+          <div class="policy-actions">
+            <button id="assign-policy" type="button" disabled>Assign selected policy</button>
+            <label for="policy-schedule-interval">Drift interval seconds</label>
+            <input id="policy-schedule-interval" type="number" min="1" value="300" />
+            <button id="schedule-policy" type="button" disabled>Schedule drift</button>
+          </div>
+          <div id="agent-policies" class="list compact-list empty">Select an agent.</div>
+        </article>
+
+        <article class="panel logs-panel">
+          <div class="panel-heading">
+            <h2>Logs</h2>
+            <span class="muted">Agent operational log chunks</span>
+          </div>
+          <div id="agent-logs" class="list compact-list empty">Select an agent.</div>
         </article>
 
         <article class="panel audit-panel">

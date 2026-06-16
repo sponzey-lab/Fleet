@@ -1,98 +1,105 @@
-# Task 001 - 현재 WebSocket Lifecycle 정리와 테스트 고정
+# Task 001: 문서 최신화, 구현 Feature Matrix, Release Gate 정리
 
-상태: `[ ] 대기` `[ ] 진행 중` `[x] 완료`
+상태: Completed
+우선순위: P0
+연결 계획: `.tasks/plan.md` Phase 004
+의존성: 없음
+결과물: 현재 구현 기준선 문서, feature matrix, release gate
 
 ## 목표
 
-현재 Agent-Controller WebSocket이 "상시 연결"이 아니라 heartbeat 주기마다 열고 닫는 구조임을 테스트와 문서로 명확히 고정한다.
+현재 구현과 문서의 차이를 먼저 줄인다. 이 작업은 단순 문서 정리가 아니라 이후 phase에서 기준으로 삼을 "현재 무엇이 되고, 무엇이 부분 구현이며, 무엇이 아직 안 되는지"를 확정하는 작업이다.
 
-이 task는 큰 behavior 변경을 하지 않는다. 이후 persistent session 전환 중 회귀를 확인할 수 있도록 현재 lifecycle, 한계, 전환 목표를 코드 테스트와 문서에 남기는 것이 목적이다.
+사용자가 README만 보고 controller와 agent를 설치, 초기화, 연결, 확인, 삭제/재등록할 수 있어야 한다. 또한 개발자가 다음 기능을 추가할 때 어떤 검증 명령을 반드시 실행해야 하는지도 분명해야 한다.
 
-## 배경
+## 기능 묶음
 
-현재 구조:
+1. README/README.ko/docs/PROJECT 정책 동기화
+2. 구현 feature matrix 작성
+3. release gate와 stale docs scan 기준 확정
 
-```text
-Agent
-  -> controller identity 확인
-  -> WebSocket 연결
-  -> auth
-  -> heartbeat/facts/metrics/log 전송
-  -> queued task 1개 수신 가능
-  -> output/task_result 전송
-  -> 연결 종료
-  -> heartbeat interval sleep
+## 구현 체크리스트
+
+문서 기준선:
+
+- [x] README.md에서 Controller는 중앙 서버, Agent는 대상 서버라는 용어를 첫 부분에 명확히 설명한다.
+- [x] README.ko.md도 README.md와 같은 구조와 의미로 맞춘다.
+- [x] controller 하나에 여러 agent가 outbound로 붙는 구조를 명확히 쓴다.
+- [x] controller가 agent로 직접 inbound 접속하지 않는다는 점을 명시한다.
+- [x] HTTP는 사용 가능하지만 test-only라는 경고를 유지한다.
+- [x] production 설명은 HTTPS 중심으로 정리한다.
+- [x] HTTPS 준비 절차는 기본 흐름과 분리해서 설명한다.
+- [x] `--dev-insecure-loopback` 잔여 예시를 제거하거나 과거 설명으로 격리한다.
+- [x] agent 초기화는 현재 권장 UX인 `sponzey agent init` 중심으로 정리한다.
+- [x] agent 삭제/재등록은 data dir 삭제, revoke, 새 token 발급의 차이를 구분한다.
+
+세부 문서:
+
+- [x] `docs/api.md`에서 구현된 endpoint와 미구현 endpoint를 구분한다.
+- [x] facts/metrics/drift paging contract를 문서화한다.
+- [x] `agent_system_time_ms`와 `stored_at`의 의미를 문서화한다.
+- [x] `docs/logs.md`에서 log interval이 heartbeat와 독립된 현재 구조를 반영한다.
+- [x] `docs/service-install.md`에서 `agent init` 중심 예시로 정리한다.
+- [x] `docs/release-notes-mvp.md`를 v0.0.14 기준 현재 구현으로 갱신한다.
+- [x] `npm/fleet/README.md`에서 지원 platform과 미지원 platform을 분리한다.
+- [x] `PROJECT.md`의 HTTP 정책, persistent session, npm/package 설명이 현재 구현과 충돌하는지 확인한다.
+
+Feature matrix:
+
+- [x] `docs/feature-matrix.md` 또는 적절한 문서에 현재 기능 목록을 만든다.
+- [x] 각 기능을 `Implemented`, `Partial`, `Planned`, `Policy decision required`로 표시한다.
+- [x] Controller 기능을 정리한다.
+- [x] Agent 기능을 정리한다.
+- [x] Web Admin 기능을 정리한다.
+- [x] CLI 기능을 정리한다.
+- [x] npm/package 기능을 정리한다.
+- [x] API/OpenAPI 기능을 정리한다.
+- [x] security/audit 기능을 정리한다.
+
+Release gate:
+
+- [x] `cargo fmt --check`를 release gate에 포함한다.
+- [x] `cargo clippy --workspace --all-targets -- -D warnings`를 release gate에 포함한다.
+- [x] `cargo test --workspace`를 release gate에 포함한다.
+- [x] `npm test --workspace @sponzey/fleet`를 release gate에 포함한다.
+- [x] 현재 존재하는 smoke script 목록을 조사한다.
+- [x] release 전 필수 smoke와 선택 smoke를 구분한다.
+- [x] stale docs scan keyword 목록을 정리한다.
+
+## 테스트
+
+- [x] README 명령이 현재 CLI help와 충돌하지 않는지 수동 확인한다.
+- [x] API 문서의 endpoint가 실제 route와 크게 어긋나지 않는지 확인한다.
+- [x] stale keyword scan을 실행한다.
+- [x] 영어/한글 README의 주요 명령과 흐름이 동일한지 비교한다.
+
+## 검증 명령
+
+```bash
+rg -n --glob '!docs/release-gate.md' "dev-insecure-loopback|insecure remote HTTP|planned release package|sponzey agent enroll|agent enroll --" README.md README.ko.md PROJECT.md docs npm
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+npm test --workspace @sponzey/fleet
+git diff --check
 ```
 
-문제:
+## 문서 업데이트
 
-- WebSocket을 쓰지만 persistent session이 아니다.
-- `Run` 직후 Controller가 Agent에 즉시 task를 push할 수 없다.
-- Agent가 sleep 중이면 job은 다음 heartbeat까지 queued 상태로 남는다.
-- 이 구조를 모른 채 UI polling만 고치면 근본 문제가 해결되지 않는다.
-
-## 기능 범위
-
-### 1. 현재 lifecycle 테스트 고정
-
-- [x] Controller WebSocket handler가 heartbeat 이후 idle이면 연결을 닫는 현재 동작을 테스트로 기록한다.
-- [x] queued assignment가 있을 때 heartbeat 연결에서 task_assignment가 내려가는 현재 동작을 테스트로 기록한다.
-- [x] queued assignment가 없으면 즉시 push 경로가 없다는 점을 regression 관점에서 문서화한다.
-
-검토 위치:
-
-- `crates/fleet-controller/src/lib.rs`
-- `handle_agent_websocket_axum`
-- `read_task_data_until_close_axum`
-- `pending_task_assignment_message`
-
-주의:
-
-- 이 task에서 persistent session 구현을 시작하지 않는다.
-- 현재 동작 고정 테스트가 너무 구현 세부에 묶이면 이후 refactor를 방해하므로, observable behavior 위주로 작성한다.
-
-### 2. Agent loop 용어 정리 준비
-
-- [x] 현재 `run_agent_heartbeat_loop`, `run_agent_heartbeat_once`, `AgentHeartbeatOptions`의 책임을 정리한다.
-- [x] 바로 rename하지 않아도 된다. rename이 필요하면 behavior 변경과 분리된 tidy commit/task로 처리한다.
-- [x] CLI help에서 "heartbeat and task loop"가 persistent session 목표와 어떻게 달라질지 메모한다.
-
-검토 위치:
-
-- `crates/fleet-cli/src/lib.rs`
-- `sponzey agent start --help`
-- `run_agent_heartbeat_loop_with`
-
-### 3. protocol 문서에 현재 한계와 전환 목표 반영
-
-- [x] `docs/protocol.md`에 현재 WebSocket gateway 흐름이 heartbeat-bound임을 명확히 쓴다.
-- [x] 같은 문서에 목표 구조가 persistent outbound session임을 쓴다.
-- [x] "Controller가 Agent로 직접 접속한다"는 오해가 생기지 않게 표현한다.
-
-## 테스트와 검증
-
-필수:
-
-- [x] `cargo test -p fleet-controller websocket`
-- [x] `cargo test -p fleet-cli agent_heartbeat_loop`
-- [x] `cargo fmt --all --check`
-- [x] `git diff --check`
-
-권장:
-
-- [x] 관련 controller unit test 이름에 `heartbeat_bound` 또는 `current_lifecycle`처럼 의도를 드러낸다.
-- [x] 테스트가 느려지지 않도록 실제 네트워크 long wait는 피하고 fake/timeout을 짧게 둔다.
+- [x] README.md
+- [x] README.ko.md
+- [x] PROJECT.md
+- [x] docs/api.md
+- [x] docs/logs.md
+- [x] docs/service-install.md
+- [x] docs/release-notes-mvp.md
+- [x] npm/fleet/README.md
+- [x] feature matrix 문서
 
 ## 완료 기준
 
-- [x] 현재 heartbeat-bound WebSocket lifecycle이 테스트로 설명된다.
-- [x] persistent session 전환 시 어떤 테스트를 바꿔야 하는지 분명하다.
-- [x] 문서가 현재 한계와 목표 구조를 동시에 설명한다.
-- [x] behavior 변경 없이 통과한다.
-
-## 비범위
-
-- [x] persistent session registry 구현하지 않음
-- [x] Agent loop 구조 변경하지 않음
-- [x] job status schema 변경하지 않음
-- [x] Web Admin UI 변경하지 않음
+- [x] 초보자도 문서만 보고 controller start, token 생성, agent init/start, Web Admin 확인까지 따라갈 수 있다.
+- [x] HTTP와 HTTPS 설명이 중복 나열이 아니라 기본 흐름과 HTTPS 준비로 분리되어 있다.
+- [x] 주요 문서에 현재 없는 CLI 옵션이 남아 있지 않다.
+- [x] 구현됨/부분 구현/미구현/정책 결정 필요 상태가 feature matrix에 드러난다.
+- [x] release 전에 반드시 실행할 검증 명령이 명확하다.

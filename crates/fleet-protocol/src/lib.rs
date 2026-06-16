@@ -84,6 +84,25 @@ pub enum WirePayload {
         envelope: SignedTaskEnvelopeWire,
         task: TaskWire,
     },
+    TaskAck {
+        job_id: String,
+        task_id: String,
+    },
+    TaskStarted {
+        job_id: String,
+        task_id: String,
+    },
+    TaskRejected {
+        job_id: String,
+        task_id: String,
+        reason_code: TaskRejectionReasonCode,
+        reason: String,
+    },
+    TaskCancel {
+        job_id: String,
+        task_id: String,
+        reason: String,
+    },
     OutputChunk {
         job_id: String,
         task_id: String,
@@ -95,6 +114,10 @@ pub enum WirePayload {
         job_id: String,
         task_id: String,
         exit_code: i32,
+        #[serde(default)]
+        status: Option<TaskResultStatus>,
+        #[serde(default)]
+        reason: String,
     },
     SecurityEvent {
         agent_id: String,
@@ -132,6 +155,10 @@ impl WirePayload {
             | Self::AuthAccepted
             | Self::Heartbeat { .. } => ProtocolChannel::AuthSession,
             Self::TaskAssignment { .. }
+            | Self::TaskAck { .. }
+            | Self::TaskStarted { .. }
+            | Self::TaskRejected { .. }
+            | Self::TaskCancel { .. }
             | Self::OutputChunk { .. }
             | Self::TaskResult { .. }
             | Self::SecurityEvent { .. }
@@ -206,6 +233,29 @@ pub struct RunbookExecutionTaskWire {
 pub enum OutputStream {
     Stdout,
     Stderr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskRejectionReasonCode {
+    AgentBusy,
+    InvalidSignature,
+    Expired,
+    Replay,
+    TargetMismatch,
+    InvalidTask,
+    CapabilityUnsupported,
+    LocalPolicy,
+    InternalError,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskResultStatus {
+    Succeeded,
+    Failed,
+    Canceled,
+    TimedOut,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -439,6 +489,105 @@ mod tests {
     }
 
     #[test]
+    fn task_lifecycle_events_roundtrip() {
+        for payload in [
+            WirePayload::TaskAck {
+                job_id: "job-1".to_owned(),
+                task_id: "task-1".to_owned(),
+            },
+            WirePayload::TaskStarted {
+                job_id: "job-1".to_owned(),
+                task_id: "task-1".to_owned(),
+            },
+            WirePayload::TaskRejected {
+                job_id: "job-1".to_owned(),
+                task_id: "task-1".to_owned(),
+                reason_code: TaskRejectionReasonCode::InvalidSignature,
+                reason: "signature verification failed".to_owned(),
+            },
+            WirePayload::TaskCancel {
+                job_id: "job-1".to_owned(),
+                task_id: "task-1".to_owned(),
+                reason: "operator requested cancel".to_owned(),
+            },
+            WirePayload::TaskResult {
+                job_id: "job-1".to_owned(),
+                task_id: "task-1".to_owned(),
+                exit_code: 0,
+                status: Some(TaskResultStatus::Succeeded),
+                reason: String::new(),
+            },
+        ] {
+            let message = WireMessage::new(
+                "msg-task-event",
+                "task-1",
+                Some("agent-1".to_owned()),
+                1,
+                payload.clone(),
+            );
+
+            let decoded = decode_message(&encode_message(&message).unwrap()).unwrap();
+
+            assert_eq!(decoded.payload, payload);
+            assert_eq!(decoded.payload.channel(), ProtocolChannel::TaskData);
+        }
+    }
+
+    #[test]
+    fn legacy_task_result_without_status_still_decodes() {
+        let body = r#"{
+            "protocol_version":1,
+            "message_id":"msg-result",
+            "correlation_id":"corr-result",
+            "agent_id":"agent-1",
+            "timestamp_ms":1,
+            "payload":{
+                "type":"task_result",
+                "payload":{
+                    "job_id":"job-1",
+                    "task_id":"task-1",
+                    "exit_code":0
+                }
+            }
+        }"#;
+
+        let decoded = decode_message(body).unwrap();
+        let WirePayload::TaskResult { status, reason, .. } = decoded.payload else {
+            panic!("expected task result");
+        };
+
+        assert_eq!(status, None);
+        assert_eq!(reason, "");
+    }
+
+    #[test]
+    fn task_ack_ignores_unknown_compatible_fields() {
+        let body = r#"{
+            "protocol_version": 1,
+            "message_id": "msg-ack",
+            "correlation_id": "task-1",
+            "agent_id": "agent-1",
+            "timestamp_ms": 1,
+            "payload": {
+                "type": "task_ack",
+                "payload": {
+                    "job_id": "job-1",
+                    "task_id": "task-1",
+                    "future_field": "ignored"
+                }
+            }
+        }"#;
+
+        let decoded = decode_message(body).unwrap();
+
+        assert!(matches!(
+            decoded.payload,
+            WirePayload::TaskAck { job_id, task_id }
+                if job_id == "job-1" && task_id == "task-1"
+        ));
+    }
+
+    #[test]
     fn separates_auth_and_task_channels() {
         assert_eq!(
             WirePayload::AuthChallenge { nonce: "n1".into() }.channel(),
@@ -451,6 +600,14 @@ mod tests {
                 stream: OutputStream::Stdout,
                 sequence: 0,
                 data: "ok".into(),
+            }
+            .channel(),
+            ProtocolChannel::TaskData
+        );
+        assert_eq!(
+            WirePayload::TaskAck {
+                job_id: "job-1".into(),
+                task_id: "task-1".into(),
             }
             .channel(),
             ProtocolChannel::TaskData

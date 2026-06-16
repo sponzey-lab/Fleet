@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Sponzey Fleet Controller API",
-    "version": "0.0.13",
+    "version": "0.0.14",
     "summary": "REST API for the Sponzey Fleet controller.",
     "description": "Sponzey Fleet exposes controller APIs for agent enrollment, inventory, job dispatch, snapshots, drift reports, and audit events. HTTP transport is supported only for local or short-lived tests. Use HTTPS for product, production, shared, or long-running environments because HTTP does not provide confidentiality or integrity."
   },
@@ -17,6 +17,8 @@
     { "name": "Enrollment", "description": "Enrollment token lifecycle and agent registration." },
     { "name": "Agents", "description": "Agent inventory, labels, key revocation, and latest snapshots." },
     { "name": "Jobs", "description": "Command, runbook, drift check, and job output APIs." },
+    { "name": "Approvals", "description": "Approval request lifecycle for high-risk and broad-target jobs." },
+    { "name": "Policy", "description": "Policy source, agent assignment, and scheduled drift APIs." },
     { "name": "Audit", "description": "Recent audit events." }
   ],
   "components": {
@@ -33,7 +35,12 @@
         "type": "object",
         "required": ["error"],
         "properties": {
-          "error": { "type": "string", "example": "not_found" }
+          "error": { "type": "string", "example": "not_found" },
+          "required_permission": {
+            "type": "string",
+            "description": "Present on forbidden responses to name the permission that the authenticated admin actor lacks.",
+            "example": "job_approve"
+          }
         },
         "additionalProperties": false
       },
@@ -163,6 +170,7 @@
           "revoked",
           "fingerprint",
           "labels",
+          "assigned_policy_ids",
           "last_seen_at_ms",
           "last_seen_age_seconds",
           "hostname",
@@ -183,6 +191,12 @@
           "labels": {
             "type": "array",
             "items": { "$ref": "#/components/schemas/AgentLabel" }
+          },
+          "assigned_policy_ids": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Policy ids directly assigned to this agent.",
+            "example": ["nginx-running"]
           },
           "last_seen_at_ms": { "type": ["integer", "null"], "example": 1710000000000 },
           "last_seen_age_seconds": { "type": ["integer", "null"], "example": 12 },
@@ -216,7 +230,7 @@
           },
           "body": {
             "type": "object",
-            "description": "Stable inventory payload. Facts should include relatively stable system characteristics such as OS, architecture, hostname, CPU logical count, total memory, memory module count when discoverable, disk device inventory, mount layout, root disk capacity, and network interface names. Facts should not include current CPU, memory, or disk usage.",
+            "description": "Stable inventory payload. Facts should include relatively stable system characteristics such as OS, architecture, hostname, CPU logical count, total memory, memory module count when discoverable, disk device and partition inventory, mount layout, root disk capacity, and network interface names. Facts should not include current CPU, memory, or disk usage.",
             "additionalProperties": true
           }
         },
@@ -235,7 +249,7 @@
           },
           "body": {
             "type": "object",
-            "description": "Stable inventory payload. Facts should include relatively stable system characteristics such as OS, architecture, hostname, CPU logical count, total memory, memory module count when discoverable, disk device inventory, mount layout, root disk capacity, and network interface names. Facts should not include current CPU, memory, or disk usage.",
+            "description": "Stable inventory payload. Facts should include relatively stable system characteristics such as OS, architecture, hostname, CPU logical count, total memory, memory module count when discoverable, disk device and partition inventory, mount layout, root disk capacity, and network interface names. Facts should not include current CPU, memory, or disk usage.",
             "additionalProperties": true
           },
           "cursor": { "type": "string", "example": "1710000000:42" }
@@ -313,9 +327,59 @@
         },
         "additionalProperties": false
       },
+      "AgentLogChunkItem": {
+        "type": "object",
+        "required": ["agent_id", "collected_at_ms", "line", "cursor"],
+        "properties": {
+          "agent_id": { "type": "string", "example": "agent-web-01" },
+          "collected_at_ms": {
+            "type": "integer",
+            "description": "Controller stored time for this agent operational log chunk.",
+            "example": 1710000000000
+          },
+          "line": {
+            "type": "string",
+            "description": "Product-safe agent operational log line. Command stdout/stderr belongs to job output APIs, not this stream.",
+            "example": "level=info event=agent_heartbeat_completed"
+          },
+          "cursor": { "type": "string", "example": "1710000000:42" }
+        },
+        "additionalProperties": false
+      },
+      "AgentLogChunkPage": {
+        "type": "object",
+        "required": ["items", "next_cursor"],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/AgentLogChunkItem" }
+          },
+          "next_cursor": {
+            "type": ["string", "null"],
+            "description": "Pass this value as the `before` query parameter to fetch the next page.",
+            "example": "1710000000:42"
+          }
+        },
+        "additionalProperties": false
+      },
       "LatestDriftReportResponse": {
         "type": "object",
-        "required": ["agent_id", "checked_at_ms", "agent_system_time_ms", "policy_name", "status", "expected", "actual"],
+        "required": [
+          "agent_id",
+          "checked_at_ms",
+          "agent_system_time_ms",
+          "policy_name",
+          "status",
+          "severity",
+          "acknowledged",
+          "acknowledged_by",
+          "acknowledged_at_ms",
+          "resolved",
+          "resolution_job_id",
+          "resolved_at_ms",
+          "expected",
+          "actual"
+        ],
         "properties": {
           "agent_id": { "type": "string", "example": "agent-web-01" },
           "checked_at_ms": { "type": "integer", "example": 1710000000000 },
@@ -325,7 +389,14 @@
             "example": 1710000000000
           },
           "policy_name": { "type": "string", "example": "nginx-running" },
-          "status": { "type": "string", "example": "drifted" },
+          "status": { "type": "string", "enum": ["compliant", "drifted", "unknown"], "example": "drifted" },
+          "severity": { "type": "string", "enum": ["none", "warning", "critical", "unknown"], "example": "warning" },
+          "acknowledged": { "type": "boolean", "example": false },
+          "acknowledged_by": { "type": ["string", "null"], "example": "bootstrap-admin" },
+          "acknowledged_at_ms": { "type": ["integer", "null"], "example": 1710000100000 },
+          "resolved": { "type": "boolean", "example": false },
+          "resolution_job_id": { "type": ["string", "null"], "example": "job-remediate-1" },
+          "resolved_at_ms": { "type": ["integer", "null"], "example": 1710000200000 },
           "expected": { "type": "string", "example": "service nginx running" },
           "actual": { "type": "string", "example": "service nginx stopped" }
         },
@@ -333,7 +404,23 @@
       },
       "DriftReportItem": {
         "type": "object",
-        "required": ["agent_id", "checked_at_ms", "agent_system_time_ms", "policy_name", "status", "expected", "actual", "cursor"],
+        "required": [
+          "agent_id",
+          "checked_at_ms",
+          "agent_system_time_ms",
+          "policy_name",
+          "status",
+          "severity",
+          "acknowledged",
+          "acknowledged_by",
+          "acknowledged_at_ms",
+          "resolved",
+          "resolution_job_id",
+          "resolved_at_ms",
+          "expected",
+          "actual",
+          "cursor"
+        ],
         "properties": {
           "agent_id": { "type": "string", "example": "agent-web-01" },
           "checked_at_ms": { "type": "integer", "example": 1710000000000 },
@@ -343,7 +430,14 @@
             "example": 1710000000000
           },
           "policy_name": { "type": "string", "example": "nginx-running" },
-          "status": { "type": "string", "example": "drifted" },
+          "status": { "type": "string", "enum": ["compliant", "drifted", "unknown"], "example": "drifted" },
+          "severity": { "type": "string", "enum": ["none", "warning", "critical", "unknown"], "example": "warning" },
+          "acknowledged": { "type": "boolean", "example": false },
+          "acknowledged_by": { "type": ["string", "null"], "example": "bootstrap-admin" },
+          "acknowledged_at_ms": { "type": ["integer", "null"], "example": 1710000100000 },
+          "resolved": { "type": "boolean", "example": false },
+          "resolution_job_id": { "type": ["string", "null"], "example": "job-remediate-1" },
+          "resolved_at_ms": { "type": ["integer", "null"], "example": 1710000200000 },
           "expected": { "type": "string", "example": "service nginx running" },
           "actual": { "type": "string", "example": "service nginx stopped" },
           "cursor": { "type": "string", "example": "1710000000:42" }
@@ -366,6 +460,76 @@
         },
         "additionalProperties": false
       },
+      "SavePolicyRequest": {
+        "type": "object",
+        "required": ["source"],
+        "properties": {
+          "source": {
+            "type": "string",
+            "description": "Policy document source. The controller validates it before storing.",
+            "example": "apiVersion: fleet.sponzey.dev/v1alpha1\nkind: Policy\nmetadata:\n  name: nginx-running\nspec:\n  selector:\n    matchLabels:\n      role: web\n  checks:\n    - id: nginx-service\n      service:\n        name: nginx\n        state: running\n"
+          }
+        },
+        "additionalProperties": false
+      },
+      "PolicyResponse": {
+        "type": "object",
+        "required": ["id", "name", "version", "source", "created_at_ms", "updated_at_ms"],
+        "properties": {
+          "id": { "type": "string", "example": "nginx-running" },
+          "name": { "type": "string", "example": "nginx-running" },
+          "version": { "type": "integer", "minimum": 1, "example": 1 },
+          "source": { "type": "string", "example": "apiVersion: fleet.sponzey.dev/v1alpha1\nkind: Policy\n..." },
+          "created_at_ms": { "type": "integer", "example": 1710000000000 },
+          "updated_at_ms": { "type": "integer", "example": 1710000000000 }
+        },
+        "additionalProperties": false
+      },
+      "AssignPolicyRequest": {
+        "type": "object",
+        "required": ["agent_id"],
+        "properties": {
+          "agent_id": { "type": "string", "example": "agent-web-01" }
+        },
+        "additionalProperties": false
+      },
+      "PolicyAssignmentResponse": {
+        "type": "object",
+        "required": ["policy_id", "agent_id", "assigned_at_ms"],
+        "properties": {
+          "policy_id": { "type": "string", "example": "nginx-running" },
+          "agent_id": { "type": "string", "example": "agent-web-01" },
+          "assigned_at_ms": { "type": "integer", "example": 1710000000000 }
+        },
+        "additionalProperties": false
+      },
+      "SchedulePolicyDriftRequest": {
+        "type": "object",
+        "required": ["agent_id", "interval_seconds"],
+        "properties": {
+          "agent_id": { "type": "string", "example": "agent-web-01" },
+          "interval_seconds": { "type": "integer", "minimum": 1, "example": 300 }
+        },
+        "additionalProperties": false
+      },
+      "ScheduledDriftResponse": {
+        "type": "object",
+        "required": [
+          "policy_id",
+          "agent_id",
+          "interval_seconds",
+          "next_due_at_ms",
+          "last_checked_at_ms"
+        ],
+        "properties": {
+          "policy_id": { "type": "string", "example": "nginx-running" },
+          "agent_id": { "type": "string", "example": "agent-web-01" },
+          "interval_seconds": { "type": "integer", "example": 300 },
+          "next_due_at_ms": { "type": "integer", "example": 1710000300000 },
+          "last_checked_at_ms": { "type": ["integer", "null"], "example": null }
+        },
+        "additionalProperties": false
+      },
       "CommandJobRequest": {
         "type": "object",
         "required": ["job_id", "target_agent_ids", "program", "timeout_seconds", "confirmed_high_risk"],
@@ -376,7 +540,18 @@
             "items": { "type": "string" },
             "example": ["agent-web-01"]
           },
-          "selector": { "type": ["string", "null"], "example": "role=web" },
+          "selector": { "type": ["string", "null"], "example": "label:role=web" },
+          "matchLabels": {
+            "type": ["object", "null"],
+            "additionalProperties": { "type": "string" },
+            "example": { "role": "web", "env": "prod" }
+          },
+          "strategy": {
+            "anyOf": [
+              { "$ref": "#/components/schemas/JobStrategy" },
+              { "type": "null" }
+            ]
+          },
           "program": { "type": "string", "example": "uptime" },
           "args": {
             "type": "array",
@@ -401,8 +576,23 @@
             "items": { "type": "string" },
             "example": []
           },
-          "selector": { "type": ["string", "null"], "example": "role=web" },
-          "runbook_document": { "type": "string", "example": "apiVersion: fleet.sponzey.dev/v1alpha1\nkind: Runbook\nmetadata:\n  name: nginx-basic\nspec:\n  targets:\n    selector: role=web\n  tasks: []\n" },
+          "selector": { "type": ["string", "null"], "example": "label:role=web" },
+          "matchLabels": {
+            "type": ["object", "null"],
+            "additionalProperties": { "type": "string" },
+            "example": { "role": "web", "env": "prod" }
+          },
+          "strategy": {
+            "anyOf": [
+              { "$ref": "#/components/schemas/JobStrategy" },
+              { "type": "null" }
+            ]
+          },
+          "runbook_document": {
+            "type": "string",
+            "description": "Canonical v1alpha1 runbook YAML. If request target_agent_ids, selector, and matchLabels are all empty, the controller resolves targets from the selector or matchLabels inside this document. Supported safe primitives include port.check, process.check, facts.collect, and metrics.snapshot. Controlled mutation primitives include package, service, and file.copy.",
+            "example": "apiVersion: fleet.sponzey.dev/v1alpha1\nkind: Runbook\nname: nginx-basic\ndescription: Install nginx and verify the local listener.\nmatchLabels:\n  role: web\nstrategy:\n  concurrency: 1\n  maxFailures: 1\ncheckMode: false\ndryRun: false\nsteps:\n  - id: nginx-package\n    package:\n      name: nginx\n      state: present\n  - id: http-listener\n    port.check:\n      host: 127.0.0.1\n      port: 8080\n"
+          },
           "timeout_seconds": { "type": "integer", "default": 30, "example": 180 },
           "confirmed_high_risk": { "type": "boolean", "example": true },
           "confirmed_by": { "type": "string", "default": "admin", "example": "operator@example.com" },
@@ -421,7 +611,18 @@
             "items": { "type": "string" },
             "example": []
           },
-          "selector": { "type": ["string", "null"], "example": "role=web" },
+          "selector": { "type": ["string", "null"], "example": "label:role=web" },
+          "matchLabels": {
+            "type": ["object", "null"],
+            "additionalProperties": { "type": "string" },
+            "example": { "role": "web", "env": "prod" }
+          },
+          "strategy": {
+            "anyOf": [
+              { "$ref": "#/components/schemas/JobStrategy" },
+              { "type": "null" }
+            ]
+          },
           "policy_document": { "type": "string", "example": "apiVersion: fleet.sponzey.dev/v1alpha1\nkind: Policy\nmetadata:\n  name: nginx-running\nspec:\n  targets:\n    selector: role=web\n  checks: []\n" },
           "timeout_seconds": { "type": "integer", "default": 30, "example": 30 },
           "created_by": { "type": "string", "default": "admin", "example": "operator@example.com" },
@@ -430,15 +631,262 @@
         },
         "additionalProperties": false
       },
+      "JobStrategy": {
+        "type": "object",
+        "properties": {
+          "concurrency": {
+            "type": ["integer", "null"],
+            "minimum": 1,
+            "default": 1,
+            "description": "Maximum number of assignments dispatched concurrently for one job. Omit for sequential fanout.",
+            "example": 2
+          },
+          "maxFailures": {
+            "type": ["integer", "null"],
+            "minimum": 1,
+            "description": "When this many assignment failures are reached, remaining queued assignments are canceled. Omit to keep dispatching queued targets.",
+            "example": 1
+          }
+        },
+        "additionalProperties": false
+      },
+      "SelectorPreviewRequest": {
+        "type": "object",
+        "properties": {
+          "selector": {
+            "type": ["string", "null"],
+            "description": "String selector. Supported forms are agent:<name-or-id>, label:key=value, or key=value[,key=value]. Cannot be combined with matchLabels.",
+            "example": "label:role=web"
+          },
+          "matchLabels": {
+            "type": ["object", "null"],
+            "additionalProperties": { "type": "string" },
+            "description": "Object label selector. All labels must match. Cannot be combined with selector.",
+            "example": { "role": "web", "env": "prod" }
+          }
+        },
+        "additionalProperties": false
+      },
+      "SelectorPreviewWarning": {
+        "type": "object",
+        "required": ["code", "message"],
+        "properties": {
+          "code": { "type": "string", "example": "disabled_agents_excluded" },
+          "message": {
+            "type": "string",
+            "example": "1 disabled or revoked agent(s) match the selector but will be excluded"
+          }
+        },
+        "additionalProperties": false
+      },
+      "SelectorPreviewAgent": {
+        "type": "object",
+        "required": ["agent_id", "name", "status", "labels", "selected_for_dispatch"],
+        "properties": {
+          "agent_id": { "type": "string", "example": "agent-web-01" },
+          "name": { "type": "string", "example": "web-01" },
+          "status": { "type": "string", "example": "online" },
+          "labels": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/AgentLabel" }
+          },
+          "selected_for_dispatch": {
+            "type": "boolean",
+            "description": "False for disabled or revoked matches that are intentionally excluded from dispatch.",
+            "example": true
+          }
+        },
+        "additionalProperties": false
+      },
+      "SelectorPreviewResponse": {
+        "type": "object",
+        "required": [
+          "matched_count",
+          "selected_count",
+          "disabled_count",
+          "offline_count",
+          "warnings",
+          "agents"
+        ],
+        "properties": {
+          "matched_count": { "type": "integer", "example": 2 },
+          "selected_count": { "type": "integer", "example": 1 },
+          "disabled_count": { "type": "integer", "example": 1 },
+          "offline_count": { "type": "integer", "example": 0 },
+          "warnings": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/SelectorPreviewWarning" }
+          },
+          "agents": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/SelectorPreviewAgent" }
+          }
+        },
+        "additionalProperties": false
+      },
       "CreateJobResponse": {
         "type": "object",
-        "required": ["job_id", "target_count", "assignment_count"],
+        "required": ["job_id", "target_count", "assignment_count", "status", "approval_request_id"],
         "properties": {
           "job_id": { "type": "string", "example": "job-1" },
           "target_count": { "type": "integer", "example": 1 },
-          "assignment_count": { "type": "integer", "example": 1 }
+          "assignment_count": { "type": "integer", "example": 1 },
+          "status": {
+            "$ref": "#/components/schemas/JobStatus",
+            "description": "Initial job status. Approval-gated jobs return pending_approval."
+          },
+          "approval_request_id": {
+            "type": ["string", "null"],
+            "description": "Approval request id when the job is pending approval. Null when the job is queued immediately.",
+            "example": "approval-01..."
+          }
         },
         "additionalProperties": false
+      },
+      "ApprovalStatus": {
+        "type": "string",
+        "enum": ["pending", "approved", "rejected", "expired", "canceled"],
+        "example": "pending"
+      },
+      "ApprovalRequestResponse": {
+        "type": "object",
+        "required": [
+          "id",
+          "job_id",
+          "requester",
+          "approver",
+          "reason",
+          "status",
+          "expires_at_ms",
+          "created_at_ms",
+          "decided_at_ms"
+        ],
+        "properties": {
+          "id": { "type": "string", "example": "approval-01..." },
+          "job_id": { "type": "string", "example": "job-1" },
+          "requester": { "type": "string", "example": "operator@example.com" },
+          "approver": { "type": ["string", "null"], "example": "manager@example.com" },
+          "reason": {
+            "type": "string",
+            "description": "Creation reason for pending approvals, or approver decision reason for terminal approvals.",
+            "example": "high-risk command requires manual approval"
+          },
+          "status": { "$ref": "#/components/schemas/ApprovalStatus" },
+          "expires_at_ms": { "type": "integer", "example": 1710000300000 },
+          "created_at_ms": { "type": "integer", "example": 1710000000000 },
+          "decided_at_ms": { "type": ["integer", "null"], "example": null }
+        },
+        "additionalProperties": false
+      },
+      "ApprovalDecisionRequest": {
+        "type": "object",
+        "description": "Approval decision payload. The authenticated admin token determines the approver actor; the legacy actor field is accepted for compatibility but ignored.",
+        "properties": {
+          "actor": {
+            "type": "string",
+            "deprecated": true,
+            "description": "Deprecated compatibility field. The controller ignores this value and uses the authenticated admin actor.",
+            "example": "manager@example.com"
+          },
+          "reason": { "type": "string", "default": "", "example": "approved maintenance window" }
+        },
+        "additionalProperties": false
+      },
+      "ExpireApprovalsResponse": {
+        "type": "object",
+        "required": ["expired_count", "approvals"],
+        "properties": {
+          "expired_count": { "type": "integer", "example": 1 },
+          "approvals": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/ApprovalRequestResponse" }
+          }
+        },
+        "additionalProperties": false
+      },
+      "CancelJobRequest": {
+        "type": "object",
+        "properties": {
+          "reason": {
+            "type": "string",
+            "example": "operator requested cancel"
+          }
+        },
+        "additionalProperties": false
+      },
+      "CancelJobResponse": {
+        "type": "object",
+        "required": [
+          "job_id",
+          "status",
+          "task_id",
+          "agent_id",
+          "assignment_status",
+          "canceled_count",
+          "cancel_delivered_count",
+          "cancel_delivered"
+        ],
+        "properties": {
+          "job_id": { "type": "string", "example": "job-1" },
+          "status": { "$ref": "#/components/schemas/JobStatus" },
+          "task_id": { "type": ["string", "null"], "example": "task-1" },
+          "agent_id": { "type": ["string", "null"], "example": "agent-web-01" },
+          "assignment_status": {
+            "anyOf": [
+              { "$ref": "#/components/schemas/AssignmentStatus" },
+              { "type": "null" }
+            ],
+            "example": "canceled"
+          },
+          "cancel_delivered": {
+            "type": "boolean",
+            "description": "True when the controller enqueued a task_cancel message to an active agent session. The database cancel state remains the source of truth even when this is false.",
+            "example": true
+          },
+          "canceled_count": {
+            "type": "integer",
+            "description": "Number of queued, dispatched, accepted, or started assignments marked canceled by this request.",
+            "example": 3
+          },
+          "cancel_delivered_count": {
+            "type": "integer",
+            "description": "Number of active agent sessions that received a task_cancel message.",
+            "example": 1
+          }
+        },
+        "additionalProperties": false
+      },
+      "JobStatus": {
+        "type": "string",
+        "enum": [
+          "draft",
+          "pending_approval",
+          "queued",
+          "running",
+          "partial_success",
+          "success",
+          "failed",
+          "canceled",
+          "expired"
+        ],
+        "description": "Domain job aggregate state. A single-agent job is treated as a multi-agent job with one assignment.",
+        "example": "queued"
+      },
+      "AssignmentStatus": {
+        "type": "string",
+        "enum": [
+          "queued",
+          "dispatched",
+          "accepted",
+          "started",
+          "succeeded",
+          "failed",
+          "rejected",
+          "canceled",
+          "expired"
+        ],
+        "description": "Per-agent task assignment state. This is distinct from target agent connectivity status; output_received is an event, not an assignment state.",
+        "example": "started"
       },
       "JobSummary": {
         "type": "object",
@@ -449,9 +897,13 @@
           "risk",
           "command_program",
           "command_args",
+          "selector_kind",
+          "selector_source",
+          "strategy",
           "target_count",
           "target_agent_ids",
           "target_agents",
+          "assignment_summary",
           "target_connected",
           "created_at_ms",
           "updated_at_ms",
@@ -460,10 +912,10 @@
         ],
         "properties": {
           "id": { "type": "string", "example": "job-1" },
-          "status": { "type": "string", "example": "queued" },
+          "status": { "$ref": "#/components/schemas/JobStatus" },
           "dispatch_state": {
             "type": "string",
-            "enum": ["created", "queued", "delivered", "completed", "failed", "expired", "rejected"],
+            "enum": ["created", "queued", "delivered", "completed", "failed", "expired", "rejected", "canceled"],
             "description": "Operator-facing dispatch state derived by the controller. It does not contain raw command output.",
             "example": "queued"
           },
@@ -473,6 +925,17 @@
             "type": "array",
             "items": { "type": "string" }
           },
+          "selector_kind": {
+            "type": "string",
+            "description": "How the job target set was resolved: explicit_ids, selector, matchLabels, or resolved_ids.",
+            "example": "selector"
+          },
+          "selector_source": {
+            "type": "string",
+            "description": "The original selector source persisted when the job was created.",
+            "example": "label:role=web"
+          },
+          "strategy": { "$ref": "#/components/schemas/JobStrategyResponse" },
           "target_count": { "type": "integer", "example": 1 },
           "target_agent_ids": {
             "type": "array",
@@ -483,6 +946,7 @@
             "type": "array",
             "items": { "$ref": "#/components/schemas/JobTargetSummary" }
           },
+          "assignment_summary": { "$ref": "#/components/schemas/JobAssignmentSummary" },
           "target_connected": {
             "type": "boolean",
             "description": "True when at least one target currently has an authenticated persistent session.",
@@ -499,12 +963,113 @@
         },
         "additionalProperties": false
       },
+      "JobAssignmentSummary": {
+        "type": "object",
+        "required": [
+          "queued",
+          "dispatched",
+          "accepted",
+          "started",
+          "succeeded",
+          "failed",
+          "rejected",
+          "canceled",
+          "expired",
+          "skipped",
+          "unknown"
+        ],
+        "properties": {
+          "queued": { "type": "integer", "example": 1 },
+          "dispatched": { "type": "integer", "example": 0 },
+          "accepted": { "type": "integer", "example": 0 },
+          "started": { "type": "integer", "example": 0 },
+          "succeeded": { "type": "integer", "example": 0 },
+          "failed": { "type": "integer", "example": 0 },
+          "rejected": { "type": "integer", "example": 0 },
+          "canceled": { "type": "integer", "example": 0 },
+          "expired": { "type": "integer", "example": 0 },
+          "skipped": {
+            "type": "integer",
+            "description": "Assignments canceled before dispatch because maxFailures was reached.",
+            "example": 0
+          },
+          "unknown": {
+            "type": "integer",
+            "description": "Targets whose assignment status is absent or not recognized.",
+            "example": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "JobStrategyResponse": {
+        "type": "object",
+        "required": ["concurrency", "maxFailures"],
+        "properties": {
+          "concurrency": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Maximum number of assignments the controller may dispatch concurrently for this job.",
+            "example": 1
+          },
+          "maxFailures": {
+            "type": ["integer", "null"],
+            "minimum": 1,
+            "description": "Failure threshold that cancels remaining queued assignments. Null means no threshold.",
+            "example": null
+          }
+        },
+        "additionalProperties": false
+      },
       "JobTargetSummary": {
         "type": "object",
-        "required": ["agent_id", "status", "connected", "revoked"],
+        "required": [
+          "agent_id",
+          "name",
+          "status",
+          "snapshot_status",
+          "labels",
+          "task_id",
+          "assignment_status",
+          "last_error",
+          "connected",
+          "revoked"
+        ],
         "properties": {
           "agent_id": { "type": "string", "example": "agent-web-01" },
-          "status": { "type": "string", "example": "online" },
+          "name": { "type": "string", "example": "web-01" },
+          "status": {
+            "type": "string",
+            "description": "Operator-facing status derived from the target snapshot and current controller connection state.",
+            "example": "online"
+          },
+          "snapshot_status": {
+            "type": "string",
+            "description": "Agent status captured when the job target snapshot was created.",
+            "example": "offline"
+          },
+          "labels": {
+            "type": "array",
+            "description": "Agent labels captured when the job target snapshot was created.",
+            "items": { "$ref": "#/components/schemas/AgentLabel" }
+          },
+          "task_id": {
+            "type": ["string", "null"],
+            "description": "Task assignment id for this target. Null when no assignment exists in legacy or incomplete summaries.",
+            "example": "task-job-1-agent-web-01"
+          },
+          "assignment_status": {
+            "anyOf": [
+              { "$ref": "#/components/schemas/AssignmentStatus" },
+              { "type": "null" }
+            ],
+            "description": "Per-target assignment state. This is distinct from target connectivity status.",
+            "example": "queued"
+          },
+          "last_error": {
+            "type": "string",
+            "description": "Redacted per-target assignment error summary. Raw stdout/stderr is only available through the output API.",
+            "example": ""
+          },
           "connected": { "type": "boolean", "example": true },
           "revoked": { "type": "boolean", "example": false }
         },
@@ -545,6 +1110,22 @@
             "schema": { "$ref": "#/components/schemas/ErrorResponse" },
             "examples": {
               "unauthorized": { "value": { "error": "unauthorized" } }
+            }
+          }
+        }
+      },
+      "Forbidden": {
+        "description": "The admin token is valid, but the authenticated admin actor does not have the required permission.",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+            "examples": {
+              "forbidden": {
+                "value": {
+                  "error": "forbidden",
+                  "required_permission": "job_approve"
+                }
+              }
             }
           }
         }
@@ -657,7 +1238,18 @@
           "required": true,
           "content": {
             "application/json": {
-              "schema": { "$ref": "#/components/schemas/EnrollAgentRequest" }
+              "schema": { "$ref": "#/components/schemas/EnrollAgentRequest" },
+              "example": {
+                "token": "<enrollment-token>",
+                "agent_id": "agent-web-01",
+                "name": "web-01",
+                "public_key": "<agent-public-key-hex>",
+                "fingerprint": "<agent-fingerprint>",
+                "labels": [
+                  { "key": "role", "value": "web" },
+                  { "key": "env", "value": "prod" }
+                ]
+              }
             }
           }
         },
@@ -705,7 +1297,12 @@
           "required": false,
           "content": {
             "application/json": {
-              "schema": { "$ref": "#/components/schemas/CreateEnrollmentTokenRequest" }
+              "schema": { "$ref": "#/components/schemas/CreateEnrollmentTokenRequest" },
+              "example": {
+                "labels": "role=web,env=prod",
+                "max_uses": 1,
+                "expires_in_seconds": 3600
+              }
             }
           }
         },
@@ -719,7 +1316,8 @@
             }
           },
           "400": { "$ref": "#/components/responses/BadRequest" },
-          "401": { "$ref": "#/components/responses/Unauthorized" }
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
         }
       }
     },
@@ -739,6 +1337,7 @@
         "responses": {
           "204": { "description": "Enrollment token was revoked." },
           "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
           "404": { "$ref": "#/components/responses/NotFound" }
         }
       }
@@ -813,6 +1412,7 @@
           },
           "400": { "$ref": "#/components/responses/BadRequest" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
           "404": { "$ref": "#/components/responses/NotFound" }
         }
       }
@@ -837,6 +1437,7 @@
           },
           "400": { "$ref": "#/components/responses/BadRequest" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
           "404": { "$ref": "#/components/responses/NotFound" }
         }
       }
@@ -899,7 +1500,8 @@
             }
           },
           "400": { "$ref": "#/components/responses/BadRequest" },
-          "401": { "$ref": "#/components/responses/Unauthorized" }
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
         }
       }
     },
@@ -957,6 +1559,42 @@
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/MetricsSnapshotPage" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/api/agents/{agent_id}/logs": {
+      "get": {
+        "tags": ["Agents"],
+        "summary": "List agent operational log chunks for an agent.",
+        "description": "Returns newest product-safe agent operational log chunks first. This stream is separate from command stdout/stderr, which is exposed through the job output API.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "agent_id", "in": "path", "required": true, "schema": { "type": "string" } },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "integer", "minimum": 1, "maximum": 500, "default": 50 }
+          },
+          {
+            "name": "before",
+            "in": "query",
+            "required": false,
+            "description": "Opaque cursor from `next_cursor`.",
+            "schema": { "type": "string", "example": "1710000000:42" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Paged agent operational log chunks.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AgentLogChunkPage" }
               }
             }
           },
@@ -1027,6 +1665,178 @@
         }
       }
     },
+    "/api/policies": {
+      "get": {
+        "tags": ["Policy"],
+        "summary": "List stored policies.",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Stored policy documents.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": { "$ref": "#/components/schemas/PolicyResponse" }
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      },
+      "post": {
+        "tags": ["Policy"],
+        "summary": "Save a policy document.",
+        "description": "Validates and stores a policy source document. Remediation sections require `approvalRequired: true` in the current product scope.",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/SavePolicyRequest" },
+              "example": {
+                "source": "apiVersion: fleet.sponzey.dev/v1alpha1\nkind: Policy\nmetadata:\n  name: nginx-running\nspec:\n  selector:\n    matchLabels:\n      role: web\n  checks:\n    - id: nginx-service\n      service:\n        name: nginx\n        state: running\n"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Saved policy.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/PolicyResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      }
+    },
+    "/api/policies/{policy_id}/assignments": {
+      "post": {
+        "tags": ["Policy"],
+        "summary": "Assign a policy to an agent.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "policy_id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/AssignPolicyRequest" },
+              "example": {
+                "agent_id": "agent-web-01"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Policy assignment.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/PolicyAssignmentResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/api/policies/{policy_id}/schedules": {
+      "post": {
+        "tags": ["Policy"],
+        "summary": "Configure scheduled drift for a policy-agent pair.",
+        "description": "Stores schedule metadata. The background worker that creates drift-check jobs from due schedules is a follow-up capability.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "policy_id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/SchedulePolicyDriftRequest" },
+              "example": {
+                "agent_id": "agent-web-01",
+                "interval_seconds": 300
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Scheduled drift metadata.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ScheduledDriftResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/api/agents/{agent_id}/policies": {
+      "get": {
+        "tags": ["Policy"],
+        "summary": "List policy assignments for an agent.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "agent_id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "Policy assignments for the agent.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": { "$ref": "#/components/schemas/PolicyAssignmentResponse" }
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      }
+    },
+    "/api/drift/scheduled": {
+      "get": {
+        "tags": ["Policy"],
+        "summary": "List due scheduled drift checks.",
+        "description": "Returns schedule records whose `next_due_at_ms` is due at controller time.",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Due scheduled drift records.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": { "$ref": "#/components/schemas/ScheduledDriftResponse" }
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      }
+    },
     "/api/jobs": {
       "get": {
         "tags": ["Jobs"],
@@ -1071,17 +1881,87 @@
         }
       }
     },
-    "/api/jobs/command": {
+    "/api/jobs/{job_id}/cancel": {
       "post": {
         "tags": ["Jobs"],
-        "summary": "Create a command job.",
-        "description": "Command jobs are high risk and require explicit confirmation.",
+        "summary": "Cancel a job.",
+        "description": "Marks queued, dispatched, accepted, or started assignments as canceled. If the target agent has an active session, the controller also sends a task_cancel message. HTTP transport is test-only; use HTTPS for product or production environments.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "job_id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CancelJobRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Job cancel was recorded.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/CancelJobResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/api/selectors/preview": {
+      "post": {
+        "tags": ["Jobs"],
+        "summary": "Preview selector targets before creating a job.",
+        "description": "Uses the same selector resolution policy as job creation. Disabled or revoked agents are shown as matches but excluded from dispatch targets. Offline agents can be selected and remain queued until they reconnect.",
         "security": [{ "bearerAuth": [] }],
         "requestBody": {
           "required": true,
           "content": {
             "application/json": {
-              "schema": { "$ref": "#/components/schemas/CommandJobRequest" }
+              "schema": { "$ref": "#/components/schemas/SelectorPreviewRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Selector preview result.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/SelectorPreviewResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/api/jobs/command": {
+      "post": {
+        "tags": ["Jobs"],
+        "summary": "Create a command job.",
+        "description": "Create a signed command job. Safe single-target commands queue immediately. High-risk commands and broad-target jobs return pending_approval with an approval_request_id and are not dispatched until approved.",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CommandJobRequest" },
+              "example": {
+                "job_id": "job-uptime-1",
+                "target_agent_ids": ["agent-web-01"],
+                "program": "uptime",
+                "args": [],
+                "timeout_seconds": 30,
+                "confirmed_high_risk": false,
+                "expires_in_seconds": 60
+              }
             }
           }
         },
@@ -1096,6 +1976,7 @@
           },
           "400": { "$ref": "#/components/responses/BadRequest" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
           "409": { "$ref": "#/components/responses/Conflict" }
         }
       }
@@ -1104,13 +1985,21 @@
       "post": {
         "tags": ["Jobs"],
         "summary": "Create a runbook job.",
-        "description": "Runbook jobs are high risk and require explicit confirmation.",
+        "description": "Create a signed runbook job. Runbook execution is high risk and returns pending_approval with an approval_request_id until approved.",
         "security": [{ "bearerAuth": [] }],
         "requestBody": {
           "required": true,
           "content": {
             "application/json": {
-              "schema": { "$ref": "#/components/schemas/RunbookJobRequest" }
+              "schema": { "$ref": "#/components/schemas/RunbookJobRequest" },
+              "example": {
+                "job_id": "job-runbook-1",
+                "target_agent_ids": ["agent-web-01"],
+                "runbook_document": "apiVersion: fleet.sponzey.dev/v1alpha1\nkind: Runbook\nname: nginx-basic\nsteps:\n  - id: collect-facts\n    facts.collect: {}\n",
+                "timeout_seconds": 180,
+                "confirmed_high_risk": true,
+                "expires_in_seconds": 300
+              }
             }
           }
         },
@@ -1125,6 +2014,7 @@
           },
           "400": { "$ref": "#/components/responses/BadRequest" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
           "409": { "$ref": "#/components/responses/Conflict" }
         }
       }
@@ -1133,12 +2023,20 @@
       "post": {
         "tags": ["Jobs"],
         "summary": "Create a drift check job.",
+        "description": "Create a signed drift check job. Single-target drift checks can queue immediately. Broad-target drift checks require approval.",
         "security": [{ "bearerAuth": [] }],
         "requestBody": {
           "required": true,
           "content": {
             "application/json": {
-              "schema": { "$ref": "#/components/schemas/DriftCheckJobRequest" }
+              "schema": { "$ref": "#/components/schemas/DriftCheckJobRequest" },
+              "example": {
+                "job_id": "job-drift-1",
+                "target_agent_ids": ["agent-web-01"],
+                "policy_document": "apiVersion: fleet.sponzey.dev/v1alpha1\nkind: Policy\nmetadata:\n  name: nginx-running\nspec:\n  checks: []\n",
+                "timeout_seconds": 30,
+                "expires_in_seconds": 300
+              }
             }
           }
         },
@@ -1153,7 +2051,124 @@
           },
           "400": { "$ref": "#/components/responses/BadRequest" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
           "409": { "$ref": "#/components/responses/Conflict" }
+        }
+      }
+    },
+    "/api/approvals": {
+      "get": {
+        "tags": ["Approvals"],
+        "summary": "List approval requests.",
+        "description": "List approval requests, optionally filtered by status. Web Admin approval queue should use status=pending.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": { "$ref": "#/components/schemas/ApprovalStatus" },
+            "description": "Optional approval status filter."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Approval requests.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": { "$ref": "#/components/schemas/ApprovalRequestResponse" }
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/api/approvals/{approval_id}/approve": {
+      "post": {
+        "tags": ["Approvals"],
+        "summary": "Approve a pending approval request.",
+        "description": "Moves the approval to approved, changes the linked job to queued, writes audit, and dispatches queued assignments when an authenticated agent session is available.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "approval_id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ApprovalDecisionRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated approval request.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ApprovalRequestResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/api/approvals/{approval_id}/reject": {
+      "post": {
+        "tags": ["Approvals"],
+        "summary": "Reject a pending approval request.",
+        "description": "Moves the approval to rejected, changes the linked job to failed, and writes audit.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "approval_id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ApprovalDecisionRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated approval request.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ApprovalRequestResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/api/approvals/expire": {
+      "post": {
+        "tags": ["Approvals"],
+        "summary": "Expire due approval requests.",
+        "description": "Expires pending approval requests whose expiry time has passed and changes linked jobs to expired.",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Expired approvals.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ExpireApprovalsResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
         }
       }
     },

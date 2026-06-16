@@ -7,6 +7,7 @@ pub enum AuditCategory {
     Job,
     Approval,
     Drift,
+    Policy,
     Security,
 }
 
@@ -78,6 +79,7 @@ impl AuditCategory {
             Self::Job => "job",
             Self::Approval => "approval",
             Self::Drift => "drift",
+            Self::Policy => "policy",
             Self::Security => "security",
         }
     }
@@ -89,6 +91,7 @@ impl AuditCategory {
             "job" => Some(Self::Job),
             "approval" => Some(Self::Approval),
             "drift" => Some(Self::Drift),
+            "policy" => Some(Self::Policy),
             "security" => Some(Self::Security),
             _ => None,
         }

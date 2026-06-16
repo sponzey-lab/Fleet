@@ -2,7 +2,7 @@
 
 This package is a distribution wrapper for the Rust `sponzey` binary.
 
-The MVP repository builds the binary with Cargo:
+The repository builds the binary with Cargo:
 
 ```sh
 cargo build -p fleet-cli
@@ -17,14 +17,15 @@ Resolution order:
 2. Repository development binary: `target/debug/sponzey`
 3. Release binary package next to this package, using `@sponzey/fleet-<os>-<arch>`
 
-Planned release package targets:
+Supported release package targets:
 
 - `@sponzey/fleet-darwin-arm64`
 - `@sponzey/fleet-darwin-x64`
 - `@sponzey/fleet-linux-arm64`
 - `@sponzey/fleet-linux-x64`
 
-Unsupported platforms fail with a clear `unsupported platform` error and exit code `127`.
+Windows packages are not currently published. Unsupported platforms fail with a
+clear `unsupported platform` error and exit code `127`.
 
 Local pack smoke:
 
@@ -72,11 +73,35 @@ still not found, add the npm global bin directory explicitly:
 export PATH="$(npm prefix -g)/bin:$PATH"
 ```
 
+Standalone release archives are the non-npm install path. GitHub release
+artifacts are named `sponzey-<os>-<arch>.tar.gz` and are published with
+`SHA256SUMS`. Verify them before installing:
+
+```sh
+./scripts/verify_standalone_artifacts.sh dist/release
+```
+
+For Linux services, install the resolved Rust binary rather than an npm shim:
+
+```sh
+sponzey controller install-service --data-dir /var/lib/sponzey-fleet --dry-run
+sponzey agent install-service --data-dir /var/lib/sponzey-fleet --dry-run
+sponzey controller status-service --dry-run
+sponzey agent logs-service --dry-run
+```
+
+Upgrade is currently an external npm/artifact operation. Inspect the supported
+policy first:
+
+```sh
+sponzey upgrade --dry-run
+```
+
 GitHub Actions release:
 
 1. Add an npm automation token as the repository secret `NPM_TOKEN`.
 2. Bump `Cargo.toml`, `Cargo.lock`, root `package.json`, `npm/fleet/package.json`, and every `npm/fleet-*/package.json` to the same version.
-3. Push a matching tag, for example `v0.0.13`.
+3. Push a matching tag, for example `v0.0.14`.
 
 The `.github/workflows/npm-release.yml` workflow builds native platform packages on GitHub-hosted runners, publishes all platform packages first, and publishes this wrapper package last.
 Linux release binaries are built on Ubuntu 22.04 to avoid requiring glibc 2.39 from Ubuntu 24.04.

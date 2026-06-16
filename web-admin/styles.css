@@ -61,16 +61,29 @@ p {
 }
 
 input,
-button {
+button,
+select,
+textarea {
   min-height: 36px;
   border: 1px solid #c8d1df;
   border-radius: 6px;
   font: inherit;
 }
 
-input {
+input,
+select,
+textarea {
   padding: 0 10px;
   background: #fff;
+}
+
+textarea {
+  padding: 10px;
+  min-height: 160px;
+  resize: vertical;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.45;
 }
 
 input[type="checkbox"] {
@@ -110,6 +123,16 @@ button:disabled {
   color: #a12323;
 }
 
+.warning-banner {
+  border: 1px solid #f5c26b;
+  border-radius: 6px;
+  background: #fff7e6;
+  color: #7a4b00;
+  padding: 10px 12px;
+  margin-bottom: 18px;
+  font-weight: 700;
+}
+
 .layout {
   display: grid;
   grid-template-columns: minmax(260px, 0.9fr) repeat(2, minmax(260px, 1fr));
@@ -133,7 +156,9 @@ button:disabled {
   grid-column: span 2;
 }
 
-.job-panel {
+.job-panel,
+.runbook-panel,
+.policy-panel {
   grid-column: span 2;
 }
 
@@ -167,9 +192,19 @@ button:disabled {
   font-size: 12px;
 }
 
+.inline-control {
+  color: #687385;
+  font-size: 12px;
+  font-weight: 700;
+}
+
 .list {
   display: grid;
   gap: 8px;
+}
+
+.compact-list {
+  margin-top: 12px;
 }
 
 .empty {
@@ -210,6 +245,7 @@ button:disabled {
   gap: 4px;
 }
 
+.policy-row,
 .job-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
@@ -228,6 +264,11 @@ button:disabled {
   color: #687385;
 }
 
+.policy-row.selected {
+  border-color: #1f6feb;
+  box-shadow: inset 3px 0 0 #1f6feb;
+}
+
 .job-status {
   align-self: start;
   display: inline-flex;
@@ -240,6 +281,30 @@ button:disabled {
 .agent-meta {
   grid-column: 1 / -1;
   color: #687385;
+}
+
+.detail-panel {
+  margin-top: 12px;
+  border-top: 1px solid #e3e8f0;
+  padding-top: 12px;
+}
+
+.detail-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 12px;
+}
+
+.detail-grid small {
+  display: block;
+  color: #687385;
+  font-size: 11px;
+}
+
+.detail-grid strong {
+  display: block;
+  overflow-wrap: anywhere;
+  font-size: 13px;
 }
 
 .status-pill {
@@ -275,7 +340,9 @@ button:disabled {
 .status-pill.created,
 .status-pill.queued,
 .status-pill.delivered,
-.status-pill.running {
+.status-pill.running,
+.status-pill.pending_approval,
+.status-pill.stale {
   background: #eef4ff;
   color: #1f4f9f;
 }
@@ -296,6 +363,33 @@ button:disabled {
 
 .chart-set {
   margin-bottom: 12px;
+}
+
+.table-view {
+  margin-bottom: 12px;
+  overflow: auto;
+}
+
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.data-table th,
+.data-table td {
+  border-bottom: 1px solid #e3e8f0;
+  padding: 8px;
+  text-align: left;
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+
+.data-table th {
+  color: #4b5568;
+  font-size: 11px;
+  text-transform: uppercase;
+  background: #f8fafc;
 }
 
 .inventory-grid {
@@ -420,6 +514,13 @@ button:disabled {
   margin-bottom: 12px;
 }
 
+.runbook-form,
+.policy-form {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
 .token-form {
   display: grid;
   grid-template-columns: 1.1fr 110px 150px;
@@ -429,7 +530,10 @@ button:disabled {
 }
 
 .run-form label:not(.checkbox-row),
-.token-form label {
+.token-form label,
+.runbook-form label:not(.checkbox-row),
+.policy-form label,
+.policy-actions label {
   grid-row: 1;
   align-self: start;
   font-size: 12px;
@@ -485,6 +589,14 @@ button:disabled {
   min-height: 104px;
 }
 
+.policy-actions {
+  display: grid;
+  grid-template-columns: auto auto 150px auto;
+  gap: 8px;
+  align-items: center;
+  margin-top: 12px;
+}
+
 .token-row {
   display: grid;
   grid-template-columns: minmax(160px, 1fr) auto auto minmax(130px, auto) auto;
@@ -525,8 +637,11 @@ button:disabled {
 }
 
 .audit-row {
+.approval-row,
+.compact-row,
+.log-row,
+.audit-row {
   display: grid;
-  grid-template-columns: auto minmax(120px, 1fr) minmax(120px, 1fr) auto;
   gap: 10px;
   align-items: center;
   border: 1px solid #e3e8f0;
@@ -534,8 +649,28 @@ button:disabled {
   padding: 10px;
 }
 
+.approval-row {
+  grid-template-columns: auto minmax(160px, 1fr) auto auto;
+}
+
+.compact-row {
+  grid-template-columns: auto minmax(0, 1fr);
+}
+
+.log-row {
+  grid-template-columns: minmax(170px, auto) minmax(0, 1fr);
+}
+
+.audit-row {
+  grid-template-columns: auto minmax(120px, 1fr) minmax(120px, 1fr) auto;
+}
+
+.approval-row small,
+.compact-row small,
 .audit-row small,
-.audit-row code {
+.audit-row code,
+.log-row code {
+  display: block;
   overflow-wrap: anywhere;
 }
 
@@ -553,7 +688,13 @@ code {
   .inventory-grid,
   .chart-grid,
   .audit-row,
+  .approval-row,
+  .compact-row,
+  .log-row,
   .run-form,
+  .runbook-form,
+  .policy-form,
+  .policy-actions,
   .token-form,
   .token-row {
     grid-template-columns: 1fr;
@@ -566,6 +707,8 @@ code {
   .auth-form,
   .job-panel,
   .audit-panel,
+  .runbook-panel,
+  .policy-panel,
   .token-panel {
     grid-column: auto;
     min-width: 0;
@@ -576,6 +719,9 @@ code {
   .token-form label,
   .token-form input,
   .token-form button,
+  .policy-actions label,
+  .policy-actions input,
+  .policy-actions button,
   .checkbox-row,
   .run-form button {
     grid-row: auto;

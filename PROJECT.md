@@ -318,8 +318,7 @@ sponzey controller start \
   --host 127.0.0.1 \
   --port 7700 \
   --data-dir ./sponzey-fleet \
-  --external-url http://127.0.0.1:7700 \
-  --dev-insecure-loopback
+  --external-url http://127.0.0.1:7700
 ```
 
 운영:
@@ -808,13 +807,13 @@ MVP는 “npm으로 controller와 agent를 설치하고, agent가 outbound로 �
 
 ### 8.4 MVP 이후 Phase 002 목표
 
-MVP 이후 첫 제품화 목표는 “다른 노트북/서버의 agent가 SSH tunnel 없이 안전하게 controller에 붙는 remote beta”다. 이 단계는 단순히 원격 HTTP를 허용하는 작업이 아니다. insecure remote HTTP는 계속 거부하고, HTTPS/TLS 기반 enrollment와 WSS 기반 agent channel을 정식 경로로 만든다.
+MVP 이후 첫 제품화 목표는 “다른 노트북/서버의 agent가 SSH tunnel 없이 안전하게 controller에 붙는 remote beta”다. HTTP는 기술적으로 허용하지만 테스트 전용 transport로 취급하고, 사용 시 항상 명확한 경고와 audit를 남긴다. 제품, 고객, 운영, 공동 사용, 장시간 실행 환경의 정식 경로는 HTTPS/TLS 기반 enrollment와 WSS 기반 agent channel이다.
 
 Phase 002의 핵심 방향:
 
 - controller bind address와 external URL을 분리한다.
-- `http://127.0.0.1`은 loopback 개발 모드로만 유지한다.
-- 원격 agent는 `https://fleet.example.com` 같은 HTTPS URL로만 등록한다.
+- `http://127.0.0.1`과 LAN HTTP URL은 테스트 편의상 허용하되 test-only warning을 유지한다.
+- 원격 production agent는 `https://fleet.example.com` 같은 HTTPS URL로 등록한다.
 - controller signing identity pinning과 TLS certificate trust를 분리한다.
 - enrollment token은 scope, expiry, single-use, revoke, audit를 갖춘다.
 - agent production service lifecycle을 systemd 기준으로 정리한다.

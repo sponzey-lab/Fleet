@@ -1,30 +1,37 @@
 use fleet_application::{
-    AdminTokenRepository, AgentIdentityRecord as AppAgentIdentityRecord, AgentIdentityRepository,
-    AgentRepository, ApprovalDecisionRecord as AppApprovalDecisionRecord, ApprovalRepository,
-    AuditRepository, AuditWriter, CommandJobRepository, ControllerIdentityMetadata,
-    ControllerIdentityRepository, DispatchAssignmentRepository, DriftCheckJobRepository,
+    AdminTokenRecord as AppAdminTokenRecord, AdminTokenRepository,
+    AgentIdentityRecord as AppAgentIdentityRecord, AgentIdentityRepository,
+    AgentLogChunkPageRecord as AppAgentLogChunkPageRecord, AgentLogRepository, AgentRepository,
+    ApprovalRepository, ApprovalRequestRecord as AppApprovalRequestRecord, AuditRepository,
+    AuditWriter, CommandJobRepository, ControllerIdentityMetadata, ControllerIdentityRepository,
+    DispatchAssignmentRepository, DriftCheckJobRepository,
     DriftReportPageRecord as AppDriftReportPageRecord, DriftReportRecord as AppDriftReportRecord,
     DriftRepository, EnrollmentTokenRecord as AppEnrollmentTokenRecord, EnrollmentTokenRepository,
     FactsRepository, FactsSnapshotPageRecord as AppFactsSnapshotPageRecord,
-    FactsSnapshotRecord as AppFactsSnapshotRecord, JobOutputChunk, JobOutputRepository,
-    JobOutputStream, JobQueryRepository, JobRepository, JobSummaryRecord as AppJobSummaryRecord,
-    JobTargetSummaryRecord as AppJobTargetSummaryRecord, MetricsRepository,
-    MetricsSnapshotPageRecord as AppMetricsSnapshotPageRecord,
+    FactsSnapshotRecord as AppFactsSnapshotRecord, JobDispatchGate as AppJobDispatchGate,
+    JobOutputChunk, JobOutputRepository, JobOutputStream, JobQueryRepository, JobRepository,
+    JobSummaryRecord as AppJobSummaryRecord, JobTargetSummaryRecord as AppJobTargetSummaryRecord,
+    MetricsRepository, MetricsSnapshotPageRecord as AppMetricsSnapshotPageRecord,
     MetricsSnapshotRecord as AppMetricsSnapshotRecord,
-    PendingTaskAssignment as AppPendingTaskAssignment, RunbookJobRepository, SnapshotPageCursor,
-    TaskAssignmentRepository,
+    PendingTaskAssignment as AppPendingTaskAssignment,
+    PolicyAssignmentRecord as AppPolicyAssignmentRecord, PolicyRecord as AppPolicyRecord,
+    PolicyRepository, RunbookJobRepository, ScheduledDriftRecord as AppScheduledDriftRecord,
+    SnapshotPageCursor, TaskAssignmentRepository,
 };
 use fleet_domain::{
     Agent, AgentError, AgentFingerprint, AgentId, AgentIdentity, AgentLabel, AgentName,
-    AgentPublicKey, AgentStatus, AuditActor, AuditCategory, AuditEvent, AuditTarget, AuditValue,
-    CommandTask, ControllerPublicKey, DriftCheckTask, DriftReport, DriftStatus, Job, JobId,
-    JobStatus, RunbookExecutionTask, TaskEnvelope, TaskExpiry, TaskId, TaskKind, TaskNonce,
-    TaskSignature,
+    AgentPublicKey, AgentStatus, AssignmentStatus, AuditActor, AuditCategory, AuditEvent,
+    AuditTarget, AuditValue, CommandTask, ControllerPublicKey, DriftAcknowledgement,
+    DriftCheckTask, DriftReport, DriftSeverity, DriftStatus, Job, JobId, JobStatus,
+    RunbookExecutionTask, TaskEnvelope, TaskExpiry, TaskId, TaskKind, TaskNonce, TaskSignature,
+    aggregate_job_status,
 };
 use rusqlite::{Connection, ErrorCode, OptionalExtension, params};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+pub const CURRENT_SCHEMA_VERSION: i64 = 9;
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -126,12 +133,60 @@ pub struct PendingRunbookAssignment {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskAssignmentStateRecord {
+    pub job_id: String,
+    pub task_id: String,
+    pub agent_id: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskAssignmentSummaryRecord {
+    pub job_id: String,
+    pub task_id: String,
+    pub agent_id: String,
+    pub status: String,
+    pub last_error: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JobStrategyRecord {
+    pub concurrency: u32,
+    pub max_failures: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JobDispatchGateRecord {
+    pub concurrency: u32,
+    pub max_failures: Option<u32>,
+    pub active_count: usize,
+    pub failure_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalRequestRecord {
+    pub id: String,
+    pub job_id: String,
+    pub requester: String,
+    pub approver: Option<String>,
+    pub reason: String,
+    pub status: String,
+    pub expires_at: SystemTime,
+    pub created_at: SystemTime,
+    pub decided_at: Option<SystemTime>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobSummaryRecord {
     pub id: String,
     pub status: String,
     pub risk: String,
     pub command_program: Option<String>,
     pub command_args: Vec<String>,
+    pub selector_kind: String,
+    pub selector_source: String,
+    pub strategy_concurrency: u32,
+    pub strategy_max_failures: Option<u32>,
     pub target_count: usize,
     pub target_agents: Vec<JobTargetSummaryRecord>,
     pub created_at: SystemTime,
@@ -141,7 +196,12 @@ pub struct JobSummaryRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobTargetSummaryRecord {
     pub agent_id: String,
+    pub agent_name: String,
     pub status: String,
+    pub labels: Vec<(String, String)>,
+    pub task_id: Option<String>,
+    pub assignment_status: Option<String>,
+    pub last_error: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -190,10 +250,44 @@ pub struct DriftReportPageRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyRecord {
+    pub id: String,
+    pub name: String,
+    pub version: u32,
+    pub source: String,
+    pub created_at: SystemTime,
+    pub updated_at: SystemTime,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyAssignmentRecord {
+    pub policy_id: String,
+    pub agent_id: String,
+    pub assigned_at: SystemTime,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduledDriftRecord {
+    pub policy_id: String,
+    pub agent_id: String,
+    pub interval_seconds: u64,
+    pub next_due_at: SystemTime,
+    pub last_checked_at: Option<SystemTime>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentLogChunkRecord {
     pub agent_id: String,
     pub line: String,
     pub collected_at: SystemTime,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentLogChunkPageRecord {
+    pub agent_id: String,
+    pub line: String,
+    pub collected_at: SystemTime,
+    pub cursor: SnapshotPageCursor,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -201,11 +295,15 @@ pub struct RetentionCleanupSummary {
     pub job_output_chunks: usize,
     pub facts_snapshots: usize,
     pub metrics_snapshots: usize,
+    pub agent_log_chunks: usize,
 }
 
 impl RetentionCleanupSummary {
     pub fn total(self) -> usize {
-        self.job_output_chunks + self.facts_snapshots + self.metrics_snapshots
+        self.job_output_chunks
+            + self.facts_snapshots
+            + self.metrics_snapshots
+            + self.agent_log_chunks
     }
 }
 
@@ -236,7 +334,141 @@ impl SqliteStore {
             "runbook_document",
             "ALTER TABLE jobs ADD COLUMN runbook_document TEXT",
         )?;
+        self.ensure_column(
+            "jobs",
+            "selector_kind",
+            "ALTER TABLE jobs ADD COLUMN selector_kind TEXT NOT NULL DEFAULT 'explicit_ids'",
+        )?;
+        self.ensure_column(
+            "jobs",
+            "selector_source",
+            "ALTER TABLE jobs ADD COLUMN selector_source TEXT NOT NULL DEFAULT ''",
+        )?;
+        self.ensure_column(
+            "jobs",
+            "strategy_concurrency",
+            "ALTER TABLE jobs ADD COLUMN strategy_concurrency INTEGER NOT NULL DEFAULT 1",
+        )?;
+        self.ensure_column(
+            "jobs",
+            "strategy_max_failures",
+            "ALTER TABLE jobs ADD COLUMN strategy_max_failures INTEGER",
+        )?;
+        self.ensure_column(
+            "job_targets",
+            "agent_display_name",
+            "ALTER TABLE job_targets ADD COLUMN agent_display_name TEXT NOT NULL DEFAULT ''",
+        )?;
+        self.ensure_column(
+            "job_targets",
+            "agent_status_snapshot",
+            "ALTER TABLE job_targets ADD COLUMN agent_status_snapshot TEXT NOT NULL DEFAULT 'unknown'",
+        )?;
+        self.ensure_column(
+            "job_targets",
+            "labels_snapshot",
+            "ALTER TABLE job_targets ADD COLUMN labels_snapshot TEXT NOT NULL DEFAULT ''",
+        )?;
+        self.ensure_column(
+            "task_assignments",
+            "status",
+            "ALTER TABLE task_assignments ADD COLUMN status TEXT NOT NULL DEFAULT 'queued'",
+        )?;
+        self.ensure_column(
+            "task_assignments",
+            "dispatched_at",
+            "ALTER TABLE task_assignments ADD COLUMN dispatched_at INTEGER",
+        )?;
+        self.ensure_column(
+            "task_assignments",
+            "accepted_at",
+            "ALTER TABLE task_assignments ADD COLUMN accepted_at INTEGER",
+        )?;
+        self.ensure_column(
+            "task_assignments",
+            "started_at",
+            "ALTER TABLE task_assignments ADD COLUMN started_at INTEGER",
+        )?;
+        self.ensure_column(
+            "task_assignments",
+            "completed_at",
+            "ALTER TABLE task_assignments ADD COLUMN completed_at INTEGER",
+        )?;
+        self.ensure_column(
+            "task_assignments",
+            "last_error",
+            "ALTER TABLE task_assignments ADD COLUMN last_error TEXT NOT NULL DEFAULT ''",
+        )?;
+        self.ensure_column(
+            "admin_tokens",
+            "actor_id",
+            "ALTER TABLE admin_tokens ADD COLUMN actor_id TEXT NOT NULL DEFAULT 'bootstrap-admin'",
+        )?;
+        self.ensure_column(
+            "admin_tokens",
+            "role",
+            "ALTER TABLE admin_tokens ADD COLUMN role TEXT NOT NULL DEFAULT 'owner'",
+        )?;
+        self.ensure_column(
+            "drift_reports",
+            "severity",
+            "ALTER TABLE drift_reports ADD COLUMN severity TEXT NOT NULL DEFAULT 'unknown'",
+        )?;
+        self.ensure_column(
+            "drift_reports",
+            "acknowledged_at",
+            "ALTER TABLE drift_reports ADD COLUMN acknowledged_at INTEGER",
+        )?;
+        self.ensure_column(
+            "drift_reports",
+            "acknowledged_by",
+            "ALTER TABLE drift_reports ADD COLUMN acknowledged_by TEXT",
+        )?;
+        self.ensure_column(
+            "drift_reports",
+            "resolved_at",
+            "ALTER TABLE drift_reports ADD COLUMN resolved_at INTEGER",
+        )?;
+        self.ensure_column(
+            "drift_reports",
+            "resolution_job_id",
+            "ALTER TABLE drift_reports ADD COLUMN resolution_job_id TEXT",
+        )?;
+        self.record_schema_version()?;
         Ok(())
+    }
+
+    fn record_schema_version(&self) -> Result<(), StoreError> {
+        self.connection.execute(
+            "INSERT INTO schema_migrations (name, version, applied_at)
+             VALUES ('fleet_store', ?1, unixepoch())
+             ON CONFLICT(name) DO UPDATE SET
+                version = excluded.version,
+                applied_at = CASE
+                    WHEN schema_migrations.version = excluded.version
+                    THEN schema_migrations.applied_at
+                    ELSE excluded.applied_at
+                END",
+            params![CURRENT_SCHEMA_VERSION],
+        )?;
+        Ok(())
+    }
+
+    pub fn current_schema_version(&self) -> Result<Option<i64>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT version FROM schema_migrations WHERE name = 'fleet_store'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn integrity_check(&self) -> Result<String, StoreError> {
+        self.connection
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .map_err(StoreError::from)
     }
 
     fn ensure_column(&self, table: &str, column: &str, statement: &str) -> Result<(), StoreError> {
@@ -261,11 +493,20 @@ impl SqliteStore {
     }
 
     pub fn insert_admin_token_hash(&self, token_hash: &str) -> Result<(), StoreError> {
+        self.insert_admin_token_hash_with_identity(token_hash, "bootstrap-admin", "owner")
+    }
+
+    pub fn insert_admin_token_hash_with_identity(
+        &self,
+        token_hash: &str,
+        actor_id: &str,
+        role: &str,
+    ) -> Result<(), StoreError> {
         self.connection.execute(
-            "INSERT INTO admin_tokens (id, token_hash, created_at)
-             VALUES (1, ?1, unixepoch())
+            "INSERT INTO admin_tokens (id, token_hash, actor_id, role, created_at)
+             VALUES (1, ?1, ?2, ?3, unixepoch())
              ON CONFLICT(id) DO NOTHING",
-            params![token_hash],
+            params![token_hash, actor_id, role],
         )?;
         Ok(())
     }
@@ -282,6 +523,27 @@ impl SqliteStore {
             .connection
             .prepare("SELECT 1 FROM admin_tokens WHERE id = 1 AND token_hash = ?1")?
             .exists(params![token_hash])?)
+    }
+
+    pub fn find_admin_token_record(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<AppAdminTokenRecord>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT actor_id, role
+                 FROM admin_tokens
+                 WHERE id = 1 AND token_hash = ?1",
+                params![token_hash],
+                |row| {
+                    Ok(AppAdminTokenRecord {
+                        actor_id: row.get(0)?,
+                        role: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)
     }
 
     pub fn insert_enrollment_token_hash(
@@ -595,12 +857,14 @@ impl SqliteStore {
         checked_at: SystemTime,
     ) -> Result<(), StoreError> {
         self.connection.execute(
-            "INSERT INTO drift_reports (agent_id, policy_name, status, expected, actual, checked_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO drift_reports (
+                agent_id, policy_name, status, severity, expected, actual, checked_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 agent_id,
                 report.policy_name.as_str(),
                 drift_status_to_str(&report.status),
+                drift_severity_to_str(report.severity),
                 report.expected.as_str(),
                 report.actual.as_str(),
                 system_time_to_unix_secs(checked_at),
@@ -616,6 +880,7 @@ impl SqliteStore {
         self.connection
             .query_row(
                 "SELECT agent_id, policy_name, status, expected, actual, checked_at
+                    , severity, acknowledged_at, acknowledged_by, resolved_at, resolution_job_id
                  FROM drift_reports
                  WHERE agent_id = ?1
                  ORDER BY checked_at DESC, id DESC
@@ -627,6 +892,8 @@ impl SqliteStore {
                         report: DriftReport {
                             policy_name: row.get(1)?,
                             status: parse_drift_status(&row.get::<_, String>(2)?),
+                            severity: parse_drift_severity(&row.get::<_, String>(6)?),
+                            acknowledgement: row_to_drift_acknowledgement(row, 7, 8, 9, 10)?,
                             expected: row.get(3)?,
                             actual: row.get(4)?,
                         },
@@ -649,6 +916,7 @@ impl SqliteStore {
             let before_secs = system_time_to_unix_secs(before.occurred_at);
             let mut statement = self.connection.prepare(
                 "SELECT id, agent_id, policy_name, status, expected, actual, checked_at
+                    , severity, acknowledged_at, acknowledged_by, resolved_at, resolution_job_id
                  FROM drift_reports
                  WHERE agent_id = ?1
                    AND (checked_at < ?2 OR (checked_at = ?2 AND id < ?3))
@@ -666,6 +934,7 @@ impl SqliteStore {
 
         let mut statement = self.connection.prepare(
             "SELECT id, agent_id, policy_name, status, expected, actual, checked_at
+                , severity, acknowledged_at, acknowledged_by, resolved_at, resolution_job_id
              FROM drift_reports
              WHERE agent_id = ?1
              ORDER BY checked_at DESC, id DESC
@@ -675,6 +944,212 @@ impl SqliteStore {
             .query_map(params![agent_id, limit], row_to_drift_report_page_record)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::from)
+    }
+
+    pub fn save_policy_source(
+        &self,
+        policy_id: &str,
+        name: &str,
+        version: u32,
+        source: &str,
+    ) -> Result<(), StoreError> {
+        self.connection.execute(
+            "INSERT INTO policies (id, name, version, source, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, unixepoch(), unixepoch())
+             ON CONFLICT(id) DO UPDATE SET
+                name = excluded.name,
+                version = excluded.version,
+                source = excluded.source,
+                updated_at = excluded.updated_at",
+            params![policy_id, name, version as i64, source],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_policies(&self) -> Result<Vec<PolicyRecord>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, name, version, source, created_at, updated_at
+             FROM policies
+             ORDER BY id",
+        )?;
+        statement
+            .query_map([], row_to_policy_record)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn find_policy(&self, policy_id: &str) -> Result<Option<PolicyRecord>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT id, name, version, source, created_at, updated_at
+                 FROM policies
+                 WHERE id = ?1",
+                params![policy_id],
+                row_to_policy_record,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn assign_policy_to_agent(
+        &self,
+        policy_id: &str,
+        agent_id: &str,
+        assigned_at: SystemTime,
+    ) -> Result<(), StoreError> {
+        self.connection.execute(
+            "INSERT INTO policy_assignments (policy_id, agent_id, assigned_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(policy_id, agent_id) DO UPDATE SET
+                assigned_at = excluded.assigned_at",
+            params![policy_id, agent_id, system_time_to_unix_secs(assigned_at)],
+        )?;
+        Ok(())
+    }
+
+    pub fn policies_for_agent(
+        &self,
+        agent_id: &str,
+    ) -> Result<Vec<PolicyAssignmentRecord>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT policy_id, agent_id, assigned_at
+             FROM policy_assignments
+             WHERE agent_id = ?1
+             ORDER BY policy_id",
+        )?;
+        statement
+            .query_map(params![agent_id], row_to_policy_assignment_record)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn assigned_policy_ids_for_agent(&self, agent_id: &str) -> Result<Vec<String>, StoreError> {
+        Ok(self
+            .policies_for_agent(agent_id)?
+            .into_iter()
+            .map(|record| record.policy_id)
+            .collect())
+    }
+
+    pub fn upsert_policy_schedule(
+        &self,
+        policy_id: &str,
+        agent_id: &str,
+        interval: Duration,
+        next_due_at: SystemTime,
+    ) -> Result<(), StoreError> {
+        if interval.is_zero() {
+            return Err(StoreError::Domain(
+                "policy schedule interval must be positive".to_owned(),
+            ));
+        }
+        self.connection.execute(
+            "INSERT INTO policy_drift_schedules (
+                policy_id, agent_id, interval_seconds, next_due_at, last_checked_at
+             ) VALUES (?1, ?2, ?3, ?4, NULL)
+             ON CONFLICT(policy_id, agent_id) DO UPDATE SET
+                interval_seconds = excluded.interval_seconds,
+                next_due_at = excluded.next_due_at",
+            params![
+                policy_id,
+                agent_id,
+                interval.as_secs().max(1) as i64,
+                system_time_to_unix_secs(next_due_at),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn due_scheduled_drift_checks(
+        &self,
+        now: SystemTime,
+        limit: usize,
+    ) -> Result<Vec<ScheduledDriftRecord>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT policy_id, agent_id, interval_seconds, next_due_at, last_checked_at
+             FROM policy_drift_schedules
+             WHERE next_due_at <= ?1
+             ORDER BY next_due_at ASC
+             LIMIT ?2",
+        )?;
+        statement
+            .query_map(
+                params![system_time_to_unix_secs(now), limit.clamp(1, 500) as i64],
+                row_to_scheduled_drift_record,
+            )?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn record_scheduled_drift_check(
+        &self,
+        policy_id: &str,
+        agent_id: &str,
+        checked_at: SystemTime,
+    ) -> Result<(), StoreError> {
+        let changed = self.connection.execute(
+            "UPDATE policy_drift_schedules
+             SET last_checked_at = ?3,
+                 next_due_at = ?3 + interval_seconds
+             WHERE policy_id = ?1 AND agent_id = ?2",
+            params![policy_id, agent_id, system_time_to_unix_secs(checked_at),],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
+    }
+
+    pub fn acknowledge_latest_drift_report(
+        &self,
+        agent_id: &str,
+        policy_name: &str,
+        actor: &str,
+        acknowledged_at: SystemTime,
+    ) -> Result<bool, StoreError> {
+        let changed = self.connection.execute(
+            "UPDATE drift_reports
+             SET acknowledged_at = ?3, acknowledged_by = ?4
+             WHERE id = (
+                SELECT id FROM drift_reports
+                WHERE agent_id = ?1 AND policy_name = ?2
+                ORDER BY checked_at DESC, id DESC
+                LIMIT 1
+             )",
+            params![
+                agent_id,
+                policy_name,
+                system_time_to_unix_secs(acknowledged_at),
+                actor,
+            ],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub fn mark_latest_drift_resolved(
+        &self,
+        agent_id: &str,
+        policy_name: &str,
+        job_id: &str,
+        resolved_at: SystemTime,
+    ) -> Result<bool, StoreError> {
+        let changed = self.connection.execute(
+            "UPDATE drift_reports
+             SET resolved_at = ?3, resolution_job_id = ?4
+             WHERE id = (
+                SELECT id FROM drift_reports
+                WHERE agent_id = ?1 AND policy_name = ?2
+                ORDER BY checked_at DESC, id DESC
+                LIMIT 1
+             )",
+            params![
+                agent_id,
+                policy_name,
+                system_time_to_unix_secs(resolved_at),
+                job_id,
+            ],
+        )?;
+        Ok(changed > 0)
     }
 
     pub fn insert_agent_log_chunk(
@@ -716,6 +1191,45 @@ impl SqliteStore {
             .map_err(StoreError::from)
     }
 
+    pub fn list_agent_log_chunks_page(
+        &self,
+        agent_id: &str,
+        limit: usize,
+        before: Option<SnapshotPageCursor>,
+    ) -> Result<Vec<AgentLogChunkPageRecord>, StoreError> {
+        let limit = limit.clamp(1, 501) as i64;
+        if let Some(before) = before {
+            let before_secs = system_time_to_unix_secs(before.occurred_at);
+            let mut statement = self.connection.prepare(
+                "SELECT id, agent_id, line, collected_at
+                 FROM agent_log_chunks
+                 WHERE agent_id = ?1
+                   AND (collected_at < ?2 OR (collected_at = ?2 AND id < ?3))
+                 ORDER BY collected_at DESC, id DESC
+                 LIMIT ?4",
+            )?;
+            return statement
+                .query_map(
+                    params![agent_id, before_secs, before.row_id, limit],
+                    row_to_agent_log_chunk_page_record,
+                )?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(StoreError::from);
+        }
+
+        let mut statement = self.connection.prepare(
+            "SELECT id, agent_id, line, collected_at
+             FROM agent_log_chunks
+             WHERE agent_id = ?1
+             ORDER BY collected_at DESC, id DESC
+             LIMIT ?2",
+        )?;
+        statement
+            .query_map(params![agent_id, limit], row_to_agent_log_chunk_page_record)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
     pub fn cleanup_retention(
         &self,
         cutoff: SystemTime,
@@ -726,6 +1240,7 @@ impl SqliteStore {
             job_output_chunks: self.count_before("job_output_chunks", "created_at", cutoff)?,
             facts_snapshots: self.count_before("facts_snapshots", "collected_at", cutoff)?,
             metrics_snapshots: self.count_before("metrics_snapshots", "collected_at", cutoff)?,
+            agent_log_chunks: self.count_before("agent_log_chunks", "collected_at", cutoff)?,
         };
         if dry_run {
             return Ok(summary);
@@ -733,6 +1248,7 @@ impl SqliteStore {
         self.delete_before("job_output_chunks", "created_at", cutoff)?;
         self.delete_before("facts_snapshots", "collected_at", cutoff)?;
         self.delete_before("metrics_snapshots", "collected_at", cutoff)?;
+        self.delete_before("agent_log_chunks", "collected_at", cutoff)?;
         Ok(summary)
     }
 
@@ -941,7 +1457,286 @@ impl SqliteStore {
                 system_time_to_unix_secs(envelope.expires_at.as_system_time()),
             ],
         )?;
+        self.connection.execute(
+            "INSERT INTO job_targets (
+                job_id, agent_id, status, agent_display_name, agent_status_snapshot, labels_snapshot
+             )
+             SELECT
+                ?1,
+                a.id,
+                a.status,
+                a.name,
+                a.status,
+                a.labels
+             FROM agents a
+             WHERE a.id = ?2
+             ON CONFLICT(job_id, agent_id) DO NOTHING",
+            params![envelope.job_id.as_str(), envelope.target_agent_id.as_str()],
+        )?;
         Ok(())
+    }
+
+    pub fn update_job_selector_snapshot(
+        &self,
+        job_id: &str,
+        selector_kind: &str,
+        selector_source: &str,
+    ) -> Result<bool, StoreError> {
+        let changed = self.connection.execute(
+            "UPDATE jobs
+             SET selector_kind = ?2, selector_source = ?3
+             WHERE id = ?1",
+            params![job_id, selector_kind, selector_source],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub fn update_job_strategy(
+        &self,
+        job_id: &str,
+        concurrency: u32,
+        max_failures: Option<u32>,
+    ) -> Result<bool, StoreError> {
+        let concurrency = concurrency.max(1);
+        let changed = self.connection.execute(
+            "UPDATE jobs
+             SET strategy_concurrency = ?2, strategy_max_failures = ?3
+             WHERE id = ?1",
+            params![job_id, concurrency as i64, max_failures.map(i64::from)],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub fn job_strategy(&self, job_id: &str) -> Result<Option<JobStrategyRecord>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT strategy_concurrency, strategy_max_failures
+                 FROM jobs
+                 WHERE id = ?1",
+                params![job_id],
+                |row| {
+                    let concurrency = row.get::<_, i64>(0)?.max(1) as u32;
+                    let max_failures = row
+                        .get::<_, Option<i64>>(1)?
+                        .and_then(|value| u32::try_from(value).ok())
+                        .filter(|value| *value > 0);
+                    Ok(JobStrategyRecord {
+                        concurrency,
+                        max_failures,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn job_dispatch_gate(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<JobDispatchGateRecord>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT
+                    j.strategy_concurrency,
+                    j.strategy_max_failures,
+                    COALESCE(SUM(CASE WHEN ta.status IN ('dispatched', 'accepted', 'started') THEN 1 ELSE 0 END), 0) AS active_count,
+                    COALESCE(SUM(CASE WHEN ta.status IN ('failed', 'rejected', 'expired') THEN 1 ELSE 0 END), 0) AS failure_count
+                 FROM jobs j
+                 LEFT JOIN task_assignments ta ON ta.job_id = j.id
+                 WHERE j.id = ?1
+                 GROUP BY j.id",
+                params![job_id],
+                |row| {
+                    let concurrency = row.get::<_, i64>(0)?.max(1) as u32;
+                    let max_failures = row
+                        .get::<_, Option<i64>>(1)?
+                        .and_then(|value| u32::try_from(value).ok())
+                        .filter(|value| *value > 0);
+                    Ok(JobDispatchGateRecord {
+                        concurrency,
+                        max_failures,
+                        active_count: row.get::<_, i64>(2)?.max(0) as usize,
+                        failure_count: row.get::<_, i64>(3)?.max(0) as usize,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn update_task_assignment_status(
+        &self,
+        task_id: &str,
+        status: AssignmentStatus,
+        occurred_at: SystemTime,
+        last_error: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        let status_value = assignment_status_to_str(status);
+        let occurred_at = system_time_to_unix_secs(occurred_at);
+        let changed = match status {
+            AssignmentStatus::Dispatched => self.connection.execute(
+                "UPDATE task_assignments
+                 SET status = ?2, dispatched_at = ?3
+                 WHERE id = ?1",
+                params![task_id, status_value, occurred_at],
+            )?,
+            AssignmentStatus::Accepted => self.connection.execute(
+                "UPDATE task_assignments
+                 SET status = ?2, accepted_at = ?3
+                 WHERE id = ?1",
+                params![task_id, status_value, occurred_at],
+            )?,
+            AssignmentStatus::Started => self.connection.execute(
+                "UPDATE task_assignments
+                 SET status = ?2, started_at = ?3
+                 WHERE id = ?1",
+                params![task_id, status_value, occurred_at],
+            )?,
+            AssignmentStatus::Succeeded
+            | AssignmentStatus::Failed
+            | AssignmentStatus::Rejected
+            | AssignmentStatus::Canceled
+            | AssignmentStatus::Expired => self.connection.execute(
+                "UPDATE task_assignments
+                 SET status = ?2, completed_at = ?3, last_error = COALESCE(?4, last_error)
+                 WHERE id = ?1",
+                params![task_id, status_value, occurred_at, last_error],
+            )?,
+            AssignmentStatus::Queued => self.connection.execute(
+                "UPDATE task_assignments
+                 SET status = ?2, last_error = COALESCE(?3, last_error)
+                 WHERE id = ?1",
+                params![task_id, status_value, last_error],
+            )?,
+        };
+        Ok(changed > 0)
+    }
+
+    pub fn update_active_task_assignment_status(
+        &self,
+        task_id: &str,
+        status: AssignmentStatus,
+        occurred_at: SystemTime,
+        last_error: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        let Some(current_status) = self.find_task_assignment_status(task_id)? else {
+            return Ok(false);
+        };
+        if assignment_status_value_is_terminal(&current_status) {
+            return Ok(false);
+        }
+        self.update_task_assignment_status(task_id, status, occurred_at, last_error)
+    }
+
+    pub fn find_task_assignment_status(&self, task_id: &str) -> Result<Option<String>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT status FROM task_assignments WHERE id = ?1",
+                params![task_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn find_task_assignment_state_for_job(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<TaskAssignmentStateRecord>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT job_id, id, agent_id, status
+                 FROM task_assignments
+                 WHERE job_id = ?1
+                 ORDER BY created_at, id
+                 LIMIT 1",
+                params![job_id],
+                |row| {
+                    Ok(TaskAssignmentStateRecord {
+                        job_id: row.get(0)?,
+                        task_id: row.get(1)?,
+                        agent_id: row.get(2)?,
+                        status: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn list_task_assignment_summaries_for_job(
+        &self,
+        job_id: &str,
+    ) -> Result<Vec<TaskAssignmentSummaryRecord>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT job_id, id, agent_id, status, last_error
+             FROM task_assignments
+             WHERE job_id = ?1
+             ORDER BY created_at, id",
+        )?;
+        statement
+            .query_map(params![job_id], |row| {
+                Ok(TaskAssignmentSummaryRecord {
+                    job_id: row.get(0)?,
+                    task_id: row.get(1)?,
+                    agent_id: row.get(2)?,
+                    status: row.get(3)?,
+                    last_error: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn recompute_job_status_from_assignments(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<JobStatus>, StoreError> {
+        let strategy = self.job_strategy(job_id)?;
+        let statuses = self
+            .list_task_assignment_summaries_for_job(job_id)?
+            .into_iter()
+            .map(|assignment| {
+                AssignmentStatus::parse(&assignment.status).ok_or_else(|| {
+                    StoreError::Domain(format!(
+                        "invalid task assignment status: {}",
+                        assignment.status
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if statuses.is_empty() && strategy.is_none() {
+            return Ok(None);
+        }
+        let status = aggregate_job_status(
+            &statuses,
+            strategy.and_then(|strategy| strategy.max_failures),
+        );
+        self.update_job_status(job_id, status)?;
+        Ok(Some(status))
+    }
+
+    pub fn cancel_queued_assignments_after_max_failures(
+        &self,
+        job_id: &str,
+        occurred_at: SystemTime,
+        reason: &str,
+    ) -> Result<usize, StoreError> {
+        let Some(gate) = self.job_dispatch_gate(job_id)? else {
+            return Ok(0);
+        };
+        if !matches!(gate.max_failures, Some(limit) if limit > 0 && gate.failure_count >= limit as usize)
+        {
+            return Ok(0);
+        }
+        let changed = self.connection.execute(
+            "UPDATE task_assignments
+             SET status = 'canceled', completed_at = ?2, last_error = ?3
+             WHERE job_id = ?1
+               AND status = 'queued'",
+            params![job_id, system_time_to_unix_secs(occurred_at), reason],
+        )?;
+        Ok(changed)
     }
 
     pub fn list_pending_command_assignments_for_agent(
@@ -956,7 +1751,8 @@ impl SqliteStore {
              FROM task_assignments ta
              JOIN jobs j ON j.id = ta.job_id
              WHERE ta.agent_id = ?1
-               AND j.status = 'queued'
+               AND ta.status = 'queued'
+               AND j.status IN ('queued', 'running')
                AND j.command_program IS NOT NULL
              ORDER BY ta.created_at, ta.id",
         )?;
@@ -1035,7 +1831,8 @@ impl SqliteStore {
              FROM task_assignments ta
              JOIN jobs j ON j.id = ta.job_id
              WHERE ta.agent_id = ?1
-               AND j.status = 'queued'
+               AND ta.status = 'queued'
+               AND j.status IN ('queued', 'running')
                AND j.drift_policy_document IS NOT NULL
              ORDER BY ta.created_at, ta.id",
         )?;
@@ -1110,7 +1907,8 @@ impl SqliteStore {
              FROM task_assignments ta
              JOIN jobs j ON j.id = ta.job_id
              WHERE ta.agent_id = ?1
-               AND j.status = 'queued'
+               AND ta.status = 'queued'
+               AND j.status IN ('queued', 'running')
                AND j.runbook_document IS NOT NULL
              ORDER BY ta.created_at, ta.id",
         )?;
@@ -1194,7 +1992,8 @@ impl SqliteStore {
                 j.runbook_document, j.timeout_ms
              FROM task_assignments ta
              JOIN jobs j ON j.id = ta.job_id
-             WHERE j.status = 'queued'
+             WHERE ta.status = 'queued'
+               AND j.status IN ('queued', 'running')
                AND (?1 IS NULL OR ta.agent_id = ?1)
                AND (?2 IS NULL OR ta.job_id = ?2)
                AND (
@@ -1310,6 +2109,110 @@ impl SqliteStore {
             .map_err(StoreError::from)
     }
 
+    pub fn insert_approval_request(
+        &self,
+        request: AppApprovalRequestRecord,
+    ) -> Result<(), StoreError> {
+        self.connection.execute(
+            "INSERT INTO approval_requests (
+                id, job_id, requester, approver, reason, status, expires_at, created_at, decided_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                request.id,
+                request.job_id,
+                request.requester,
+                request.approver,
+                request.reason,
+                request.status,
+                system_time_to_unix_secs(request.expires_at),
+                system_time_to_unix_secs(request.created_at),
+                request.decided_at.map(system_time_to_unix_secs),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn find_approval_request(
+        &self,
+        approval_id: &str,
+    ) -> Result<Option<AppApprovalRequestRecord>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT id, job_id, requester, approver, reason, status, expires_at, created_at, decided_at
+                 FROM approval_requests
+                 WHERE id = ?1",
+                params![approval_id],
+                row_to_app_approval_request_record,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn find_pending_approval_for_job(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<AppApprovalRequestRecord>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT id, job_id, requester, approver, reason, status, expires_at, created_at, decided_at
+                 FROM approval_requests
+                 WHERE job_id = ?1 AND status = 'pending'
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 1",
+                params![job_id],
+                row_to_app_approval_request_record,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn list_approval_requests(
+        &self,
+        status: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<AppApprovalRequestRecord>, StoreError> {
+        let limit = limit.clamp(1, 500) as i64;
+        let mut statement = self.connection.prepare(
+            "SELECT id, job_id, requester, approver, reason, status, expires_at, created_at, decided_at
+             FROM approval_requests
+             WHERE (?1 IS NULL OR status = ?1)
+             ORDER BY created_at DESC, id DESC
+             LIMIT ?2",
+        )?;
+        let rows = statement
+            .query_map(params![status, limit], row_to_app_approval_request_record)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn update_approval_request(
+        &self,
+        request: AppApprovalRequestRecord,
+    ) -> Result<bool, StoreError> {
+        let changed = self.connection.execute(
+            "UPDATE approval_requests
+             SET requester = ?2,
+                 approver = ?3,
+                 reason = ?4,
+                 status = ?5,
+                 expires_at = ?6,
+                 created_at = ?7,
+                 decided_at = ?8
+             WHERE id = ?1",
+            params![
+                request.id,
+                request.requester,
+                request.approver,
+                request.reason,
+                request.status,
+                system_time_to_unix_secs(request.expires_at),
+                system_time_to_unix_secs(request.created_at),
+                request.decided_at.map(system_time_to_unix_secs),
+            ],
+        )?;
+        Ok(changed > 0)
+    }
+
     pub fn list_job_summaries(&self, limit: usize) -> Result<Vec<JobSummaryRecord>, StoreError> {
         self.list_job_summaries_filtered(None, limit)
     }
@@ -1335,11 +2238,25 @@ impl SqliteStore {
                 j.command_program,
                 j.command_args_json,
                 j.created_at,
+                j.selector_kind,
+                j.selector_source,
+                j.strategy_concurrency,
+                j.strategy_max_failures,
                 COUNT(ta.id) AS target_count,
-                COALESCE(GROUP_CONCAT(ta.agent_id || char(30) || COALESCE(a.status, 'unknown'), char(31)), '') AS target_agents,
+                COALESCE(GROUP_CONCAT(
+                    COALESCE(jt.agent_id, ta.agent_id, '') || char(30) ||
+                    COALESCE(NULLIF(jt.agent_display_name, ''), a.name, jt.agent_id, ta.agent_id, '') || char(30) ||
+                    COALESCE(NULLIF(jt.agent_status_snapshot, ''), jt.status, a.status, 'unknown') || char(30) ||
+                    COALESCE(jt.labels_snapshot, '') || char(30) ||
+                    COALESCE(ta.id, '') || char(30) ||
+                    COALESCE(ta.status, '') || char(30) ||
+                    COALESCE(ta.last_error, ''),
+                    char(31)
+                ), '') AS target_agents,
                 MAX(ta.expires_at) AS expires_at
              FROM jobs j
              LEFT JOIN task_assignments ta ON ta.job_id = j.id
+             LEFT JOIN job_targets jt ON jt.job_id = j.id AND jt.agent_id = ta.agent_id
              LEFT JOIN agents a ON a.id = ta.agent_id
              WHERE (?1 IS NULL OR j.id = ?1)
              GROUP BY j.id
@@ -1355,9 +2272,13 @@ impl SqliteStore {
                     row.get::<_, Option<String>>(3)?,
                     row.get::<_, String>(4)?,
                     row.get::<_, i64>(5)?,
-                    row.get::<_, i64>(6)?,
+                    row.get::<_, String>(6)?,
                     row.get::<_, String>(7)?,
-                    row.get::<_, Option<i64>>(8)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, Option<i64>>(9)?,
+                    row.get::<_, i64>(10)?,
+                    row.get::<_, String>(11)?,
+                    row.get::<_, Option<i64>>(12)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -1370,6 +2291,10 @@ impl SqliteStore {
                     command_program,
                     command_args_json,
                     created_at,
+                    selector_kind,
+                    selector_source,
+                    strategy_concurrency,
+                    strategy_max_failures,
                     target_count,
                     target_agents,
                     expires_at,
@@ -1380,6 +2305,12 @@ impl SqliteStore {
                         risk,
                         command_program,
                         command_args: parse_command_args(&command_args_json)?,
+                        selector_kind,
+                        selector_source,
+                        strategy_concurrency: strategy_concurrency.max(1) as u32,
+                        strategy_max_failures: strategy_max_failures
+                            .and_then(|value| u32::try_from(value).ok())
+                            .filter(|value| *value > 0),
                         target_count: target_count.max(0) as usize,
                         target_agents: parse_job_target_summaries(&target_agents),
                         created_at: unix_secs_to_system_time(created_at),
@@ -1717,6 +2648,13 @@ impl AdminTokenRepository for SqliteStore {
     fn verify_admin_token_hash(&self, token_hash: &str) -> Result<bool, Self::Error> {
         SqliteStore::verify_admin_token_hash(self, token_hash)
     }
+
+    fn find_admin_token_record(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<AppAdminTokenRecord>, Self::Error> {
+        SqliteStore::find_admin_token_record(self, token_hash)
+    }
 }
 
 impl AgentIdentityRepository for SqliteStore {
@@ -1845,49 +2783,116 @@ impl EnrollmentTokenRepository for SqliteStore {
 impl ApprovalRepository for SqliteStore {
     type Error = StoreError;
 
-    fn record_approval_decision(
+    fn insert_approval_request(
         &mut self,
-        decision: AppApprovalDecisionRecord,
+        request: AppApprovalRequestRecord,
     ) -> Result<(), Self::Error> {
         self.connection.execute(
-            "INSERT INTO approval_decisions (
-                id, job_id, actor, decision, reason, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO approval_requests (
+                id, job_id, requester, approver, reason, status, expires_at, created_at, decided_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
-                decision.id,
-                decision.job_id,
-                decision.actor,
-                decision.decision,
-                decision.reason,
-                system_time_to_unix_secs(decision.created_at),
+                request.id,
+                request.job_id,
+                request.requester,
+                request.approver,
+                request.reason,
+                request.status,
+                system_time_to_unix_secs(request.expires_at),
+                system_time_to_unix_secs(request.created_at),
+                request.decided_at.map(system_time_to_unix_secs),
             ],
         )?;
         Ok(())
     }
 
-    fn list_approval_decisions(
+    fn find_approval_request(
+        &self,
+        approval_id: &str,
+    ) -> Result<Option<AppApprovalRequestRecord>, Self::Error> {
+        self.connection
+            .query_row(
+                "SELECT id, job_id, requester, approver, reason, status, expires_at, created_at, decided_at
+                 FROM approval_requests
+                 WHERE id = ?1",
+                params![approval_id],
+                row_to_app_approval_request_record,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    fn find_pending_approval_for_job(
         &self,
         job_id: &str,
-    ) -> Result<Vec<AppApprovalDecisionRecord>, Self::Error> {
+    ) -> Result<Option<AppApprovalRequestRecord>, Self::Error> {
+        self.connection
+            .query_row(
+                "SELECT id, job_id, requester, approver, reason, status, expires_at, created_at, decided_at
+                 FROM approval_requests
+                 WHERE job_id = ?1 AND status = 'pending'
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 1",
+                params![job_id],
+                row_to_app_approval_request_record,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    fn list_approval_requests(
+        &self,
+        status: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<AppApprovalRequestRecord>, Self::Error> {
+        let limit = limit.clamp(1, 500) as i64;
         let mut statement = self.connection.prepare(
-            "SELECT id, job_id, actor, decision, reason, created_at
-             FROM approval_decisions
-             WHERE job_id = ?1
-             ORDER BY created_at ASC, id ASC",
+            "SELECT id, job_id, requester, approver, reason, status, expires_at, created_at, decided_at
+             FROM approval_requests
+             WHERE (?1 IS NULL OR status = ?1)
+             ORDER BY created_at DESC, id DESC
+             LIMIT ?2",
         )?;
         let rows = statement
-            .query_map(params![job_id], |row| {
-                Ok(AppApprovalDecisionRecord {
-                    id: row.get(0)?,
-                    job_id: row.get(1)?,
-                    actor: row.get(2)?,
-                    decision: row.get(3)?,
-                    reason: row.get(4)?,
-                    created_at: unix_secs_to_system_time(row.get(5)?),
-                })
-            })?
+            .query_map(params![status, limit], row_to_app_approval_request_record)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    fn update_approval_request(
+        &mut self,
+        request: AppApprovalRequestRecord,
+    ) -> Result<bool, Self::Error> {
+        let changed = self.connection.execute(
+            "UPDATE approval_requests
+             SET requester = ?2,
+                 approver = ?3,
+                 reason = ?4,
+                 status = ?5,
+                 expires_at = ?6,
+                 created_at = ?7,
+                 decided_at = ?8
+             WHERE id = ?1",
+            params![
+                request.id,
+                request.requester,
+                request.approver,
+                request.reason,
+                request.status,
+                system_time_to_unix_secs(request.expires_at),
+                system_time_to_unix_secs(request.created_at),
+                request.decided_at.map(system_time_to_unix_secs),
+            ],
+        )?;
+        Ok(changed > 0)
+    }
+
+    fn update_job_status_for_approval(
+        &mut self,
+        job_id: &str,
+        status: JobStatus,
+    ) -> Result<bool, Self::Error> {
+        self.update_job_status(job_id, status)
     }
 }
 
@@ -1923,6 +2928,37 @@ impl DispatchAssignmentRepository for SqliteStore {
         self.find_agent_by_id(agent_id.as_str())
     }
 
+    fn dispatch_gate(&self, job_id: &JobId) -> Result<AppJobDispatchGate, Self::Error> {
+        let gate = self
+            .job_dispatch_gate(job_id.as_str())?
+            .unwrap_or(JobDispatchGateRecord {
+                concurrency: 1,
+                max_failures: None,
+                active_count: 0,
+                failure_count: 0,
+            });
+        Ok(AppJobDispatchGate {
+            concurrency: gate.concurrency as usize,
+            max_failures: gate.max_failures,
+            active_count: gate.active_count,
+            failure_count: gate.failure_count,
+        })
+    }
+
+    fn mark_assignment_dispatched(
+        &mut self,
+        task_id: &TaskId,
+        now: SystemTime,
+    ) -> Result<(), Self::Error> {
+        self.update_task_assignment_status(
+            task_id.as_str(),
+            AssignmentStatus::Dispatched,
+            now,
+            None,
+        )?;
+        Ok(())
+    }
+
     fn mark_job_running(&mut self, job_id: &JobId, _now: SystemTime) -> Result<(), Self::Error> {
         self.update_job_status(job_id.as_str(), JobStatus::Running)?;
         Ok(())
@@ -1935,13 +2971,21 @@ impl DispatchAssignmentRepository for SqliteStore {
 }
 
 impl CommandJobRepository for SqliteStore {
-    fn save_command_job(&mut self, job: Job, task: &CommandTask) -> Result<(), Self::Error> {
+    fn save_command_job(
+        &mut self,
+        job: Job,
+        task: &CommandTask,
+    ) -> Result<(), <Self as TaskAssignmentRepository>::Error> {
         self.save_command_job_record(&job, task)
     }
 }
 
 impl DriftCheckJobRepository for SqliteStore {
-    fn save_drift_check_job(&mut self, job: Job, task: &DriftCheckTask) -> Result<(), Self::Error> {
+    fn save_drift_check_job(
+        &mut self,
+        job: Job,
+        task: &DriftCheckTask,
+    ) -> Result<(), <Self as TaskAssignmentRepository>::Error> {
         self.save_drift_check_job_record(&job, task)
     }
 }
@@ -1951,7 +2995,7 @@ impl RunbookJobRepository for SqliteStore {
         &mut self,
         job: Job,
         task: &RunbookExecutionTask,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), <Self as TaskAssignmentRepository>::Error> {
         self.save_runbook_job_record(&job, task)
     }
 }
@@ -1988,13 +3032,22 @@ impl JobQueryRepository for SqliteStore {
                 risk: record.risk,
                 command_program: record.command_program,
                 command_args: record.command_args,
+                selector_kind: record.selector_kind,
+                selector_source: record.selector_source,
+                strategy_concurrency: record.strategy_concurrency,
+                strategy_max_failures: record.strategy_max_failures,
                 target_count: record.target_count,
                 target_agents: record
                     .target_agents
                     .into_iter()
                     .map(|target| AppJobTargetSummaryRecord {
                         agent_id: target.agent_id,
+                        agent_name: target.agent_name,
                         status: target.status,
+                        labels: target.labels,
+                        task_id: target.task_id,
+                        assignment_status: target.assignment_status,
+                        last_error: target.last_error,
                     })
                     .collect(),
                 created_at: record.created_at,
@@ -2011,13 +3064,22 @@ impl JobQueryRepository for SqliteStore {
                 risk: record.risk,
                 command_program: record.command_program,
                 command_args: record.command_args,
+                selector_kind: record.selector_kind,
+                selector_source: record.selector_source,
+                strategy_concurrency: record.strategy_concurrency,
+                strategy_max_failures: record.strategy_max_failures,
                 target_count: record.target_count,
                 target_agents: record
                     .target_agents
                     .into_iter()
                     .map(|target| AppJobTargetSummaryRecord {
                         agent_id: target.agent_id,
+                        agent_name: target.agent_name,
                         status: target.status,
+                        labels: target.labels,
+                        task_id: target.task_id,
+                        assignment_status: target.assignment_status,
+                        last_error: target.last_error,
                     })
                     .collect(),
                 created_at: record.created_at,
@@ -2121,6 +3183,29 @@ impl MetricsRepository for SqliteStore {
     }
 }
 
+impl AgentLogRepository for SqliteStore {
+    type Error = StoreError;
+
+    fn list_agent_log_chunks(
+        &self,
+        agent_id: &str,
+        limit: usize,
+        before: Option<SnapshotPageCursor>,
+    ) -> Result<Vec<AppAgentLogChunkPageRecord>, Self::Error> {
+        Ok(
+            SqliteStore::list_agent_log_chunks_page(self, agent_id, limit, before)?
+                .into_iter()
+                .map(|record| AppAgentLogChunkPageRecord {
+                    agent_id: record.agent_id,
+                    line: record.line,
+                    collected_at: record.collected_at,
+                    cursor: record.cursor,
+                })
+                .collect(),
+        )
+    }
+}
+
 impl DriftRepository for SqliteStore {
     type Error = StoreError;
 
@@ -2166,6 +3251,132 @@ impl DriftRepository for SqliteStore {
     }
 }
 
+impl PolicyRepository for SqliteStore {
+    type Error = StoreError;
+
+    fn save_policy_source(
+        &mut self,
+        policy_id: &str,
+        name: &str,
+        version: u32,
+        source: &str,
+    ) -> Result<(), Self::Error> {
+        SqliteStore::save_policy_source(self, policy_id, name, version, source)
+    }
+
+    fn list_policies(&self) -> Result<Vec<AppPolicyRecord>, Self::Error> {
+        Ok(SqliteStore::list_policies(self)?
+            .into_iter()
+            .map(|record| AppPolicyRecord {
+                id: record.id,
+                name: record.name,
+                version: record.version,
+                source: record.source,
+                created_at: record.created_at,
+                updated_at: record.updated_at,
+            })
+            .collect())
+    }
+
+    fn find_policy(&self, policy_id: &str) -> Result<Option<AppPolicyRecord>, Self::Error> {
+        Ok(
+            SqliteStore::find_policy(self, policy_id)?.map(|record| AppPolicyRecord {
+                id: record.id,
+                name: record.name,
+                version: record.version,
+                source: record.source,
+                created_at: record.created_at,
+                updated_at: record.updated_at,
+            }),
+        )
+    }
+
+    fn assign_policy_to_agent(
+        &mut self,
+        policy_id: &str,
+        agent_id: &str,
+        assigned_at: SystemTime,
+    ) -> Result<(), Self::Error> {
+        SqliteStore::assign_policy_to_agent(self, policy_id, agent_id, assigned_at)
+    }
+
+    fn policies_for_agent(
+        &self,
+        agent_id: &str,
+    ) -> Result<Vec<AppPolicyAssignmentRecord>, Self::Error> {
+        Ok(SqliteStore::policies_for_agent(self, agent_id)?
+            .into_iter()
+            .map(|record| AppPolicyAssignmentRecord {
+                policy_id: record.policy_id,
+                agent_id: record.agent_id,
+                assigned_at: record.assigned_at,
+            })
+            .collect())
+    }
+
+    fn upsert_policy_schedule(
+        &mut self,
+        policy_id: &str,
+        agent_id: &str,
+        interval: Duration,
+        next_due_at: SystemTime,
+    ) -> Result<(), Self::Error> {
+        SqliteStore::upsert_policy_schedule(self, policy_id, agent_id, interval, next_due_at)
+    }
+
+    fn due_scheduled_drift_checks(
+        &self,
+        now: SystemTime,
+        limit: usize,
+    ) -> Result<Vec<AppScheduledDriftRecord>, Self::Error> {
+        Ok(SqliteStore::due_scheduled_drift_checks(self, now, limit)?
+            .into_iter()
+            .map(|record| AppScheduledDriftRecord {
+                policy_id: record.policy_id,
+                agent_id: record.agent_id,
+                interval_seconds: record.interval_seconds,
+                next_due_at: record.next_due_at,
+                last_checked_at: record.last_checked_at,
+            })
+            .collect())
+    }
+
+    fn record_scheduled_drift_check(
+        &mut self,
+        policy_id: &str,
+        agent_id: &str,
+        checked_at: SystemTime,
+    ) -> Result<(), Self::Error> {
+        SqliteStore::record_scheduled_drift_check(self, policy_id, agent_id, checked_at)
+    }
+
+    fn acknowledge_latest_drift_report(
+        &mut self,
+        agent_id: &str,
+        policy_name: &str,
+        actor: &str,
+        acknowledged_at: SystemTime,
+    ) -> Result<bool, Self::Error> {
+        SqliteStore::acknowledge_latest_drift_report(
+            self,
+            agent_id,
+            policy_name,
+            actor,
+            acknowledged_at,
+        )
+    }
+
+    fn mark_latest_drift_resolved(
+        &mut self,
+        agent_id: &str,
+        policy_name: &str,
+        job_id: &str,
+        resolved_at: SystemTime,
+    ) -> Result<bool, Self::Error> {
+        SqliteStore::mark_latest_drift_resolved(self, agent_id, policy_name, job_id, resolved_at)
+    }
+}
+
 fn row_to_facts_snapshot_page_record(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<FactsSnapshotPageRecord> {
@@ -2198,6 +3409,22 @@ fn row_to_metrics_snapshot_page_record(
     })
 }
 
+fn row_to_agent_log_chunk_page_record(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<AgentLogChunkPageRecord> {
+    let id = row.get(0)?;
+    let collected_at = unix_secs_to_system_time(row.get(3)?);
+    Ok(AgentLogChunkPageRecord {
+        agent_id: row.get(1)?,
+        line: row.get(2)?,
+        collected_at,
+        cursor: SnapshotPageCursor {
+            occurred_at: collected_at,
+            row_id: id,
+        },
+    })
+}
+
 fn row_to_drift_report_page_record(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<DriftReportPageRecord> {
@@ -2208,6 +3435,8 @@ fn row_to_drift_report_page_record(
         report: DriftReport {
             policy_name: row.get(2)?,
             status: parse_drift_status(&row.get::<_, String>(3)?),
+            severity: parse_drift_severity(&row.get::<_, String>(7)?),
+            acknowledgement: row_to_drift_acknowledgement(row, 8, 9, 10, 11)?,
             expected: row.get(4)?,
             actual: row.get(5)?,
         },
@@ -2216,6 +3445,55 @@ fn row_to_drift_report_page_record(
             occurred_at: checked_at,
             row_id: id,
         },
+    })
+}
+
+fn row_to_policy_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<PolicyRecord> {
+    Ok(PolicyRecord {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        version: row.get::<_, i64>(2)?.max(0) as u32,
+        source: row.get(3)?,
+        created_at: unix_secs_to_system_time(row.get(4)?),
+        updated_at: unix_secs_to_system_time(row.get(5)?),
+    })
+}
+
+fn row_to_policy_assignment_record(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<PolicyAssignmentRecord> {
+    Ok(PolicyAssignmentRecord {
+        policy_id: row.get(0)?,
+        agent_id: row.get(1)?,
+        assigned_at: unix_secs_to_system_time(row.get(2)?),
+    })
+}
+
+fn row_to_scheduled_drift_record(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<ScheduledDriftRecord> {
+    Ok(ScheduledDriftRecord {
+        policy_id: row.get(0)?,
+        agent_id: row.get(1)?,
+        interval_seconds: row.get::<_, i64>(2)?.max(0) as u64,
+        next_due_at: unix_secs_to_system_time(row.get(3)?),
+        last_checked_at: row.get::<_, Option<i64>>(4)?.map(unix_secs_to_system_time),
+    })
+}
+
+fn row_to_app_approval_request_record(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<AppApprovalRequestRecord> {
+    Ok(AppApprovalRequestRecord {
+        id: row.get(0)?,
+        job_id: row.get(1)?,
+        requester: row.get(2)?,
+        approver: row.get(3)?,
+        reason: row.get(4)?,
+        status: row.get(5)?,
+        expires_at: unix_secs_to_system_time(row.get(6)?),
+        created_at: unix_secs_to_system_time(row.get(7)?),
+        decided_at: row.get::<_, Option<i64>>(8)?.map(unix_secs_to_system_time),
     })
 }
 
@@ -2277,6 +3555,17 @@ fn job_status_to_str(status: JobStatus) -> &'static str {
     }
 }
 
+fn assignment_status_to_str(status: AssignmentStatus) -> &'static str {
+    status.as_str()
+}
+
+fn assignment_status_value_is_terminal(value: &str) -> bool {
+    matches!(
+        value,
+        "succeeded" | "failed" | "rejected" | "canceled" | "expired"
+    )
+}
+
 fn task_risk_to_str(risk: fleet_domain::TaskRisk) -> &'static str {
     match risk {
         fleet_domain::TaskRisk::Low => "low",
@@ -2323,6 +3612,50 @@ fn parse_drift_status(value: &str) -> DriftStatus {
     }
 }
 
+fn drift_severity_to_str(severity: DriftSeverity) -> &'static str {
+    match severity {
+        DriftSeverity::None => "none",
+        DriftSeverity::Warning => "warning",
+        DriftSeverity::Critical => "critical",
+        DriftSeverity::Unknown => "unknown",
+    }
+}
+
+fn parse_drift_severity(value: &str) -> DriftSeverity {
+    match value {
+        "none" => DriftSeverity::None,
+        "warning" => DriftSeverity::Warning,
+        "critical" => DriftSeverity::Critical,
+        _ => DriftSeverity::Unknown,
+    }
+}
+
+fn row_to_drift_acknowledgement(
+    row: &rusqlite::Row<'_>,
+    acknowledged_at_index: usize,
+    acknowledged_by_index: usize,
+    resolved_at_index: usize,
+    resolution_job_id_index: usize,
+) -> rusqlite::Result<DriftAcknowledgement> {
+    let resolved_at = row.get::<_, Option<i64>>(resolved_at_index)?;
+    let resolution_job_id = row.get::<_, Option<String>>(resolution_job_id_index)?;
+    if let (Some(resolved_at), Some(job_id)) = (resolved_at, resolution_job_id) {
+        return Ok(DriftAcknowledgement::Resolved {
+            job_id,
+            at: unix_secs_to_system_time(resolved_at),
+        });
+    }
+    let acknowledged_at = row.get::<_, Option<i64>>(acknowledged_at_index)?;
+    let acknowledged_by = row.get::<_, Option<String>>(acknowledged_by_index)?;
+    if let (Some(acknowledged_at), Some(by)) = (acknowledged_at, acknowledged_by) {
+        return Ok(DriftAcknowledgement::Acknowledged {
+            by,
+            at: unix_secs_to_system_time(acknowledged_at),
+        });
+    }
+    Ok(DriftAcknowledgement::Open)
+}
+
 fn parse_command_args(value: &str) -> Result<Vec<String>, StoreError> {
     serde_json::from_str(value).map_err(|error| StoreError::Domain(error.to_string()))
 }
@@ -2334,13 +3667,29 @@ fn parse_job_target_summaries(value: &str) -> Vec<JobTargetSummaryRecord> {
     value
         .split('\u{1f}')
         .filter_map(|item| {
-            let (agent_id, status) = item.split_once('\u{1e}')?;
+            let mut fields = item.split('\u{1e}');
+            let agent_id = fields.next()?;
+            let agent_name = fields.next().unwrap_or(agent_id);
+            let status = fields.next().unwrap_or("unknown");
+            let labels_snapshot = fields.next().unwrap_or("");
+            let task_id = fields.next().filter(|value| !value.is_empty());
+            let assignment_status = fields.next().filter(|value| !value.is_empty());
+            let last_error = fields.next().unwrap_or("");
             if agent_id.is_empty() {
                 return None;
             }
             Some(JobTargetSummaryRecord {
                 agent_id: agent_id.to_owned(),
+                agent_name: agent_name.to_owned(),
                 status: status.to_owned(),
+                labels: decode_labels(labels_snapshot)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|label| (label.key().to_owned(), label.value().to_owned()))
+                    .collect(),
+                task_id: task_id.map(str::to_owned),
+                assignment_status: assignment_status.map(str::to_owned),
+                last_error: last_error.to_owned(),
             })
         })
         .collect()
@@ -2405,6 +3754,12 @@ pub fn store_layer_ready() -> bool {
 const SCHEMA_SQL: &str = r#"
 PRAGMA foreign_keys = ON;
 
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    name TEXT PRIMARY KEY,
+    version INTEGER NOT NULL,
+    applied_at INTEGER NOT NULL DEFAULT (unixepoch())
+);
+
 CREATE TABLE IF NOT EXISTS controller_identity (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     public_key TEXT NOT NULL,
@@ -2416,6 +3771,8 @@ CREATE TABLE IF NOT EXISTS controller_identity (
 CREATE TABLE IF NOT EXISTS admin_tokens (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     token_hash TEXT NOT NULL,
+    actor_id TEXT NOT NULL DEFAULT 'bootstrap-admin',
+    role TEXT NOT NULL DEFAULT 'owner',
     created_at INTEGER NOT NULL
 );
 
@@ -2461,6 +3818,10 @@ CREATE TABLE IF NOT EXISTS jobs (
     command_max_output_bytes INTEGER NOT NULL DEFAULT 1048576,
     drift_policy_document TEXT,
     runbook_document TEXT,
+    selector_kind TEXT NOT NULL DEFAULT 'explicit_ids',
+    selector_source TEXT NOT NULL DEFAULT '',
+    strategy_concurrency INTEGER NOT NULL DEFAULT 1,
+    strategy_max_failures INTEGER,
     created_at INTEGER NOT NULL DEFAULT (unixepoch())
 );
 
@@ -2468,6 +3829,9 @@ CREATE TABLE IF NOT EXISTS job_targets (
     job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
     agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
     status TEXT NOT NULL,
+    agent_display_name TEXT NOT NULL DEFAULT '',
+    agent_status_snapshot TEXT NOT NULL DEFAULT 'unknown',
+    labels_snapshot TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (job_id, agent_id)
 );
 
@@ -2475,11 +3839,17 @@ CREATE TABLE IF NOT EXISTS task_assignments (
     id TEXT PRIMARY KEY,
     job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
     agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT 'queued',
     nonce TEXT NOT NULL UNIQUE,
     payload_hash TEXT NOT NULL,
     signature TEXT NOT NULL,
     issued_at INTEGER NOT NULL DEFAULT (unixepoch()),
     expires_at INTEGER NOT NULL,
+    dispatched_at INTEGER,
+    accepted_at INTEGER,
+    started_at INTEGER,
+    completed_at INTEGER,
+    last_error TEXT NOT NULL DEFAULT '',
     created_at INTEGER NOT NULL DEFAULT (unixepoch())
 );
 
@@ -2501,6 +3871,18 @@ CREATE TABLE IF NOT EXISTS approval_decisions (
     decision TEXT NOT NULL,
     reason TEXT NOT NULL DEFAULT '',
     created_at INTEGER NOT NULL DEFAULT (unixepoch())
+);
+
+CREATE TABLE IF NOT EXISTS approval_requests (
+    id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    requester TEXT NOT NULL,
+    approver TEXT,
+    reason TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    decided_at INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS audit_events (
@@ -2533,9 +3915,39 @@ CREATE TABLE IF NOT EXISTS drift_reports (
     agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
     policy_name TEXT NOT NULL,
     status TEXT NOT NULL,
+    severity TEXT NOT NULL DEFAULT 'unknown',
     expected TEXT NOT NULL,
     actual TEXT NOT NULL,
-    checked_at INTEGER NOT NULL
+    checked_at INTEGER NOT NULL,
+    acknowledged_at INTEGER,
+    acknowledged_by TEXT,
+    resolved_at INTEGER,
+    resolution_job_id TEXT
+);
+
+CREATE TABLE IF NOT EXISTS policies (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS policy_assignments (
+    policy_id TEXT NOT NULL REFERENCES policies(id) ON DELETE CASCADE,
+    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    assigned_at INTEGER NOT NULL,
+    PRIMARY KEY (policy_id, agent_id)
+);
+
+CREATE TABLE IF NOT EXISTS policy_drift_schedules (
+    policy_id TEXT NOT NULL REFERENCES policies(id) ON DELETE CASCADE,
+    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    interval_seconds INTEGER NOT NULL,
+    next_due_at INTEGER NOT NULL,
+    last_checked_at INTEGER,
+    PRIMARY KEY (policy_id, agent_id)
 );
 
 CREATE TABLE IF NOT EXISTS agent_log_chunks (
@@ -2591,6 +4003,75 @@ mod tests {
         let store = SqliteStore::in_memory().unwrap();
         store.migrate().unwrap();
         store.migrate().unwrap();
+        assert_eq!(
+            store.current_schema_version().unwrap(),
+            Some(CURRENT_SCHEMA_VERSION)
+        );
+    }
+
+    #[test]
+    fn empty_database_initialization_records_schema_version() {
+        let store = SqliteStore::in_memory().unwrap();
+
+        assert_eq!(
+            store.current_schema_version().unwrap(),
+            Some(CURRENT_SCHEMA_VERSION)
+        );
+        assert!(store.has_column("schema_migrations", "version").unwrap());
+        assert!(store.has_column("agents", "pinned_controller").unwrap());
+        assert!(store.has_column("task_assignments", "nonce").unwrap());
+        assert!(store.has_column("task_assignments", "status").unwrap());
+        assert!(store.has_column("task_assignments", "accepted_at").unwrap());
+        assert!(store.has_column("admin_tokens", "actor_id").unwrap());
+        assert!(store.has_column("admin_tokens", "role").unwrap());
+    }
+
+    #[test]
+    fn migration_from_previous_jobs_schema_adds_columns_without_losing_rows() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE jobs (
+                    id TEXT PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    risk TEXT NOT NULL,
+                    approval_requirement TEXT NOT NULL,
+                    timeout_ms INTEGER NOT NULL,
+                    command_program TEXT,
+                    command_args_json TEXT NOT NULL DEFAULT '[]',
+                    command_max_output_bytes INTEGER NOT NULL DEFAULT 1048576,
+                    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                );
+                INSERT INTO jobs (
+                    id, status, risk, approval_requirement, timeout_ms,
+                    command_program, command_args_json, command_max_output_bytes
+                ) VALUES (
+                    'legacy-job', 'queued', 'high', 'admin_confirmation', 30000,
+                    'uptime', '[]', 1048576
+                );
+                "#,
+            )
+            .unwrap();
+
+        let store = SqliteStore { connection };
+        store.migrate().unwrap();
+
+        assert!(store.has_column("jobs", "drift_policy_document").unwrap());
+        assert!(store.has_column("jobs", "runbook_document").unwrap());
+        assert_eq!(
+            store.current_schema_version().unwrap(),
+            Some(CURRENT_SCHEMA_VERSION)
+        );
+        let job_count: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM jobs WHERE id = 'legacy-job'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(job_count, 1);
     }
 
     #[test]
@@ -2610,6 +4091,21 @@ mod tests {
         assert!(store.has_column("jobs", "timeout_ms").unwrap());
         assert!(store.has_column("jobs", "drift_policy_document").unwrap());
         assert!(store.has_column("jobs", "runbook_document").unwrap());
+        assert!(store.has_column("jobs", "selector_kind").unwrap());
+        assert!(store.has_column("jobs", "selector_source").unwrap());
+        assert!(store.has_column("jobs", "strategy_concurrency").unwrap());
+        assert!(store.has_column("jobs", "strategy_max_failures").unwrap());
+        assert!(
+            store
+                .has_column("job_targets", "agent_display_name")
+                .unwrap()
+        );
+        assert!(
+            store
+                .has_column("job_targets", "agent_status_snapshot")
+                .unwrap()
+        );
+        assert!(store.has_column("job_targets", "labels_snapshot").unwrap());
         assert!(store.has_column("task_assignments", "issued_at").unwrap());
         assert!(
             store
@@ -2656,6 +4152,30 @@ mod tests {
             "controller-fp"
         );
 
+        <SqliteStore as AdminTokenRepository>::insert_admin_token_hash(
+            &mut store,
+            "admin-hash-contract",
+        )
+        .unwrap();
+        assert!(
+            <SqliteStore as AdminTokenRepository>::verify_admin_token_hash(
+                &store,
+                "admin-hash-contract"
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            <SqliteStore as AdminTokenRepository>::find_admin_token_record(
+                &store,
+                "admin-hash-contract"
+            )
+            .unwrap(),
+            Some(AppAdminTokenRecord {
+                actor_id: "bootstrap-admin".to_owned(),
+                role: "owner".to_owned(),
+            })
+        );
+
         <SqliteStore as EnrollmentTokenRepository>::insert_enrollment_token_hash(
             &mut store,
             "et-contract",
@@ -2689,23 +4209,30 @@ mod tests {
             Duration::from_secs(30),
         );
         store.save_job_record(&job).unwrap();
-        <SqliteStore as ApprovalRepository>::record_approval_decision(
+        <SqliteStore as ApprovalRepository>::insert_approval_request(
             &mut store,
-            AppApprovalDecisionRecord {
+            AppApprovalRequestRecord {
                 id: "approval-contract".to_owned(),
                 job_id: "job-contract".to_owned(),
-                actor: "admin".to_owned(),
-                decision: "approved".to_owned(),
+                requester: "operator".to_owned(),
+                approver: None,
                 reason: "test".to_owned(),
+                status: "pending".to_owned(),
+                expires_at: SystemTime::UNIX_EPOCH + Duration::from_secs(60),
                 created_at: SystemTime::UNIX_EPOCH + Duration::from_secs(2),
+                decided_at: None,
             },
         )
         .unwrap();
         assert_eq!(
-            <SqliteStore as ApprovalRepository>::list_approval_decisions(&store, "job-contract")
-                .unwrap()[0]
-                .decision,
-            "approved"
+            <SqliteStore as ApprovalRepository>::list_approval_requests(
+                &store,
+                Some("pending"),
+                10
+            )
+            .unwrap()[0]
+                .job_id,
+            "job-contract"
         );
 
         <SqliteStore as FactsRepository>::insert_facts_snapshot(
@@ -2740,6 +4267,8 @@ mod tests {
             &DriftReport {
                 policy_name: "contract".to_owned(),
                 status: DriftStatus::Compliant,
+                severity: DriftSeverity::None,
+                acknowledgement: DriftAcknowledgement::Open,
                 expected: "expected".to_owned(),
                 actual: "actual".to_owned(),
             },
@@ -2908,6 +4437,43 @@ mod tests {
     }
 
     #[test]
+    fn pages_agent_log_chunks_before_cursor() {
+        let store = SqliteStore::in_memory().unwrap();
+        store.save_agent(agent()).unwrap();
+        for (seconds, line) in [
+            (1, "level=info event=agent_log_uploaded sequence=1"),
+            (2, "level=info event=agent_log_uploaded sequence=2"),
+            (3, "level=info event=agent_log_uploaded sequence=3"),
+        ] {
+            store
+                .insert_agent_log_chunk(
+                    "a1",
+                    line,
+                    SystemTime::UNIX_EPOCH + Duration::from_secs(seconds),
+                )
+                .unwrap();
+        }
+
+        let first_page = store.list_agent_log_chunks_page("a1", 2, None).unwrap();
+        assert_eq!(
+            first_page
+                .iter()
+                .map(|record| record.line.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "level=info event=agent_log_uploaded sequence=3",
+                "level=info event=agent_log_uploaded sequence=2"
+            ]
+        );
+
+        let second_page = store
+            .list_agent_log_chunks_page("a1", 2, Some(first_page[1].cursor))
+            .unwrap();
+        assert_eq!(second_page.len(), 1);
+        assert!(second_page[0].line.contains("sequence=1"));
+    }
+
+    #[test]
     fn pages_facts_snapshots_with_stable_cursor() {
         let store = SqliteStore::in_memory().unwrap();
         store.save_agent(agent()).unwrap();
@@ -3005,6 +4571,8 @@ mod tests {
                 &DriftReport {
                     policy_name: "nginx-running".to_owned(),
                     status: DriftStatus::Unknown,
+                    severity: DriftSeverity::Unknown,
+                    acknowledgement: DriftAcknowledgement::Open,
                     expected: "service nginx running".to_owned(),
                     actual: "unknown".to_owned(),
                 },
@@ -3017,6 +4585,8 @@ mod tests {
                 &DriftReport {
                     policy_name: "nginx-running".to_owned(),
                     status: DriftStatus::Drifted,
+                    severity: DriftSeverity::Warning,
+                    acknowledgement: DriftAcknowledgement::Open,
                     expected: "service nginx running".to_owned(),
                     actual: "stopped".to_owned(),
                 },
@@ -3045,6 +4615,8 @@ mod tests {
                     "a1",
                     &DriftReport {
                         policy_name: "nginx-running".to_owned(),
+                        severity: DriftSeverity::for_status(status.clone()),
+                        acknowledgement: DriftAcknowledgement::Open,
                         status,
                         expected: "service nginx running".to_owned(),
                         actual: actual.to_owned(),
@@ -3071,6 +4643,112 @@ mod tests {
     }
 
     #[test]
+    fn stores_policy_assignment_schedule_and_drift_acknowledgement_state() {
+        let store = SqliteStore::in_memory().unwrap();
+        store.save_agent(agent()).unwrap();
+        store
+            .save_policy_source("policy-1", "nginx-running", 1, "kind: Policy")
+            .unwrap();
+
+        assert_eq!(store.list_policies().unwrap().len(), 1);
+        assert!(store.find_policy("policy-1").unwrap().is_some());
+
+        store
+            .assign_policy_to_agent(
+                "policy-1",
+                "a1",
+                SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+            )
+            .unwrap();
+        assert_eq!(
+            store.assigned_policy_ids_for_agent("a1").unwrap(),
+            vec!["policy-1".to_owned()]
+        );
+
+        store
+            .upsert_policy_schedule(
+                "policy-1",
+                "a1",
+                Duration::from_secs(300),
+                SystemTime::UNIX_EPOCH + Duration::from_secs(300),
+            )
+            .unwrap();
+        assert!(
+            store
+                .due_scheduled_drift_checks(SystemTime::UNIX_EPOCH + Duration::from_secs(299), 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .due_scheduled_drift_checks(SystemTime::UNIX_EPOCH + Duration::from_secs(300), 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        store
+            .record_scheduled_drift_check(
+                "policy-1",
+                "a1",
+                SystemTime::UNIX_EPOCH + Duration::from_secs(300),
+            )
+            .unwrap();
+        assert!(
+            store
+                .due_scheduled_drift_checks(SystemTime::UNIX_EPOCH + Duration::from_secs(599), 10)
+                .unwrap()
+                .is_empty()
+        );
+
+        store
+            .insert_drift_report(
+                "a1",
+                &DriftReport {
+                    policy_name: "nginx-running".to_owned(),
+                    status: DriftStatus::Drifted,
+                    severity: DriftSeverity::Warning,
+                    acknowledgement: DriftAcknowledgement::Open,
+                    expected: "service nginx running".to_owned(),
+                    actual: "stopped".to_owned(),
+                },
+                SystemTime::UNIX_EPOCH + Duration::from_secs(301),
+            )
+            .unwrap();
+
+        assert!(
+            store
+                .acknowledge_latest_drift_report(
+                    "a1",
+                    "nginx-running",
+                    "admin",
+                    SystemTime::UNIX_EPOCH + Duration::from_secs(302),
+                )
+                .unwrap()
+        );
+        let acknowledged = store.latest_drift_report("a1").unwrap().unwrap();
+        assert!(matches!(
+            acknowledged.report.acknowledgement,
+            DriftAcknowledgement::Acknowledged { ref by, .. } if by == "admin"
+        ));
+
+        assert!(
+            store
+                .mark_latest_drift_resolved(
+                    "a1",
+                    "nginx-running",
+                    "job-remediate",
+                    SystemTime::UNIX_EPOCH + Duration::from_secs(303),
+                )
+                .unwrap()
+        );
+        let resolved = store.latest_drift_report("a1").unwrap().unwrap();
+        assert!(matches!(
+            resolved.report.acknowledgement,
+            DriftAcknowledgement::Resolved { ref job_id, .. } if job_id == "job-remediate"
+        ));
+    }
+
+    #[test]
     fn retention_cleanup_dry_run_does_not_delete() {
         let store = SqliteStore::in_memory().unwrap();
         store.save_agent(agent()).unwrap();
@@ -3086,11 +4764,13 @@ mod tests {
                 job_output_chunks: 1,
                 facts_snapshots: 1,
                 metrics_snapshots: 1,
+                agent_log_chunks: 1,
             }
         );
         assert_eq!(row_count(&store, "job_output_chunks"), 2);
         assert_eq!(row_count(&store, "facts_snapshots"), 2);
         assert_eq!(row_count(&store, "metrics_snapshots"), 2);
+        assert_eq!(row_count(&store, "agent_log_chunks"), 2);
     }
 
     #[test]
@@ -3103,10 +4783,28 @@ mod tests {
             .cleanup_retention(SystemTime::UNIX_EPOCH + Duration::from_secs(100), false)
             .unwrap();
 
-        assert_eq!(summary.total(), 3);
+        assert_eq!(summary.total(), 4);
         assert_eq!(row_count(&store, "job_output_chunks"), 1);
         assert_eq!(row_count(&store, "facts_snapshots"), 1);
         assert_eq!(row_count(&store, "metrics_snapshots"), 1);
+        assert_eq!(row_count(&store, "agent_log_chunks"), 1);
+    }
+
+    #[test]
+    fn retention_cleanup_does_not_delete_audit_events() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        store.save_agent(agent()).unwrap();
+        seed_retention_rows(&store);
+        store
+            .write(AuditEvent::security("retention_guard", "store"))
+            .unwrap();
+
+        store
+            .cleanup_retention(SystemTime::UNIX_EPOCH + Duration::from_secs(100), false)
+            .unwrap();
+
+        assert_eq!(AuditRepository::list(&store, 10).unwrap().len(), 1);
+        assert_eq!(row_count(&store, "audit_events"), 1);
     }
 
     #[test]
@@ -3132,6 +4830,126 @@ mod tests {
             .exists([])
             .unwrap();
         assert!(assignment_exists);
+        assert_eq!(
+            store.find_task_assignment_status("task-1").unwrap(),
+            Some("queued".to_owned())
+        );
+    }
+
+    #[test]
+    fn task_assignment_status_transitions_are_persisted() {
+        let store = SqliteStore::in_memory().unwrap();
+        store.save_agent(agent()).unwrap();
+        let mut job = fleet_domain::Job::new(
+            fleet_domain::JobId::new("job-1").unwrap(),
+            fleet_domain::TaskRisk::High,
+            fleet_domain::ApprovalRequirement::AdminConfirmation,
+            Duration::from_secs(30),
+        );
+        job.queue(true).unwrap();
+        let command = CommandTask::new("uptime", Vec::new(), Duration::from_secs(30)).unwrap();
+        store.save_command_job_record(&job, &command).unwrap();
+        store
+            .save_task_assignment_record(&task_envelope("nonce-1", "task-1"))
+            .unwrap();
+
+        store
+            .update_task_assignment_status(
+                "task-1",
+                AssignmentStatus::Dispatched,
+                SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.find_task_assignment_status("task-1").unwrap(),
+            Some("dispatched".to_owned())
+        );
+        assert!(
+            store
+                .list_pending_dispatch_assignments(
+                    Some(&AgentId::new("a1").unwrap()),
+                    Some(&fleet_domain::JobId::new("job-1").unwrap()),
+                    10,
+                )
+                .unwrap()
+                .is_empty()
+        );
+
+        store
+            .update_task_assignment_status(
+                "task-1",
+                AssignmentStatus::Accepted,
+                SystemTime::UNIX_EPOCH + Duration::from_secs(2),
+                None,
+            )
+            .unwrap();
+        store
+            .update_task_assignment_status(
+                "task-1",
+                AssignmentStatus::Started,
+                SystemTime::UNIX_EPOCH + Duration::from_secs(3),
+                None,
+            )
+            .unwrap();
+        store
+            .update_task_assignment_status(
+                "task-1",
+                AssignmentStatus::Failed,
+                SystemTime::UNIX_EPOCH + Duration::from_secs(4),
+                Some("exit_code=1"),
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.find_task_assignment_status("task-1").unwrap(),
+            Some("failed".to_owned())
+        );
+    }
+
+    #[test]
+    fn active_assignment_update_does_not_override_terminal_status() {
+        let store = SqliteStore::in_memory().unwrap();
+        store.save_agent(agent()).unwrap();
+        let mut job = fleet_domain::Job::new(
+            fleet_domain::JobId::new("job-1").unwrap(),
+            fleet_domain::TaskRisk::High,
+            fleet_domain::ApprovalRequirement::AdminConfirmation,
+            Duration::from_secs(30),
+        );
+        job.queue(true).unwrap();
+        let command = CommandTask::new("uptime", Vec::new(), Duration::from_secs(30)).unwrap();
+        store.save_command_job_record(&job, &command).unwrap();
+        store
+            .save_task_assignment_record(&task_envelope("nonce-1", "task-1"))
+            .unwrap();
+
+        store
+            .update_task_assignment_status(
+                "task-1",
+                AssignmentStatus::Canceled,
+                SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+                Some("operator requested cancel"),
+            )
+            .unwrap();
+        let changed = store
+            .update_active_task_assignment_status(
+                "task-1",
+                AssignmentStatus::Succeeded,
+                SystemTime::UNIX_EPOCH + Duration::from_secs(2),
+                Some("exit_code=0"),
+            )
+            .unwrap();
+        let state = store
+            .find_task_assignment_state_for_job("job-1")
+            .unwrap()
+            .unwrap();
+
+        assert!(!changed);
+        assert_eq!(state.task_id, "task-1");
+        assert_eq!(state.agent_id, "a1");
+        assert_eq!(state.status, "canceled");
     }
 
     #[test]
@@ -3340,6 +5158,63 @@ mod tests {
         assert_eq!(summaries[0].command_program.as_deref(), Some("uptime"));
         assert_eq!(summaries[0].command_args, vec!["-a"]);
         assert_eq!(summaries[0].target_count, 1);
+        assert_eq!(summaries[0].selector_kind, "explicit_ids");
+        assert_eq!(summaries[0].strategy_concurrency, 1);
+        assert_eq!(summaries[0].strategy_max_failures, None);
+        assert_eq!(summaries[0].target_agents[0].agent_id, "a1");
+        assert_eq!(summaries[0].target_agents[0].agent_name, "web-01");
+        assert_eq!(summaries[0].target_agents[0].status, "pending");
+        assert_eq!(
+            summaries[0].target_agents[0].task_id.as_deref(),
+            Some("task-1")
+        );
+        assert_eq!(
+            summaries[0].target_agents[0].assignment_status.as_deref(),
+            Some("queued")
+        );
+        assert_eq!(
+            summaries[0].target_agents[0].labels,
+            vec![("role".to_owned(), "web".to_owned())]
+        );
+    }
+
+    #[test]
+    fn job_target_snapshot_survives_later_agent_label_and_status_changes() {
+        let store = SqliteStore::in_memory().unwrap();
+        store.save_agent(agent()).unwrap();
+        let mut job = fleet_domain::Job::new(
+            fleet_domain::JobId::new("job-1").unwrap(),
+            fleet_domain::TaskRisk::High,
+            fleet_domain::ApprovalRequirement::AdminConfirmation,
+            Duration::from_secs(30),
+        );
+        job.queue(true).unwrap();
+        let command = CommandTask::new("uptime", Vec::new(), Duration::from_secs(30)).unwrap();
+        store.save_command_job_record(&job, &command).unwrap();
+        store
+            .update_job_selector_snapshot("job-1", "selector", "label:role=web")
+            .unwrap();
+        store.update_job_strategy("job-1", 2, Some(1)).unwrap();
+        store
+            .save_task_assignment_record(&task_envelope("nonce-1", "task-1"))
+            .unwrap();
+
+        store
+            .update_agent_labels("a1", &[AgentLabel::new("role", "db").unwrap()])
+            .unwrap();
+        store.revoke_agent_key("a1").unwrap();
+
+        let summary = store.find_job_summary("job-1").unwrap().unwrap();
+
+        assert_eq!(summary.selector_kind, "selector");
+        assert_eq!(summary.selector_source, "label:role=web");
+        assert_eq!(summary.strategy_concurrency, 2);
+        assert_eq!(summary.strategy_max_failures, Some(1));
+        assert_eq!(summary.target_agents[0].status, "pending");
+        assert_eq!(
+            summary.target_agents[0].labels,
+            vec![("role".to_owned(), "web".to_owned())]
+        );
     }
 
     #[test]
@@ -3546,6 +5421,20 @@ mod tests {
             .insert_metrics_snapshot(
                 "a1",
                 "{\"recent\":true}",
+                SystemTime::UNIX_EPOCH + Duration::from_secs(200),
+            )
+            .unwrap();
+        store
+            .insert_agent_log_chunk(
+                "a1",
+                "level=info event=old_agent_log",
+                SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+            )
+            .unwrap();
+        store
+            .insert_agent_log_chunk(
+                "a1",
+                "level=info event=recent_agent_log",
                 SystemTime::UNIX_EPOCH + Duration::from_secs(200),
             )
             .unwrap();

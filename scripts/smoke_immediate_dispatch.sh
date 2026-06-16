@@ -91,7 +91,7 @@ fi
 curl -fsS \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"job_id":"job-immediate-1","target_agent_ids":[],"selector":"role=web","program":"printf","args":["immediate-ok"],"timeout_seconds":30,"confirmed_high_risk":true,"confirmed_by":"smoke-admin","expires_in_seconds":60,"nonce_prefix":"immediate-smoke"}' \
+  -d '{"job_id":"job-immediate-1","target_agent_ids":[],"selector":"role=web","program":"echo","args":["immediate-ok"],"timeout_seconds":30,"confirmed_high_risk":false,"confirmed_by":"smoke-admin","expires_in_seconds":60,"nonce_prefix":"immediate-smoke"}' \
   "$CONTROLLER_URL/api/jobs/command" >/dev/null
 
 i=0
@@ -99,7 +99,7 @@ OUTPUT_API=""
 while [ "$i" -lt 50 ]; do
   OUTPUT_API="$(curl -fsS -H "Authorization: Bearer $ADMIN_TOKEN" "$CONTROLLER_URL/api/jobs/job-immediate-1/output" 2>/dev/null || true)"
   case "$OUTPUT_API" in
-    *'"data":"immediate-ok"'*) break ;;
+    *immediate-ok*) break ;;
   esac
   i=$((i + 1))
   sleep 0.1

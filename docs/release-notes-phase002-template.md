@@ -18,7 +18,7 @@ Use this template for beta releases after MVP.
 
 - Built-in HTTPS supports PEM certificate/key material; automated certificate renewal is outside this release.
 - Controller signing key rotation is not automated yet.
-- Approval queue APIs are not complete; high-risk execution still requires explicit confirmation at job creation.
+- Approval request lifecycle APIs are available. Dedicated Web Admin approval queue and RBAC/admin identity separation remain follow-up work.
 - Linux service install/remove writes systemd files only when run as root on Linux.
 
 ## Verification

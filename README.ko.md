@@ -72,6 +72,58 @@ cargo build -p fleet-cli
 
 소스 빌드를 쓰는 경우 아래 예시의 `sponzey`를 `./target/debug/sponzey`로 바꾸면 됩니다.
 
+### 설치 경로 선택
+
+개발 환경이나 작은 서버에서는 npm 설치가 가장 단순합니다.
+
+```bash
+npm install -g @sponzey/fleet
+```
+
+대상 host에 npm을 두고 싶지 않다면 standalone release archive를 사용합니다.
+release archive 이름은 다음 규칙을 따릅니다.
+
+```text
+sponzey-darwin-arm64.tar.gz
+sponzey-darwin-x64.tar.gz
+sponzey-linux-arm64.tar.gz
+sponzey-linux-x64.tar.gz
+```
+
+설치 전에 checksum을 확인합니다.
+
+```bash
+./scripts/verify_standalone_artifacts.sh dist/release
+```
+
+release workflow는 archive와 함께 `SHA256SUMS`를 게시합니다. signature
+검증은 아직 구현하지 않았으므로, 현재 integrity 경계는 checksum 검증과
+release provenance 확인입니다.
+
+장시간 실행하는 Linux host에서는 resolved binary를 systemd service로
+등록합니다.
+
+```bash
+sponzey controller install-service --data-dir /var/lib/sponzey-fleet --dry-run
+sudo sponzey controller install-service --data-dir /var/lib/sponzey-fleet
+sponzey controller status-service --dry-run
+sponzey controller logs-service --dry-run
+```
+
+Agent service도 `sponzey agent install-service` 형태로 동일하게 사용합니다.
+service unit은 명시 CLI 인자를 사용하며 runtime에 process environment를
+patch하지 않습니다.
+
+upgrade는 현재 외부 package 또는 artifact 교체 작업입니다. binary를
+교체하기 전 정책을 먼저 확인합니다.
+
+```bash
+sponzey upgrade --dry-run
+```
+
+controller storage에 영향을 줄 수 있는 upgrade 전에는 controller data를
+backup해야 합니다.
+
 ## 가장 빠른 데모
 
 ```bash
@@ -93,7 +145,17 @@ GET /swagger-ui
 보호 API를 호출할 때는 `sponzey controller init`이 출력한 admin token을
 Bearer token으로 사용합니다. HTTP에서 Swagger UI를 쓰면 token과 request
 payload가 암호화되지 않으므로 로컬 또는 짧은 테스트 용도로만 사용해야
-합니다. 상세 API 계약은 [docs/api.md](docs/api.md)에 유지합니다.
+합니다. 상세 API 계약, public/internal endpoint 경계, pagination 형태,
+deprecation policy는 [docs/api.md](docs/api.md)에 유지합니다. agent WebSocket
+protocol은 [docs/protocol.md](docs/protocol.md)에 별도로 문서화합니다.
+
+현재 bootstrap admin token은 `bootstrap-admin` actor와 `owner` role로
+매핑됩니다. 최소 role/permission 경계는 [docs/security.md](docs/security.md)에
+정리합니다.
+
+현재 구현 상태는 [docs/feature-matrix.md](docs/feature-matrix.md)에
+정리합니다. release 검증 명령과 필수 smoke check는
+[docs/release-gate.md](docs/release-gate.md)에 정리합니다.
 
 ## Transport 안전 경고
 
@@ -161,6 +223,12 @@ http://127.0.0.1:7700/admin
 ```
 
 1단계에서 복사한 admin token을 붙여넣습니다.
+
+Web Admin 화면에서는 agent inventory, 선택한 agent 상세, facts, disk/mount
+inventory, range selector가 있는 metrics chart, drift 최신값과 history, agent
+운영 로그, job output, target별 assignment 상태, pending approval, enrollment
+token, policy assignment, runbook job 생성, audit event를 확인할 수 있습니다.
+HTTP로 접속하면 화면 상단에 HTTP transport 경고도 표시합니다.
 
 ### 4. Enrollment token 만들기
 
@@ -257,8 +325,86 @@ completed, no-output 상태를 보여주면서도 raw command output을 product 
 
 Agent key를 revoke하면 agent가 disabled 상태가 되고, active session이
 있다면 `agent_revoked` reason으로 즉시 닫으며, 추가 task 전달을 막습니다.
-이미 agent가 시작한 local OS process를 즉시 kill한다는 보장은 아닙니다.
-그 기능은 별도 task cancellation protocol 범위입니다.
+Revoke는 job 중단 버튼이 아닙니다. 특정 job을 중단하려면
+`POST /api/jobs/{job_id}/cancel`을 사용하거나, 해당 기능을 노출하는 UI/CLI
+표면을 사용해야 합니다.
+
+Cancel은 job과 assignment를 `canceled`로 기록합니다. Agent session이 active
+상태이고 task가 이미 dispatch되었다면 controller는 기존 WebSocket session으로
+`task_cancel`을 보냅니다. Agent는 현재 실행 중인 task id와 일치할 때 command
+process를 kill하고 `task_result.status = "canceled"`를 보고합니다. Timeout은
+cancel과 다릅니다. command timeout은 `task_result.status = "timed_out"`로
+보고되고 controller는 job을 `expired`로 저장합니다.
+
+## 대상 Preview와 Snapshot
+
+Job을 만들기 전에 자동화 도구나 Web Admin은 `POST /api/selectors/preview`를
+호출해서 대상 agent를 미리 확인할 수 있습니다. 요청은 string selector 또는
+`matchLabels` 중 하나를 사용합니다.
+
+```json
+{ "matchLabels": { "role": "web", "env": "prod" } }
+```
+
+지원하는 string selector는 `agent:<name-or-id>`, `label:key=value`,
+`key=value,key2=value2`입니다. Disabled 또는 revoked agent는 preview에는
+나오지만 dispatch 대상에서 제외됩니다. Offline agent는 선택될 수 있고,
+reconnect 전까지 assignment가 queued 상태로 남습니다.
+
+Job이 생성되면 controller는 selector source와 target snapshot을 저장합니다.
+이후 agent label이나 status가 바뀌어도 이미 생성된 job의 원래 대상 집합은
+바뀌지 않습니다.
+
+Multi-agent job은 preview 결과를 확인한 뒤 생성합니다. Controller는 해당
+snapshot의 target마다 assignment를 하나씩 만듭니다. 선택적인 job `strategy`로
+fanout 방식을 조절합니다.
+
+```json
+{
+  "strategy": {
+    "concurrency": 2,
+    "maxFailures": 1
+  }
+}
+```
+
+`concurrency` 기본값은 `1`이며 순차 dispatch를 뜻합니다. `maxFailures`는
+선택값입니다. 기준에 도달하면 아직 dispatch되지 않은 queued assignment를 더
+실행하지 않고 `canceled`로 전환합니다. Job detail 응답은 저장된 strategy,
+target별 `task_id`, `assignment_status`, `last_error`, 그리고 집계용
+`assignment_summary` count object를 포함하므로 Web Admin과 자동화 도구가 연결
+상태와 실행 상태를 구분할 수 있습니다.
+
+## 위험 작업과 Approval
+
+Sponzey는 위험 job을 만드는 것과 agent로 실제 dispatch하는 것을 분리합니다.
+
+`uptime` 같은 안전한 단일 agent 확인 명령은 바로 queued 될 수 있습니다. shell
+명령, `sudo`, `su`, reboot/shutdown, user/group 변경, package/service/file 변경,
+알 수 없는 command, 여러 agent를 대상으로 하는 broad target은 approval request를
+만듭니다. 이 job은 `pending_approval` 상태로 남고, approval이 승인되기 전까지
+agent로 dispatch되지 않습니다.
+
+`confirmed_high_risk`와 `--confirm-risk`는 과거 client 호환을 위한 확인 표시입니다.
+approval을 대신하지 않습니다. Approval은 승인자, 사유, 상태, 만료 시각, audit
+event를 남깁니다.
+
+승인자는 입력창의 actor 값이 아니라 인증된 admin token에서 나온 actor로
+결정됩니다. Approval request body에는 reason을 보낼 수 있고, UI가 보낸 actor
+값은 audit이나 권한 판단에 사용하지 않습니다.
+
+Approval API는 현재 사용할 수 있습니다.
+
+```text
+GET  /api/approvals?status=pending
+POST /api/approvals/{approval_id}/approve
+POST /api/approvals/{approval_id}/reject
+POST /api/approvals/expire
+```
+
+Web Admin approval queue도 같은 API를 사용합니다. Approve/reject action은
+decision reason만 보내며, controller는 인증된 admin token에서 approver를
+결정합니다. 처리 후 approval, job, audit 화면을 다시 읽습니다.
 
 ## HTTPS 준비
 
@@ -384,11 +530,50 @@ sudo rm -rf /var/lib/sponzey-fleet/agent
 
 Controller inventory와 audit 기록은 남습니다. 같은 host를 다시 쓰려면 새 enrollment token을 만들고 `sponzey agent init`을 다시 실행합니다.
 
+## Controller 데이터 백업/복구
+
+data directory를 삭제하거나, 다른 장비로 옮기거나, 위험한 운영 작업을 하기
+전에는 controller를 백업하세요. 백업 중 SQLite DB에 쓰기가 들어가지 않도록
+controller를 먼저 중지하는 것을 권장합니다.
+
+```bash
+sponzey controller backup \
+  --data-dir .sponzey \
+  --output ./sponzey-controller.backup.json
+```
+
+백업 archive에는 controller identity key와 SQLite data가 들어갑니다. 비밀값과
+같은 수준으로 보관해야 합니다.
+
+파일을 쓰지 않고 복구 가능 여부만 확인하려면:
+
+```bash
+sponzey controller restore \
+  --data-dir ./restore-check \
+  --input ./sponzey-controller.backup.json \
+  --dry-run
+```
+
+빈 data directory로 복구하려면:
+
+```bash
+sponzey controller restore \
+  --data-dir .sponzey-restored \
+  --input ./sponzey-controller.backup.json
+```
+
+복구는 기존 controller directory를 자동으로 덮어쓰지 않습니다. 정말 교체해도
+되는 대상인지 확인한 뒤에만 `--force`를 사용하세요.
+
 전체 초기화는 data directory 전체를 삭제하면 됩니다.
 
 ```bash
 rm -rf .sponzey
 ```
+
+data directory 삭제는 reset입니다. Backup/restore는 controller identity,
+inventory, jobs, audit events, telemetry, enrollment records를 보존하는
+복구 경로입니다.
 
 ## 자주 나는 오류
 
@@ -403,6 +588,18 @@ rm -rf .sponzey
 ### `agent is not enrolled`
 
 `sponzey agent start ...` 전에 `sponzey agent init ...`을 먼저 실행해야 합니다.
+
+### 실행 중인 job이 agent disconnect 후에도 running으로 남음
+
+정상 동작입니다. Controller는 WebSocket이 끊겼다는 이유만으로 job을 failed로
+바꾸지 않습니다. 최종 `task_result`, cancel, timeout, expiry 정책이 terminal
+상태를 결정합니다. 실제 결과는 job output과 audit entries를 함께 확인해야 합니다.
+
+### canceled, failed, expired가 다르게 보임
+
+`canceled`는 operator cancel이 기록된 상태입니다. `failed`는 agent가 non-zero
+또는 실패 결과를 보고한 상태입니다. `expired`는 timeout 또는 assignment expiry가
+우선한 상태입니다. 세 상태는 의도적으로 분리됩니다.
 
 ### `WARNING: insecure HTTP controller URL enabled`
 
@@ -421,6 +618,8 @@ API 주소를 연 것입니다. `/admin`으로 열어야 합니다.
 - Agent init: `sponzey enroll-token create`가 출력한 enrollment token
 
 ## 개발 검증
+
+전체 release gate는 [docs/release-gate.md](docs/release-gate.md)에 정리되어 있습니다.
 
 ```bash
 cargo fmt --all --check

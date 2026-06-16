@@ -112,7 +112,9 @@ Controller session implementation note:
 - 같은 key의 output chunk가 다른 body로 오면 raw body를 audit/log에 남기지 않고 `websocket_output_chunk_conflict` security audit를 남긴 뒤 protocol error로 session cleanup 대상이 된다.
 - controller connection drop만으로 `running` job을 즉시 `failed`로 바꾸지 않는다. task result가 없으면 기존 expiry/reconciler 정책이 최종 상태를 결정한다.
 - Agent key revoke 성공 직후 controller는 active session이 있으면 `agent_revoked` close reason으로 writer loop에 close를 enqueue하고 registry에서 제거한다.
-- Revoke는 추가 task 수신 차단과 session 종료를 보장한다. 이미 agent 로컬 OS process로 실행 중인 task의 즉시 kill은 별도 cancellation protocol 범위다.
+- Revoke는 추가 task 수신 차단과 session 종료를 보장한다. 특정 job을 중단하려면 revoke가 아니라 `POST /api/jobs/{job_id}/cancel`을 사용한다.
+- Cancel API는 queued assignment를 DB에서 terminal `canceled`로 바꾸고, 이미 `dispatched`, `accepted`, `started` 상태인 active session에는 `task_cancel`을 보낸다.
+- Agent는 `task_cancel`이 현재 실행 중인 task id와 일치하면 cancel flag를 설정하고, command runner는 child process를 kill한 뒤 `task_result.status = "canceled"`를 돌려보낸다.
 - session lifecycle audit action은 `agent_session_started`, `agent_session_ended`, `agent_session_replaced`, `agent_session_revoked_closed`, `agent_session_auth_failed`를 사용한다.
 
 Close reason policy:
@@ -139,6 +141,10 @@ Security notes:
 task 실행과 결과 전달용 payload:
 
 - `task_assignment`
+- `task_ack`
+- `task_started`
+- `task_rejected`
+- `task_cancel`
 - `output_chunk`
 - `task_result`
 - `security_event`
@@ -261,11 +267,74 @@ agent는 실행 전에 최소한 다음을 확인해야 한다.
 - nonce replay가 아니다.
 - controller public key로 signature를 검증한다.
 
-검증에 실패하면 agent는 task를 실행하지 않고 `security_event`를 controller에 보낸다. Controller는 이를 Security audit event로 저장한다.
+검증에 실패하면 agent는 task를 실행하지 않고 `task_rejected`를 controller에 보낸다. Controller는 해당 assignment를 `rejected`로 저장하고 job audit event를 남긴다. 별도의 보안 이상 징후나 protocol mismatch는 `security_event`를 통해 Security audit event로 저장한다.
 
 MVP agent는 WebSocket session 안에서 nonce replay guard를 적용한다. Persistent nonce replay store와 장시간 live streaming은 후속 hardening 범위다.
 
-## Output and Result
+## Assignment Lifecycle, Output, and Result
+
+WebSocket write 성공은 agent가 task를 수락하거나 실행했다는 뜻이 아니다. Controller는 dispatch write 성공 시 assignment를 `dispatched`로만 저장한다.
+
+Agent lifecycle events:
+
+```json
+{
+  "type": "task_ack",
+  "payload": {
+    "job_id": "job-1",
+    "task_id": "task-1"
+  }
+}
+```
+
+```json
+{
+  "type": "task_started",
+  "payload": {
+    "job_id": "job-1",
+    "task_id": "task-1"
+  }
+}
+```
+
+```json
+{
+  "type": "task_rejected",
+  "payload": {
+    "job_id": "job-1",
+    "task_id": "task-1",
+    "reason_code": "invalid_signature",
+    "reason": "task envelope signature is invalid"
+  }
+}
+```
+
+Rejected reason codes:
+
+- `agent_busy`
+- `invalid_signature`
+- `expired`
+- `replay`
+- `target_mismatch`
+- `invalid_task`
+- `capability_unsupported`
+- `local_policy`
+- `internal_error`
+
+Controller-to-agent cancel message:
+
+```json
+{
+  "type": "task_cancel",
+  "payload": {
+    "job_id": "job-1",
+    "task_id": "task-1",
+    "reason": "operator requested cancel"
+  }
+}
+```
+
+Agent는 `task_cancel.task_id`가 현재 실행 중인 task와 일치할 때만 cancel을 적용한다. 다른 task id의 cancel은 무시한다. Cancel된 command는 일반 failure가 아니라 `canceled` terminal result로 보고해야 한다.
 
 command/runbook 실행 결과는 application log가 아니라 job output storage로 들어간다.
 
@@ -288,12 +357,18 @@ command/runbook 실행 결과는 application log가 아니라 job output storage
   "payload": {
     "job_id": "job-1",
     "task_id": "task-1",
-    "exit_code": 0
+    "exit_code": 0,
+    "status": "succeeded",
+    "reason": ""
   }
 }
 ```
 
-Controller는 `exit_code == 0`이면 job을 `success`, 아니면 `failed`로 저장한다.
+`output_chunk`는 final result가 아니다. Controller는 output chunk를 job output storage에 저장하지만 assignment를 `succeeded` 또는 `failed`로 바꾸지 않는다.
+
+Controller는 `task_result.status`가 있으면 이를 우선 사용한다. `succeeded`는 assignment `succeeded`와 job `success`, `failed`는 assignment `failed`와 job `failed`, `canceled`는 assignment/job `canceled`, `timed_out`은 assignment/job `expired`로 저장한다. 구버전 agent가 `status` 없이 `task_result`를 보내면 `exit_code == 0`은 success, 그 외는 failed로 fallback 처리한다. 이후 multi-agent fanout에서는 job aggregate 계산이 target별 assignment 결과를 기준으로 확장된다.
+
+이미 `canceled`, `expired`, `failed`, `succeeded`, `rejected` 같은 terminal assignment가 된 뒤에 늦은 `task_result`가 도착하면 Controller는 terminal 상태를 덮어쓰지 않고 `task_result_ignored` audit event만 남긴다. Disconnect나 duplicate session 때문에 늦은 success가 도착해도 canceled job을 success로 바꾸지 않는다.
 
 ## Security Event
 

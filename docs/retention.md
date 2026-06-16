@@ -35,9 +35,11 @@ Currently it cleans bounded operational artifact tables:
 - `job_output_chunks`
 - `facts_snapshots`
 - `metrics_snapshots`
+- `agent_log_chunks`
 
 ## Current MVP Limits
 
 - There is no background cleanup worker.
 - There is no retention configuration endpoint.
-- Log stream artifact cleanup is not implemented because MVP log tail does not persist separate stream artifacts yet.
+- Agent operational log chunks stored in `agent_log_chunks` are cleaned by the explicit cleanup command.
+- Raw remote file tail and journald stream archival are not persisted separately in MVP.

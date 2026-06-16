@@ -1,0 +1,17 @@
+apiVersion: fleet.sponzey.dev/v1alpha1
+kind: Runbook
+metadata:
+  name: nginx-basic
+spec:
+  targets:
+    selector: role=web
+  tasks:
+    - id: nginx-package
+      package:
+        name: nginx
+        state: present
+    - id: nginx-service
+      service:
+        name: nginx
+        state: started
+        enabled: true

@@ -1,104 +1,91 @@
-# Task 011 - 문서, Swagger, Smoke
+# Task 011: Safe Primitive 확장
 
-상태: `[ ] 대기` `[ ] 진행 중` `[x] 완료`
+상태: Completed
+우선순위: P1
+연결 계획: `.tasks/plan.md` Phase 008
+의존성: Task 010
+결과물: 승인 없이 확장 가능한 안전 primitive
 
 ## 목표
 
-상시 Agent 연결 모델을 문서, Swagger/OpenAPI, smoke test로 닫는다.
+approval/capability 없이 위험한 primitive를 열지 않는다. 먼저 idempotency와 side effect가 비교적 통제 가능한 safe primitive를 확장하고, result model을 실제 실행 경로에 적용한다.
 
-사용자는 "Controller가 Agent로 접속한다"가 아니라 "Agent가 Controller에 outbound persistent WebSocket session을 유지하고, Controller가 그 session으로 즉시 task를 push한다"는 구조를 이해해야 한다.
+## 기능 묶음
 
-## 기능 범위
+1. existing package/service/file.copy idempotency 정리
+2. check primitive 추가
+3. facts/metrics/log snapshot primitive 정리
 
-### 1. README / 한국어 README 동기화
+## 구현 체크리스트
 
-- [x] `README.md`를 persistent session 기준으로 업데이트한다.
-- [x] `README.ko.md`를 같은 내용으로 동기화한다.
-- [x] HTTP/WS는 테스트 전용, 제품/운영은 HTTPS/WSS라는 경고를 유지한다.
+기존 primitive:
 
-포함할 설명:
+- [x] command primitive result를 common result schema에 맞춘다.
+- [x] package primitive changed/skipped 판정을 강화한다.
+- [x] service primitive changed/skipped 판정을 강화한다.
+- [x] file.copy checksum/diff 판정을 강화한다.
+- [x] primitive timeout/output limit을 일관화한다.
+- [x] dry-run/check mode에서 side effect가 발생하지 않도록 한다.
 
-- Controller는 Agent로 직접 접속하지 않는다.
-- Agent가 Controller에 outbound persistent WebSocket을 유지한다.
-- connected Agent에서는 `Run`이 즉시 task를 push한다.
-- offline Agent는 reconnect 후 queued job을 받는다.
-- revoke는 active session close와 추가 task 차단을 의미한다.
-- 이미 실행 중인 OS process kill은 별도 cancellation 기능이다.
+Check primitive:
 
-### 2. Protocol/API/OpenAPI 문서 갱신
+- [x] `port.check` primitive를 설계한다.
+- [x] `process.check` primitive를 설계한다.
+- [x] check primitive는 기본적으로 changed=false로 처리한다.
+- [x] check 실패와 task 실패의 차이를 정한다.
+- [x] result message를 operator가 이해할 수 있게 만든다.
 
-- [x] `docs/protocol.md`에 persistent session lifecycle을 반영한다.
-- [x] `docs/api.md`에 job/session 상태 API를 반영한다.
-- [x] `docs/openapi.json`에 신규/변경 endpoint와 schema를 반영한다.
-- [x] `web-admin/api.schema.json`을 Web Admin 사용 API와 맞춘다.
+Snapshot primitive:
 
-Protocol 문서 필수 항목:
+- [x] `facts.collect` primitive를 설계한다.
+- [x] `metrics.snapshot` primitive를 설계한다.
+- [x] `logs.tail` primitive는 원문 output과 retention 정책을 고려해 scope를 제한한다.
+- [x] snapshot primitive가 periodic collector와 충돌하지 않게 한다.
 
-- auth 후 session registry 등록
-- heartbeat는 liveness signal
-- facts/metrics/log interval 분리
-- task_assignment 즉시 push
-- output_chunk/task_result streaming
-- duplicate session 정책
-- close reason 정책
+제외 대상:
 
-API 문서 필수 항목:
+- [x] `shell`은 이번 task에서 구현하지 않는다.
+- [x] `reboot`은 이번 task에서 구현하지 않는다.
+- [x] `user/group/cron`은 이번 task에서 구현하지 않는다.
+- [x] 위험 primitive는 approval/capability task 이후로 둔다.
 
-- job detail 또는 dispatch_state 응답
-- agent session summary 응답
-- output API polling fallback
-- token/private key/raw output 예시 금지
+## 테스트
 
-### 3. Smoke test 작성
+- [x] package idempotency test
+- [x] service idempotency test
+- [x] file.copy checksum no-change test
+- [x] file.copy changed diff test
+- [x] check mode no side effect test
+- [x] port.check success/failure test
+- [x] process.check success/failure test
+- [x] facts.collect result schema test
+- [x] metrics.snapshot result schema test
 
-- [x] local controller + agent + run immediate smoke script를 작성한다.
-- [x] heartbeat interval을 30초로 둔 상태에서도 Run 직후 output이 관찰되는지 확인한다.
-- [x] remote HTTP warning smoke를 유지한다.
-- [x] HTTPS/WSS smoke를 유지한다.
+## 검증 명령
 
-Smoke 기준:
-
-```text
-controller start
-agent start --heartbeat-interval-seconds 30
-wait until session connected
-create command job
-assert task dispatched before next heartbeat interval
-assert output observed
-assert task_result success
+```bash
+cargo fmt --check
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+git diff --check
 ```
 
-## 테스트와 검증
+검증 결과:
 
-필수:
-
+- [x] `cargo fmt --all --check`
 - [x] `cargo test --workspace`
 - [x] `cargo clippy --workspace --all-targets -- -D warnings`
-- [x] `npm test --workspace web-admin`
-- [x] `npm run typecheck --workspace web-admin`
-- [x] `npm run build --workspace web-admin`
-- [x] local immediate run smoke
-- [x] remote HTTP warning smoke
-- [x] HTTPS/WSS smoke
 - [x] `git diff --check`
 
-문서 검증:
+## 문서 업데이트
 
-- [x] README.md와 README.ko.md 명령 예시가 같은 흐름이다.
-- [x] CLI help와 README 예시가 충돌하지 않는다.
-- [x] Swagger/OpenAPI endpoint와 실제 route가 일치한다.
-- [x] "Controller가 Agent로 접속한다"는 표현이 없다.
+- [x] runbook primitive reference 문서를 업데이트한다.
+- [x] safe primitive와 dangerous primitive 구분을 문서화한다.
+- [x] 각 primitive result 예시를 추가한다.
 
 ## 완료 기준
 
-- [x] 사용자는 persistent outbound session 모델을 문서로 이해할 수 있다.
-- [x] connected Agent에서 Run 결과가 즉시 나오는 것을 smoke로 확인한다.
-- [x] HTTP 테스트 전용 경고 정책이 문서와 구현에 남아 있다.
-- [x] Swagger/OpenAPI와 Web Admin API schema가 최신이다.
-- [x] 전체 release 전 검증 게이트를 통과한다.
-
-## 비범위
-
-- [x] multi-controller HA 문서화하지 않음
-- [x] full enterprise deployment guide 작성하지 않음
-- [x] Ansible full compatibility 문서화하지 않음
+- [x] safe primitive는 common result schema를 따른다.
+- [x] dry-run/check mode에서 side effect가 없다.
+- [x] changed/skipped/failed 의미가 테스트로 고정된다.
+- [x] 위험 primitive가 우회적으로 열리지 않는다.

@@ -170,6 +170,7 @@ HTTP request -> SQL query -> mutable global config -> shell command -> ad hoc lo
 
 - domain state machine
 - job dispatch
+- job/assignment state transition
 - agent enrollment
 - token validation
 - signed task validation
@@ -177,9 +178,11 @@ HTTP request -> SQL query -> mutable global config -> shell command -> ad hoc lo
 - drift detection
 - runbook parser
 - selector matching
+- selector result snapshot
 - audit event creation
 - log redaction
 - config parsing
+- storage migration/retention rule
 
 권장 흐름:
 
@@ -835,6 +838,63 @@ Agent session
 - 여러 thread/task가 같은 WebSocket writer에 직접 쓰는 구조
 - active session이 있다는 이유로 high-risk approval을 생략하는 구조
 - UI가 agent connected/running 상태를 자체 추정하는 구조
+
+### 9.4 Job과 Assignment 상태 경계
+
+Job은 운영자가 생성하고 추적하는 실행 단위다. Assignment는 특정 Agent에 배정된 실행 단위다. 이 둘을 섞으면 multi-agent 실행, 재시도, 부분 성공, 취소, 감사 추적이 불명확해진다.
+
+필수 규칙:
+
+- Job 상태와 Assignment 상태는 domain layer의 명시적 state machine으로 관리한다.
+- Job은 target selector와 target snapshot을 가진다.
+- Assignment는 target snapshot의 개별 agent마다 생성한다.
+- WebSocket으로 task를 보내기 전에 Job/Assignment는 store에 먼저 기록되어야 한다.
+- Assignment transition은 queued, dispatched, accepted, started, output_received, succeeded, failed, rejected, canceled, expired 같은 명시 상태 중 허용된 전이만 통과한다.
+- Agent가 task를 받았다는 사실과 task 실행을 시작했다는 사실은 서로 다른 protocol event로 다룬다.
+- output chunk와 final result는 protocol, storage, UI에서 분리한다.
+- partial_success는 Job aggregate 결과이며 개별 Assignment의 성공/실패를 덮어쓰지 않는다.
+- reconnect 이후 in-flight Assignment 처리는 명시 정책과 테스트를 가져야 한다.
+- cancel과 timeout은 서로 다른 결과로 보존한다.
+
+금지:
+
+- 단일 agent 실행 가정으로 Job row 하나만 업데이트하는 multi-agent 구현
+- output chunk 수신을 성공 결과로 간주하는 구현
+- active WebSocket write 성공을 task accepted 또는 task started로 간주하는 구현
+- UI가 Job/Assignment 상태를 문자열 조합으로 자체 추론하는 구현
+- store update 없이 session registry 상태만으로 실행 상태를 판단하는 구현
+
+### 9.5 Facts, Metrics, Logs 의미 경계
+
+Facts, Metrics, Logs는 모두 Agent에서 Controller로 올라오지만 목적이 다르다. 의미가 섞이면 UI, API, retention, alerting, drift 판단이 모두 흔들린다.
+
+Facts:
+
+- 거의 변하지 않는 inventory 정보다.
+- 예: hostname, OS, arch, CPU logical count, memory total, memory module count, disk inventory, partition, mount, filesystem, network interface identity.
+- 메모리 사용률, 디스크 사용률, CPU 사용률 같은 시간 변동 값은 Facts에 넣지 않는다.
+- Facts에는 agent system time과 controller stored time을 함께 보존한다.
+
+Metrics:
+
+- 시간에 따라 변하는 usage telemetry다.
+- 예: CPU usage, memory used/available, disk used/available, load, process/resource counters.
+- Metrics는 paging, retention, chart range를 전제로 저장한다.
+- Metrics schema는 chart 편의를 위해 domain 의미를 잃어서는 안 된다.
+
+Logs:
+
+- Agent가 올리는 operational log/event stream이다.
+- command stdout/stderr 원문과 application product log를 혼동하지 않는다.
+- job output은 job output storage에 저장하고, 일반 Product log에는 원문 전체를 남기지 않는다.
+- log upload interval은 heartbeat interval과 독립적이어야 한다.
+
+필수 규칙:
+
+- Facts/Metrics/Logs schema 변경은 API 문서와 Web Admin 표시를 함께 갱신한다.
+- retention 정책은 Metrics/Logs/Job output/Audit를 구분한다.
+- Audit는 일반 retention worker가 임의 삭제하지 않는다.
+- system time field의 의미를 API와 UI에서 명확히 표시한다.
 
 ## 10. Web Admin UI 규칙
 

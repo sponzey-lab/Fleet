@@ -75,6 +75,9 @@ export function createApiClient({ fetchImpl = globalThis.fetch, tokenProvider = 
     listMetrics(agentId, page = {}) {
       return request(`/api/agents/${encodePathValue(agentId)}/metrics${pageQuery(page)}`);
     },
+    listAgentLogs(agentId, page = {}) {
+      return request(`/api/agents/${encodePathValue(agentId)}/logs${pageQuery(page)}`);
+    },
     getLatestDrift(agentId) {
       return request(`/api/agents/${encodePathValue(agentId)}/drift/latest`);
     },
@@ -90,11 +93,72 @@ export function createApiClient({ fetchImpl = globalThis.fetch, tokenProvider = 
     listJobs() {
       return request("/api/jobs");
     },
+    listApprovals(status = "") {
+      const query = status ? `?status=${encodeURIComponent(status)}` : "";
+      return request(`/api/approvals${query}`);
+    },
+    listPolicies() {
+      return request("/api/policies");
+    },
+    savePolicy(body = {}) {
+      return request("/api/policies", {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+    },
+    assignPolicy(policyId, body = {}) {
+      return request(`/api/policies/${encodePathValue(policyId)}/assignments`, {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+    },
+    schedulePolicyDrift(policyId, body = {}) {
+      return request(`/api/policies/${encodePathValue(policyId)}/schedules`, {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+    },
+    listAgentPolicies(agentId) {
+      return request(`/api/agents/${encodePathValue(agentId)}/policies`);
+    },
+    listDueScheduledDrift() {
+      return request("/api/drift/scheduled");
+    },
+    approveApproval(approvalId, body = {}) {
+      return request(`/api/approvals/${encodePathValue(approvalId)}/approve`, {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+    },
+    rejectApproval(approvalId, body = {}) {
+      return request(`/api/approvals/${encodePathValue(approvalId)}/reject`, {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+    },
+    expireApprovals(body = {}) {
+      return request("/api/approvals/expire", {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+    },
+    previewSelector(body) {
+      return request("/api/selectors/preview", {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+    },
     getJob(jobId) {
       return request(`/api/jobs/${encodePathValue(jobId)}`);
     },
     getJobOutput(jobId) {
       return request(`/api/jobs/${encodePathValue(jobId)}/output`);
+    },
+    cancelJob(jobId, body = {}) {
+      return request(`/api/jobs/${encodePathValue(jobId)}/cancel`, {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
     },
     listAudit() {
       return request("/api/audit");
