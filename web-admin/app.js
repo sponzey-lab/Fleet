@@ -16,6 +16,7 @@ const TELEMETRY_PAGE_LIMIT = 120;
 const DETAIL_PAGE_LIMIT = 25;
 const JOB_OUTPUT_POLL_ATTEMPTS = 45;
 const JOB_OUTPUT_POLL_INTERVAL_MS = 1000;
+const COMMAND_JOB_EXPIRES_IN_SECONDS = 300;
 const TERMINAL_DISPATCH_STATES = new Set(["completed", "failed", "expired", "rejected", "canceled"]);
 const TERMINAL_JOB_STATUSES = new Set(["success", "failed", "expired", "canceled"]);
 
@@ -850,7 +851,7 @@ export function buildCommandJobRequest({ agentId, program, args, confirmed }) {
     timeout_seconds: 30,
     confirmed_high_risk: true,
     confirmed_by: "web-admin",
-    expires_in_seconds: 60,
+    expires_in_seconds: COMMAND_JOB_EXPIRES_IN_SECONDS,
     nonce_prefix: jobId,
   };
 }
@@ -912,7 +913,11 @@ export function renderJobOutputStatus(
     lines.push(`Expires at: ${expiresAt}`);
   }
   if (!isTerminalJob(job)) {
-    lines.push(`Polling job output${progress}.`);
+    if (isApprovalPendingJob(job)) {
+      lines.push("Open Approvals and approve or reject this job before output can appear.");
+    } else {
+      lines.push(`Polling job output${progress}.`);
+    }
   }
   if (paused) {
     lines.push("Polling paused. Refresh or select the job again to continue.");
@@ -965,6 +970,19 @@ export function isTerminalJob(job) {
   const status = String(job?.status || "").toLowerCase();
   const dispatchState = String(job?.dispatch_state || "").toLowerCase();
   return TERMINAL_JOB_STATUSES.has(status) || TERMINAL_DISPATCH_STATES.has(dispatchState);
+}
+
+export function isApprovalPendingJob(job) {
+  const status = String(job?.status || "").toLowerCase();
+  const dispatchState = String(job?.dispatch_state || "").toLowerCase();
+  return status === "pending_approval" || dispatchState === "pending_approval";
+}
+
+export function approvalDecisionJobToPoll(action, decision) {
+  if (action !== "approve") {
+    return "";
+  }
+  return String(decision?.job_id || "").trim();
 }
 
 function jobTargetSummary(job) {
@@ -1227,13 +1245,29 @@ async function decideApproval(id, action) {
   if (reason === null) {
     return;
   }
+  let decision = null;
   if (action === "approve") {
-    await api.approveApproval(id, { reason: reason || "" });
+    decision = await api.approveApproval(id, { reason: reason || "" });
   } else {
-    await api.rejectApproval(id, { reason: reason || "" });
+    decision = await api.rejectApproval(id, { reason: reason || "" });
   }
   setStatus(`${action === "approve" ? "Approved" : "Rejected"} ${id}.`, "ok");
   await loadApprovalsJobsAndAudit();
+  const jobIdToPoll = approvalDecisionJobToPoll(action, decision);
+  if (jobIdToPoll) {
+    state.lastJobId = jobIdToPoll;
+    document.querySelector("#job-output").textContent = renderJobOutputStatus(
+      {
+        id: jobIdToPoll,
+        status: "queued",
+        dispatch_state: "created",
+        target_agents: [],
+      },
+      { jobId: jobIdToPoll },
+    );
+    document.querySelector("#job-targets").innerHTML = renderJobTargetTable(null);
+    await pollJobOutput(jobIdToPoll);
+  }
 }
 
 async function expireDueApprovals() {
@@ -1431,7 +1465,7 @@ async function pollJobOutput(jobId) {
         attempt,
         maxAttempts: JOB_OUTPUT_POLL_ATTEMPTS,
       });
-      if (isTerminalJob(job)) {
+      if (isTerminalJob(job) || isApprovalPendingJob(job)) {
         return;
       }
     }

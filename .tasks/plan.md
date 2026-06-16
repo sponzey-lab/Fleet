@@ -2,7 +2,7 @@
 
 작성일: 2026-06-15
 기준 문서: `PROJECT.md`, `AGENTS.md`, `README.md`, `README.ko.md`, `docs/`, `.tasks/phase001`, `.tasks/phase002`, `.tasks/phase003`
-기준 구현: v0.0.14 릴리스 후보 현재 워킹트리
+기준 구현: v0.0.15 릴리스 후보 현재 워킹트리
 
 이 문서는 현재 구현된 Sponzey Fleet를 `PROJECT.md`의 장기 제품 방향과 비교하여, MVP 이후 어떤 개발이 필요한지 정리한 제품화 계획이다.
 
@@ -644,7 +644,7 @@ Phase 012 gate:
 - [x] `docs/api.md`에서 `agent_system_time_ms`, `stored_at` 의미 설명
 - [x] `docs/logs.md`에서 log interval이 heartbeat와 독립된 현재 구조 반영
 - [ ] `docs/service-install.md`에서 `agent init` 중심 예시로 정리
-- [ ] `docs/release-notes-mvp.md`에서 v0.0.14 기준 기능 업데이트
+- [ ] `docs/release-notes-mvp.md`에서 v0.0.15 기준 기능 업데이트
 - [ ] `npm/fleet/README.md`에서 지원 platform과 미지원 platform 명시
 - [ ] `PROJECT.md`에서 HTTP 원격 사용 정책이 현재 구현과 충돌하는지 확인
 - [ ] `PROJECT.md`에서 `--dev-insecure-loopback` 잔여 표현 제거 또는 과거 설명으로 이동

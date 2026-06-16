@@ -8628,6 +8628,15 @@ spec:
                 body: "ok".to_owned(),
             })
             .unwrap();
+        store
+            .append_job_output_chunk_record(&JobOutputChunk {
+                job_id: "job-1".to_owned(),
+                agent_id: "agent-1".to_owned(),
+                stream: JobOutputStream::Stderr,
+                sequence: 1,
+                body: "real 0m0.001s\nuser 0m0.000s\nsys 0m0.001s\n".to_owned(),
+            })
+            .unwrap();
 
         let response = route_request(
             "GET /api/jobs/job-1/output HTTP/1.1\r\nAuthorization: Bearer admin-token\r\n\r\n",
@@ -8640,6 +8649,8 @@ spec:
         assert!(response.contains("\"agent_id\":\"agent-1\""));
         assert!(response.contains("\"stream\":\"stdout\""));
         assert!(response.contains("\"data\":\"ok\""));
+        assert!(response.contains("\"stream\":\"stderr\""));
+        assert!(response.contains("real 0m0.001s\\nuser 0m0.000s\\nsys 0m0.001s\\n"));
     }
 
     #[test]

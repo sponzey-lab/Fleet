@@ -28,6 +28,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 const LOG_TAIL_MAX_LINES: usize = 50;
 const LOG_TAIL_MAX_LINE_BYTES: usize = 4096;
 const LOG_TAIL_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const REMOTE_RUN_EXPIRES_IN_SECONDS: u64 = 300;
 const AGENT_SESSION_OUTBOUND_QUEUE_CAPACITY: usize = 64;
 const AGENT_SESSION_READ_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -1472,6 +1473,15 @@ fn execute_remote_run(
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0)
     );
+    let status = remote_run_response_status(&response_json);
+    println!("status={status}");
+    if remote_run_response_needs_approval(&response_json) {
+        if let Some(approval_request_id) = remote_run_response_approval_request_id(&response_json) {
+            println!("approval_request_id={approval_request_id}");
+        }
+        println!("output_state=waiting_for_approval");
+        return Ok(());
+    }
 
     let output_path = format!("/api/jobs/{job_id}/output");
     let output = http_get_url(controller_url, &output_path, Some(admin_token))?;
@@ -1479,6 +1489,24 @@ fn execute_remote_run(
         println!("{line}");
     }
     Ok(())
+}
+
+fn remote_run_response_status(response_json: &serde_json::Value) -> &str {
+    response_json
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("queued")
+}
+
+fn remote_run_response_approval_request_id(response_json: &serde_json::Value) -> Option<&str> {
+    response_json
+        .get("approval_request_id")
+        .and_then(serde_json::Value::as_str)
+}
+
+fn remote_run_response_needs_approval(response_json: &serde_json::Value) -> bool {
+    remote_run_response_status(response_json) == "pending_approval"
+        || remote_run_response_approval_request_id(response_json).is_some()
 }
 
 fn remote_run_request_body(
@@ -1496,7 +1524,7 @@ fn remote_run_request_body(
         "timeout_seconds": command.timeout_seconds,
         "confirmed_high_risk": true,
         "confirmed_by": "cli-admin-token",
-        "expires_in_seconds": 60,
+        "expires_in_seconds": REMOTE_RUN_EXPIRES_IN_SECONDS,
         "nonce_prefix": job_id
     }))
     .map_err(|error| CliError::Http(error.to_string()))
@@ -6025,7 +6053,26 @@ mod tests {
 
         assert!(body.contains("\"selector\":\"role=web\""));
         assert!(body.contains("\"timeout_seconds\":45"));
+        assert!(body.contains("\"expires_in_seconds\":300"));
         assert!(!body.contains("admin-secret"));
+    }
+
+    #[test]
+    fn remote_run_pending_approval_response_does_not_poll_output() {
+        let response = serde_json::json!({
+            "job_id": "job-cli-1",
+            "target_count": 1,
+            "assignment_count": 1,
+            "status": "pending_approval",
+            "approval_request_id": "approval-1"
+        });
+
+        assert_eq!(remote_run_response_status(&response), "pending_approval");
+        assert_eq!(
+            remote_run_response_approval_request_id(&response),
+            Some("approval-1")
+        );
+        assert!(remote_run_response_needs_approval(&response));
     }
 
     #[test]

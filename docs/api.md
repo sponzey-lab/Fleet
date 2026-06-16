@@ -461,7 +461,7 @@ Content-Type: application/json
   "timeout_seconds": 30,
   "confirmed_high_risk": true,
   "confirmed_by": "operator@example.com",
-  "expires_in_seconds": 60,
+  "expires_in_seconds": 300,
   "nonce_prefix": "nonce-job-1"
 }
 ```

@@ -158,6 +158,8 @@ const {
   renderJobTargetTable,
   jobStatusMessage,
   isTerminalJob,
+  isApprovalPendingJob,
+  approvalDecisionJobToPoll,
   pollJobOutputOnce,
   renderJobs,
   renderApprovals,
@@ -744,6 +746,7 @@ const jobRequest = buildCommandJobRequest({
 });
 assert(jobRequest.confirmed_high_risk, "job request must include high-risk confirmation");
 assert(jobRequest.target_agent_ids.includes("agent-1"), "job request must target selected agent");
+assert(jobRequest.expires_in_seconds === 300, "command jobs must leave enough time for approval");
 const runbookRequest = buildRunbookJobRequest({
   agentId: "agent-1",
   document: "apiVersion: fleet.sponzey.dev/v1alpha1\nkind: Runbook\nsteps: []",
@@ -779,6 +782,13 @@ assert(output.includes("[agent-1 stdout #0]"), "job output renderer must prefix 
 assert(output.includes("ok"), "job output renderer must include stdout body");
 assert(output.includes("[agent-1 stderr #1]"), "job output renderer must prefix stderr with sequence");
 assert(output.includes("warn"), "job output renderer must include stderr body");
+const multilineOutput = renderJobOutput([
+  { agent_id: "agent-1", stream: "stdout", sequence: 0, data: "line 1\nline 2\nline 3\n" },
+  { agent_id: "agent-1", stream: "stderr", sequence: 1, data: "real 0m0.001s\nuser 0m0.000s\nsys 0m0.001s\n" },
+], { jobId: "job-time-1", job: { status: "success", dispatch_state: "completed" } });
+assert(multilineOutput.includes("line 1\nline 2\nline 3"), "multi-line stdout chunks must render all lines");
+assert(multilineOutput.includes("real 0m0.001s"), "multi-line stderr chunks must render timing output");
+assert(multilineOutput.includes("[agent-1 stderr #1]"), "multi-line stderr chunks must keep stream prefix");
 const waitingOutput = renderJobOutputWaiting({ jobId: "job-1", attempt: 2, maxAttempts: 10 });
 assert(waitingOutput.includes("Job created. Checking dispatch state."), "created job output must use explicit created wording");
 assert(waitingOutput.includes("Polling job output (2/10)."), "waiting output must show polling progress");
@@ -850,6 +860,27 @@ assert(
 assert(
   jobStatusMessage({ status: "pending_approval", dispatch_state: "created" }).includes("Approval required"),
   "approval-gated jobs must not look queued",
+);
+const approvalPendingOutput = renderJobOutputStatus(
+  { id: "job-approval-1", status: "pending_approval", dispatch_state: "created", target_agents: [] },
+  { jobId: "job-approval-1", attempt: 1, maxAttempts: 3 },
+);
+assert(isApprovalPendingJob({ status: "pending_approval" }), "approval pending jobs must be detected");
+assert(
+  approvalPendingOutput.includes("Open Approvals and approve or reject this job"),
+  "approval pending output must point to approval action",
+);
+assert(
+  !approvalPendingOutput.includes("Polling job output"),
+  "approval pending output must not claim output polling is active",
+);
+assert(
+  approvalDecisionJobToPoll("approve", { job_id: "job-approval-1" }) === "job-approval-1",
+  "approving an approval must resume polling for the approved job",
+);
+assert(
+  approvalDecisionJobToPoll("reject", { job_id: "job-approval-1" }) === "",
+  "rejecting an approval must not resume output polling",
 );
 const completedNoOutput = renderJobOutputAfterPolling({
   jobId: "job-complete-1",

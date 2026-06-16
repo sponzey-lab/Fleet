@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Sponzey Fleet Controller API",
-    "version": "0.0.14",
+    "version": "0.0.15",
     "summary": "REST API for the Sponzey Fleet controller.",
     "description": "Sponzey Fleet exposes controller APIs for agent enrollment, inventory, job dispatch, snapshots, drift reports, and audit events. HTTP transport is supported only for local or short-lived tests. Use HTTPS for product, production, shared, or long-running environments because HTTP does not provide confidentiality or integrity."
   },
@@ -561,7 +561,7 @@
           "timeout_seconds": { "type": "integer", "minimum": 1, "example": 30 },
           "confirmed_high_risk": { "type": "boolean", "example": true },
           "confirmed_by": { "type": "string", "default": "admin", "example": "operator@example.com" },
-          "expires_in_seconds": { "type": "integer", "default": 60, "example": 60 },
+          "expires_in_seconds": { "type": "integer", "default": 300, "example": 300 },
           "nonce_prefix": { "type": ["string", "null"], "example": "nonce-job-1" }
         },
         "additionalProperties": false
@@ -596,7 +596,7 @@
           "timeout_seconds": { "type": "integer", "default": 30, "example": 180 },
           "confirmed_high_risk": { "type": "boolean", "example": true },
           "confirmed_by": { "type": "string", "default": "admin", "example": "operator@example.com" },
-          "expires_in_seconds": { "type": "integer", "default": 60, "example": 300 },
+          "expires_in_seconds": { "type": "integer", "default": 300, "example": 300 },
           "nonce_prefix": { "type": ["string", "null"], "example": "nonce-runbook-1" }
         },
         "additionalProperties": false
@@ -626,7 +626,7 @@
           "policy_document": { "type": "string", "example": "apiVersion: fleet.sponzey.dev/v1alpha1\nkind: Policy\nmetadata:\n  name: nginx-running\nspec:\n  targets:\n    selector: role=web\n  checks: []\n" },
           "timeout_seconds": { "type": "integer", "default": 30, "example": 30 },
           "created_by": { "type": "string", "default": "admin", "example": "operator@example.com" },
-          "expires_in_seconds": { "type": "integer", "default": 60, "example": 300 },
+          "expires_in_seconds": { "type": "integer", "default": 300, "example": 300 },
           "nonce_prefix": { "type": ["string", "null"], "example": "nonce-drift-1" }
         },
         "additionalProperties": false
@@ -1960,7 +1960,7 @@
                 "args": [],
                 "timeout_seconds": 30,
                 "confirmed_high_risk": false,
-                "expires_in_seconds": 60
+                "expires_in_seconds": 300
               }
             }
           }
