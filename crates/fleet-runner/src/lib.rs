@@ -1,13 +1,15 @@
 use fleet_domain::{
-    AgentId, DriftAcknowledgement, DriftReport, DriftSeverity, DriftStatus, JobError, PackageState,
-    Policy, PolicyCheck, Runbook, RunbookTask, ServicePrimitiveState, ServiceState, TaskEnvelope,
+    AgentId, ControllerSigningTrustBundle, ControllerSigningTrustVerification,
+    DriftAcknowledgement, DriftReport, DriftSeverity, DriftStatus, JobError, PackageState, Policy,
+    PolicyCheck, Runbook, RunbookTask, ServicePrimitiveState, ServiceState, SigningKeyFingerprint,
+    SigningTrustBundleError, TaskEnvelope,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::{Display, Formatter};
-use std::fs;
-use std::io::Read;
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -51,7 +53,10 @@ pub enum RunnerError {
     Io(String),
     Job(JobError),
     InvalidSignature,
+    UnknownControllerSigningKey,
+    ExpiredControllerSigningTrust,
     ReplayedNonce,
+    ReplayStoreUnavailable(String),
     Timeout,
     Canceled,
     OutputLimitExceeded,
@@ -66,7 +71,19 @@ impl Display for RunnerError {
             Self::Io(error) => write!(formatter, "runner io error: {error}"),
             Self::Job(error) => write!(formatter, "{error}"),
             Self::InvalidSignature => write!(formatter, "task envelope signature is invalid"),
+            Self::UnknownControllerSigningKey => {
+                write!(formatter, "controller signing fingerprint is not trusted")
+            }
+            Self::ExpiredControllerSigningTrust => {
+                write!(
+                    formatter,
+                    "controller signing trust entry is outside its valid window"
+                )
+            }
             Self::ReplayedNonce => write!(formatter, "task envelope nonce was already used"),
+            Self::ReplayStoreUnavailable(error) => {
+                write!(formatter, "task nonce replay store is unavailable: {error}")
+            }
             Self::Timeout => write!(formatter, "command timed out"),
             Self::Canceled => write!(formatter, "command was canceled"),
             Self::OutputLimitExceeded => write!(formatter, "command output limit exceeded"),
@@ -100,19 +117,98 @@ pub trait TaskSignatureVerifier {
     fn verify(&self, payload_hash: &str, signature: &str) -> bool;
 }
 
+pub trait ControllerSigningMaterialVerifier {
+    fn verify(&self, public_key: &str, payload_hash: &str, signature: &str) -> bool;
+}
+
 #[derive(Debug, Default)]
 pub struct NonceReplayGuard {
     seen: HashSet<String>,
+    store_path: Option<PathBuf>,
 }
 
 impl NonceReplayGuard {
-    pub fn accept_once(&mut self, nonce: &str) -> Result<(), RunnerError> {
-        if self.seen.insert(nonce.to_owned()) {
-            Ok(())
-        } else {
-            Err(RunnerError::ReplayedNonce)
+    pub fn file_backed(path: impl AsRef<Path>) -> Result<Self, RunnerError> {
+        let path = path.as_ref().to_path_buf();
+        let mut guard = Self {
+            seen: HashSet::new(),
+            store_path: Some(path.clone()),
+        };
+        if !path.exists() {
+            return Ok(guard);
         }
+        let body = fs::read_to_string(&path).map_err(|error| {
+            RunnerError::ReplayStoreUnavailable(format!(
+                "failed to read nonce store {}: {error}",
+                path.display()
+            ))
+        })?;
+        for (index, line) in body.lines().enumerate() {
+            let Some(record) = line.strip_prefix("v1:") else {
+                return Err(RunnerError::ReplayStoreUnavailable(format!(
+                    "invalid nonce store record at line {}",
+                    index + 1
+                )));
+            };
+            if record.len() != 64
+                || !record
+                    .chars()
+                    .all(|character| character.is_ascii_hexdigit())
+            {
+                return Err(RunnerError::ReplayStoreUnavailable(format!(
+                    "invalid nonce store digest at line {}",
+                    index + 1
+                )));
+            }
+            guard.seen.insert(record.to_owned());
+        }
+        Ok(guard)
     }
+
+    pub fn accept_once(&mut self, nonce: &str) -> Result<(), RunnerError> {
+        let record = nonce_replay_record(nonce);
+        if !self.seen.insert(record.clone()) {
+            return Err(RunnerError::ReplayedNonce);
+        }
+        if let Some(path) = &self.store_path {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).map_err(|error| {
+                    RunnerError::ReplayStoreUnavailable(format!(
+                        "failed to create nonce store directory {}: {error}",
+                        parent.display()
+                    ))
+                })?;
+            }
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .map_err(|error| {
+                    RunnerError::ReplayStoreUnavailable(format!(
+                        "failed to open nonce store {}: {error}",
+                        path.display()
+                    ))
+                })?;
+            writeln!(file, "v1:{record}").map_err(|error| {
+                RunnerError::ReplayStoreUnavailable(format!(
+                    "failed to write nonce store {}: {error}",
+                    path.display()
+                ))
+            })?;
+            file.sync_all().map_err(|error| {
+                RunnerError::ReplayStoreUnavailable(format!(
+                    "failed to sync nonce store {}: {error}",
+                    path.display()
+                ))
+            })?;
+        }
+        Ok(())
+    }
+}
+
+fn nonce_replay_record(nonce: &str) -> String {
+    let digest = Sha256::digest(nonce.as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -242,6 +338,17 @@ pub struct RunbookStepOutcome {
     pub stdout: String,
     pub stderr: String,
     pub audit_metadata: String,
+    pub artifact: Option<RunbookArtifactOutcome>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RunbookArtifactOutcome {
+    pub step_id: String,
+    pub destination: String,
+    pub checksum_sha256: String,
+    pub size_bytes: u64,
+    pub retention_class: String,
+    pub content_bytes: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -387,6 +494,7 @@ pub enum PrimitiveError {
     UnsafePath(String),
     ParentDirectoryMissing(String),
     PermissionDenied(String),
+    TemplateRender(String),
     Io(String),
 }
 
@@ -406,6 +514,7 @@ impl Display for PrimitiveError {
                 )
             }
             Self::PermissionDenied(path) => write!(formatter, "permission denied: {path}"),
+            Self::TemplateRender(error) => write!(formatter, "template render error: {error}"),
             Self::Io(error) => write!(formatter, "primitive io error: {error}"),
         }
     }
@@ -582,6 +691,37 @@ pub fn build_runbook_execution_plan(
     runbook: &Runbook,
     package_manager: LinuxPackageManager,
 ) -> Result<RunbookExecutionPlan, PrimitiveError> {
+    build_runbook_execution_plan_internal(
+        runbook,
+        package_manager,
+        None::<
+            fn(
+                &fleet_domain::SecretRef,
+            ) -> Result<String, fleet_domain::TemplateSecretResolutionFailure>,
+        >,
+    )
+}
+
+pub fn build_runbook_execution_plan_with_secret_resolver(
+    runbook: &Runbook,
+    package_manager: LinuxPackageManager,
+    resolve_secret: impl FnMut(
+        &fleet_domain::SecretRef,
+    ) -> Result<String, fleet_domain::TemplateSecretResolutionFailure>,
+) -> Result<RunbookExecutionPlan, PrimitiveError> {
+    build_runbook_execution_plan_internal(runbook, package_manager, Some(resolve_secret))
+}
+
+fn build_runbook_execution_plan_internal<F>(
+    runbook: &Runbook,
+    package_manager: LinuxPackageManager,
+    mut resolve_secret: Option<F>,
+) -> Result<RunbookExecutionPlan, PrimitiveError>
+where
+    F: FnMut(
+        &fleet_domain::SecretRef,
+    ) -> Result<String, fleet_domain::TemplateSecretResolutionFailure>,
+{
     let mut steps = Vec::new();
     for task in &runbook.tasks {
         match task {
@@ -613,6 +753,41 @@ pub fn build_runbook_execution_plan(
                         destination: PathBuf::from(&copy.dest),
                         content: copy.content.as_bytes().to_vec(),
                         mode: copy.mode.as_deref().and_then(parse_octal_mode),
+                        artifact_retention_class: None,
+                        include_artifact_content: true,
+                    }),
+                });
+            }
+            RunbookTask::FileTemplate(template) => {
+                let secret_backed = template.variables.values().any(|value| {
+                    matches!(value, fleet_domain::TemplateVariableValue::SecretRef(_))
+                });
+                let rendered = match resolve_secret.as_mut() {
+                    Some(resolve_secret) => {
+                        fleet_domain::render_template_content_with_secret_resolver(
+                            &template.content,
+                            &template.variables,
+                            |reference| resolve_secret(reference),
+                        )
+                    }
+                    None => fleet_domain::render_template_content(
+                        &template.content,
+                        &template.variables,
+                    ),
+                }
+                .map_err(|error| PrimitiveError::TemplateRender(error.to_string()))?;
+                steps.push(RunbookExecutionStep {
+                    id: format!("{}:template", template.id),
+                    action: RunbookExecutionAction::FileCopy(FileCopySpec {
+                        destination: PathBuf::from(&template.dest),
+                        content: rendered.into_bytes(),
+                        mode: template.mode.as_deref().and_then(parse_octal_mode),
+                        artifact_retention_class: Some(
+                            fleet_domain::ArtifactRetentionClass::RenderedTemplate
+                                .as_str()
+                                .to_owned(),
+                        ),
+                        include_artifact_content: !secret_backed,
                     }),
                 });
             }
@@ -764,6 +939,7 @@ pub fn execute_runbook_execution_plan_with_hooks(
                             "primitive=command,program={},high_risk={}",
                             command.program, command.high_risk
                         ),
+                        artifact: None,
                     }
                 }
             }
@@ -796,6 +972,7 @@ pub fn execute_runbook_execution_plan_with_hooks(
                                 "primitive=package,name={},state=present,changed=false",
                                 spec.name
                             ),
+                            artifact: None,
                         }
                     } else if options.check_mode {
                         RunbookStepOutcome {
@@ -817,6 +994,7 @@ pub fn execute_runbook_execution_plan_with_hooks(
                                 "primitive=package,name={},state=present,changed=true,check_mode=true",
                                 spec.name
                             ),
+                            artifact: None,
                         }
                     } else {
                         let install = package_install_command(spec.manager, &spec.name)?;
@@ -853,6 +1031,7 @@ pub fn execute_runbook_execution_plan_with_hooks(
                                 "primitive=package,name={},state=present,changed={success}",
                                 spec.name
                             ),
+                            artifact: None,
                         }
                     }
                 }
@@ -898,6 +1077,7 @@ pub fn execute_runbook_execution_plan_with_hooks(
                                 "primitive=service,name={},state={:?},changed=false",
                                 spec.name, spec.state
                             ),
+                            artifact: None,
                         }
                     } else if options.check_mode {
                         RunbookStepOutcome {
@@ -919,6 +1099,7 @@ pub fn execute_runbook_execution_plan_with_hooks(
                                 "primitive=service,name={},state={:?},changed=true,check_mode=true",
                                 spec.name, spec.state
                             ),
+                            artifact: None,
                         }
                     } else {
                         if !options.confirmed_high_risk {
@@ -955,6 +1136,7 @@ pub fn execute_runbook_execution_plan_with_hooks(
                                         "primitive=service,name={},state={:?},enable=true,changed=false",
                                         spec.name, spec.state
                                     ),
+                                    artifact: None,
                                 });
                             }
                         }
@@ -1004,6 +1186,7 @@ pub fn execute_runbook_execution_plan_with_hooks(
                                     "primitive=service,name={},state={:?},changed={success}",
                                     spec.name, spec.state
                                 ),
+                                artifact: None,
                             }
                         }
                     }
@@ -1042,7 +1225,7 @@ pub fn execute_runbook_execution_plan_with_hooks(
                         diff: Some(PrimitiveDiff {
                             format: "sha256".to_owned(),
                             before: result.before_checksum,
-                            after: Some(result.after_checksum),
+                            after: Some(result.after_checksum.clone()),
                         }),
                         started_at_ms,
                         completed_at_ms: current_time_millis(),
@@ -1051,6 +1234,19 @@ pub fn execute_runbook_execution_plan_with_hooks(
                         stdout: String::new(),
                         stderr: String::new(),
                         audit_metadata: result.audit_metadata,
+                        artifact: spec
+                            .artifact_retention_class
+                            .as_ref()
+                            .map(|retention_class| RunbookArtifactOutcome {
+                                step_id: step.id.clone(),
+                                destination: spec.destination.display().to_string(),
+                                checksum_sha256: result.after_checksum.clone(),
+                                size_bytes: result.bytes_written as u64,
+                                retention_class: retention_class.clone(),
+                                content_bytes: spec
+                                    .include_artifact_content
+                                    .then(|| spec.content.clone()),
+                            }),
                     }
                 }
             }
@@ -1115,6 +1311,7 @@ pub fn execute_runbook_execution_plan_with_hooks(
                         stdout: result.body,
                         stderr: String::new(),
                         audit_metadata: format!("primitive={}", spec.kind.as_primitive_name()),
+                        artifact: None,
                     }
                 }
             }
@@ -1146,6 +1343,7 @@ fn skipped_outcome(
         stdout: String::new(),
         stderr: String::new(),
         audit_metadata: "primitive=skipped".to_owned(),
+        artifact: None,
     }
 }
 
@@ -1192,6 +1390,7 @@ fn probe_outcome(
         stdout: result.detail,
         stderr: String::new(),
         audit_metadata,
+        artifact: None,
     }
 }
 
@@ -1300,6 +1499,8 @@ pub struct FileCopySpec {
     pub destination: PathBuf,
     pub content: Vec<u8>,
     pub mode: Option<u32>,
+    pub artifact_retention_class: Option<String>,
+    pub include_artifact_content: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1700,6 +1901,83 @@ pub fn verify_signed_envelope_once(
     replay_guard.accept_once(envelope.nonce.as_str())
 }
 
+pub fn verify_signed_envelope_with_controller_trust(
+    envelope: &TaskEnvelope,
+    agent_id: &AgentId,
+    now: SystemTime,
+    trust_bundle: &ControllerSigningTrustBundle,
+    claimed_fingerprint: Option<&SigningKeyFingerprint>,
+    verifier: &impl ControllerSigningMaterialVerifier,
+) -> Result<ControllerSigningTrustVerification, RunnerError> {
+    envelope
+        .validate_for_agent(agent_id, now)
+        .map_err(RunnerError::Job)?;
+    let signature = envelope
+        .signature
+        .as_ref()
+        .ok_or(RunnerError::Job(JobError::UnsignedTask))?;
+
+    if let Some(claimed_fingerprint) = claimed_fingerprint {
+        let entry = trust_bundle
+            .entry_for_fingerprint(claimed_fingerprint, envelope.issued_at, now)
+            .map_err(runner_error_from_trust_bundle_error)?;
+        if verifier.verify(
+            entry.public_key().as_str(),
+            &envelope.payload_hash,
+            signature.as_str(),
+        ) {
+            return Ok(ControllerSigningTrustVerification::from_role(entry.role()));
+        }
+        return Err(RunnerError::InvalidSignature);
+    }
+
+    for entry in trust_bundle.valid_entries(envelope.issued_at, now) {
+        if verifier.verify(
+            entry.public_key().as_str(),
+            &envelope.payload_hash,
+            signature.as_str(),
+        ) {
+            return Ok(ControllerSigningTrustVerification::from_role(entry.role()));
+        }
+    }
+
+    Err(RunnerError::InvalidSignature)
+}
+
+pub fn verify_signed_envelope_once_with_controller_trust(
+    envelope: &TaskEnvelope,
+    agent_id: &AgentId,
+    now: SystemTime,
+    trust_bundle: &ControllerSigningTrustBundle,
+    claimed_fingerprint: Option<&SigningKeyFingerprint>,
+    verifier: &impl ControllerSigningMaterialVerifier,
+    replay_guard: &mut NonceReplayGuard,
+) -> Result<ControllerSigningTrustVerification, RunnerError> {
+    let verification = verify_signed_envelope_with_controller_trust(
+        envelope,
+        agent_id,
+        now,
+        trust_bundle,
+        claimed_fingerprint,
+        verifier,
+    )?;
+    replay_guard.accept_once(envelope.nonce.as_str())?;
+    Ok(verification)
+}
+
+fn runner_error_from_trust_bundle_error(error: SigningTrustBundleError) -> RunnerError {
+    match error {
+        SigningTrustBundleError::UnknownFingerprint => RunnerError::UnknownControllerSigningKey,
+        SigningTrustBundleError::ExpiredTrust => RunnerError::ExpiredControllerSigningTrust,
+        SigningTrustBundleError::EmptyBundle
+        | SigningTrustBundleError::InvalidCurrentEntryCount
+        | SigningTrustBundleError::DuplicateFingerprint
+        | SigningTrustBundleError::InvalidPublicKey
+        | SigningTrustBundleError::InvalidTimeWindow
+        | SigningTrustBundleError::PreviousTrustRequiresExpiry => RunnerError::InvalidSignature,
+    }
+}
+
 pub fn run_command(program: &str, args: &[String]) -> std::io::Result<CommandOutput> {
     run_command_with_spec(CommandSpec::new(
         program,
@@ -1976,8 +2254,8 @@ pub fn runner_layer_ready() -> bool {
 mod tests {
     use super::*;
     use fleet_domain::{
-        JobId, Policy, PolicyCheck, Selector, ServiceState, TaskExpiry, TaskId, TaskNonce,
-        TaskSignature,
+        ControllerSigningPublicKey, ControllerSigningTrustEntry, ControllerSigningTrustRole, JobId,
+        Policy, PolicyCheck, Selector, ServiceState, TaskExpiry, TaskId, TaskNonce, TaskSignature,
     };
     use std::fs;
     use std::time::Duration;
@@ -2105,6 +2383,285 @@ spec:
     }
 
     #[test]
+    fn runbook_execution_plan_renders_file_template_to_file_copy() {
+        let runbook = fleet_domain::parse_runbook_document(
+            r#"
+apiVersion: fleet.sponzey.dev/v1alpha1
+kind: Runbook
+name: template-web
+selector: role=web
+steps:
+  - id: nginx-template
+    file.template:
+      dest: /etc/nginx/conf.d/sponzey.conf
+      content: server { listen {{ port }}; server_name {{ host }}; }
+      mode: "0644"
+      variables: port=8080,host=example.test
+"#,
+        )
+        .unwrap();
+
+        let plan = build_runbook_execution_plan(&runbook, LinuxPackageManager::Apt).unwrap();
+
+        assert_eq!(plan.steps.len(), 1);
+        assert_eq!(plan.steps[0].id, "nginx-template:template");
+        assert!(matches!(
+            &plan.steps[0].action,
+            RunbookExecutionAction::FileCopy(spec)
+                if spec.destination == Path::new("/etc/nginx/conf.d/sponzey.conf")
+                    && spec.content == b"server { listen 8080; server_name example.test; }"
+                    && spec.mode == Some(0o644)
+        ));
+    }
+
+    #[test]
+    fn runbook_execution_plan_rejects_unresolved_secret_template_values() {
+        let runbook = fleet_domain::parse_runbook_document(
+            r#"
+apiVersion: fleet.sponzey.dev/v1alpha1
+kind: Runbook
+name: secret-template
+selector: role=web
+steps:
+  - id: secret-template
+    file.template:
+      dest: /tmp/app.conf
+      content: token={{ api_token }}
+      secretRefs: api_token=secret://app/token
+"#,
+        )
+        .unwrap();
+
+        let error = build_runbook_execution_plan(&runbook, LinuxPackageManager::Apt).unwrap_err();
+
+        assert_eq!(
+            error,
+            PrimitiveError::TemplateRender(
+                "secret variable requires provider: api_token".to_owned()
+            )
+        );
+        assert!(!error.to_string().contains("secret://app/token"));
+    }
+
+    #[test]
+    fn runbook_execution_plan_renders_secret_template_with_explicit_resolver() {
+        let runbook = fleet_domain::parse_runbook_document(
+            r#"
+apiVersion: fleet.sponzey.dev/v1alpha1
+kind: Runbook
+name: secret-template
+selector: role=web
+steps:
+  - id: secret-template
+    file.template:
+      dest: /tmp/app.conf
+      content: token={{ api_token }}
+      secretRefs: api_token=secret://app/token
+"#,
+        )
+        .unwrap();
+
+        let plan = build_runbook_execution_plan_with_secret_resolver(
+            &runbook,
+            LinuxPackageManager::Apt,
+            |reference| {
+                assert_eq!(reference.as_str(), "secret://app/token");
+                Ok("resolved-secret-value".to_owned())
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            &plan.steps[0].action,
+            RunbookExecutionAction::FileCopy(spec)
+                if spec.content == b"token=resolved-secret-value"
+                    && !spec.include_artifact_content
+        ));
+    }
+
+    #[test]
+    fn secret_template_resolver_errors_are_redacted() {
+        let runbook = fleet_domain::parse_runbook_document(
+            r#"
+apiVersion: fleet.sponzey.dev/v1alpha1
+kind: Runbook
+name: secret-template
+selector: role=web
+steps:
+  - id: secret-template
+    file.template:
+      dest: /tmp/app.conf
+      content: token={{ api_token }}
+      secretRefs: api_token=secret://app/token
+"#,
+        )
+        .unwrap();
+
+        let error = build_runbook_execution_plan_with_secret_resolver(
+            &runbook,
+            LinuxPackageManager::Apt,
+            |_| Err(fleet_domain::TemplateSecretResolutionFailure::Denied),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, PrimitiveError::TemplateRender(_)));
+        assert!(error.to_string().contains("api_token"));
+        assert!(!error.to_string().contains("secret://app/token"));
+    }
+
+    #[test]
+    fn runbook_execution_records_artifact_summary_for_file_template_only() {
+        let dir = temp_test_dir("runbook-file-template-artifact");
+        let template_destination = dir.join("app.conf");
+        let copy_destination = dir.join("copy.conf");
+        let runbook = fleet_domain::parse_runbook_document(&format!(
+            r#"
+apiVersion: fleet.sponzey.dev/v1alpha1
+kind: Runbook
+name: template-artifact
+selector: role=web
+steps:
+  - id: template
+    file.template:
+      dest: {}
+      content: port={{{{ port }}}}
+      variables: port=8080
+  - id: copy
+    file.copy:
+      dest: {}
+      content: copied
+"#,
+            template_destination.display(),
+            copy_destination.display()
+        ))
+        .unwrap();
+        let plan = build_runbook_execution_plan(&runbook, LinuxPackageManager::Apt).unwrap();
+
+        let report =
+            execute_runbook_execution_plan(&plan, RunbookExecutionOptions::default()).unwrap();
+
+        let template_artifact = report.outcomes[0].artifact.as_ref().unwrap();
+        assert_eq!(template_artifact.step_id, "template:template");
+        assert_eq!(
+            template_artifact.destination,
+            template_destination.display().to_string()
+        );
+        assert_eq!(
+            template_artifact.size_bytes,
+            fs::metadata(&template_destination).unwrap().len()
+        );
+        assert_eq!(
+            template_artifact.retention_class,
+            fleet_domain::ArtifactRetentionClass::RenderedTemplate.as_str()
+        );
+        assert_eq!(
+            template_artifact.content_bytes.as_deref(),
+            Some(&b"port=8080"[..])
+        );
+        assert!(report.outcomes[1].artifact.is_none());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn secret_template_execution_omits_artifact_body_from_report() {
+        let dir = temp_test_dir("secret-template-no-artifact-body");
+        let template_destination = dir.join("app.conf");
+        let raw_secret = "raw-secret-render-fixture";
+        let runbook = fleet_domain::parse_runbook_document(&format!(
+            r#"
+apiVersion: fleet.sponzey.dev/v1alpha1
+kind: Runbook
+name: secret-template-artifact
+selector: role=web
+steps:
+  - id: template
+    file.template:
+      dest: {}
+      content: token={{{{ api_token }}}}
+      secretRefs: api_token=secret://app/token
+"#,
+            template_destination.display()
+        ))
+        .unwrap();
+        let plan = build_runbook_execution_plan_with_secret_resolver(
+            &runbook,
+            LinuxPackageManager::Apt,
+            |_| Ok(raw_secret.to_owned()),
+        )
+        .unwrap();
+
+        let report =
+            execute_runbook_execution_plan(&plan, RunbookExecutionOptions::default()).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&template_destination).unwrap(),
+            format!("token={raw_secret}")
+        );
+        let artifact = report.outcomes[0].artifact.as_ref().unwrap();
+        assert_eq!(artifact.content_bytes, None);
+        let serialized = serde_json::to_string(&report).unwrap();
+        assert!(!serialized.contains(raw_secret));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn template_artifact_checksum_can_drive_file_drift_policy() {
+        let dir = temp_test_dir("template-artifact-drift");
+        let template_destination = dir.join("app.conf");
+        let runbook = fleet_domain::parse_runbook_document(&format!(
+            r#"
+apiVersion: fleet.sponzey.dev/v1alpha1
+kind: Runbook
+name: template-drift
+selector: role=web
+steps:
+  - id: template
+    file.template:
+      dest: {}
+      content: port={{ port }}
+      variables: port=8080
+"#,
+            template_destination.display()
+        ))
+        .unwrap();
+        let plan = build_runbook_execution_plan(&runbook, LinuxPackageManager::Apt).unwrap();
+        let report =
+            execute_runbook_execution_plan(&plan, RunbookExecutionOptions::default()).unwrap();
+        let artifact = report.outcomes[0].artifact.as_ref().unwrap();
+        let policy = fleet_domain::parse_policy_document(&format!(
+            r#"
+apiVersion: fleet.sponzey.dev/v1alpha1
+kind: Policy
+metadata:
+  name: template-drift-policy
+spec:
+  selector:
+    matchLabels:
+      role: web
+  checks:
+    - id: rendered-template
+      file:
+        path: {}
+        sha256: {}
+"#,
+            template_destination.display(),
+            artifact.checksum_sha256
+        ))
+        .unwrap();
+
+        let compliant = evaluate_policy_drift(&policy, &LocalDriftProbe);
+        assert_eq!(compliant.status, DriftStatus::Compliant);
+        assert!(compliant.expected.contains(&artifact.checksum_sha256));
+        assert!(compliant.actual.contains(&artifact.checksum_sha256));
+
+        fs::write(&template_destination, "port=9090").unwrap();
+        let drifted = evaluate_policy_drift(&policy, &LocalDriftProbe);
+        assert_eq!(drifted.status, DriftStatus::Drifted);
+        assert!(!drifted.actual.contains(&artifact.checksum_sha256));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn runbook_execution_rejects_unconfirmed_high_risk_command() {
         let plan = RunbookExecutionPlan {
             runbook_name: "high-risk".to_owned(),
@@ -2175,6 +2732,7 @@ spec:
         );
         assert!(report.outcomes[0].completed_at_ms >= report.outcomes[0].started_at_ms);
         assert!(report.outcomes[0].audit_metadata.contains("changed=true"));
+        assert!(report.outcomes[0].artifact.is_none());
         assert_eq!(
             fs::read_to_string(&destination).unwrap(),
             "worker_processes 2;"
@@ -2412,6 +2970,8 @@ spec:
                     destination: PathBuf::from("/tmp/app.conf"),
                     content: b"same".to_vec(),
                     mode: None,
+                    artifact_retention_class: None,
+                    include_artifact_content: true,
                 }),
             }],
         };
@@ -2592,6 +3152,7 @@ spec:
             stdout: String::new(),
             stderr: String::new(),
             audit_metadata: "primitive=file.copy".to_owned(),
+            artifact: None,
         };
 
         let value = serde_json::to_value(&outcome).unwrap();
@@ -2663,6 +3224,8 @@ spec:
                     destination: PathBuf::from("/tmp/sponzey-dry-run"),
                     content: b"hello".to_vec(),
                     mode: None,
+                    artifact_retention_class: None,
+                    include_artifact_content: true,
                 }),
             }],
         };
@@ -2783,6 +3346,8 @@ spec:
             destination: destination.clone(),
             content: b"worker_processes 2;\n".to_vec(),
             mode: Some(0o600),
+            artifact_retention_class: None,
+            include_artifact_content: true,
         })
         .unwrap();
 
@@ -2807,6 +3372,8 @@ spec:
             destination: destination.clone(),
             content: b"same".to_vec(),
             mode: None,
+            artifact_retention_class: None,
+            include_artifact_content: true,
         })
         .unwrap();
 
@@ -2823,6 +3390,8 @@ spec:
                 destination: PathBuf::from("../relative.conf"),
                 content: Vec::new(),
                 mode: None,
+                artifact_retention_class: None,
+                include_artifact_content: true,
             }),
             Err(PrimitiveError::UnsafePath(_))
         ));
@@ -2838,6 +3407,8 @@ spec:
                 destination,
                 content: b"body".to_vec(),
                 mode: None,
+                artifact_retention_class: None,
+                include_artifact_content: true,
             }),
             Err(PrimitiveError::ParentDirectoryMissing(_))
         ));
@@ -2854,6 +3425,8 @@ spec:
                 destination: destination.clone(),
                 content: b"body".to_vec(),
                 mode: None,
+                artifact_retention_class: None,
+                include_artifact_content: true,
             },
             |_from, _to| {
                 Err(std::io::Error::new(
@@ -2880,6 +3453,8 @@ spec:
                 destination: destination.clone(),
                 content: b"fallback".to_vec(),
                 mode: None,
+                artifact_retention_class: None,
+                include_artifact_content: true,
             },
             |_from, _to| Err(std::io::Error::other("cross-device link")),
         )
@@ -2904,8 +3479,8 @@ spec:
                 actual: "present".to_owned(),
             },
             file_sha256: CheckObservation::Match {
-                expected: "file /etc/nginx/nginx.conf sha256 abc".to_owned(),
-                actual: "abc".to_owned(),
+                expected: format!("file /etc/nginx/nginx.conf sha256 {}", "a".repeat(64)),
+                actual: "a".repeat(64),
             },
         };
 
@@ -2928,8 +3503,8 @@ spec:
                 actual: "present".to_owned(),
             },
             file_sha256: CheckObservation::Match {
-                expected: "file /etc/nginx/nginx.conf sha256 abc".to_owned(),
-                actual: "abc".to_owned(),
+                expected: format!("file /etc/nginx/nginx.conf sha256 {}", "a".repeat(64)),
+                actual: "a".repeat(64),
             },
         };
 
@@ -2951,8 +3526,8 @@ spec:
                 actual: "missing".to_owned(),
             },
             file_sha256: CheckObservation::Match {
-                expected: "file /etc/nginx/nginx.conf sha256 abc".to_owned(),
-                actual: "abc".to_owned(),
+                expected: format!("file /etc/nginx/nginx.conf sha256 {}", "a".repeat(64)),
+                actual: "a".repeat(64),
             },
         };
 
@@ -2974,8 +3549,8 @@ spec:
                 actual: "present".to_owned(),
             },
             file_sha256: CheckObservation::Match {
-                expected: "file /etc/nginx/nginx.conf sha256 abc".to_owned(),
-                actual: "abc".to_owned(),
+                expected: format!("file /etc/nginx/nginx.conf sha256 {}", "a".repeat(64)),
+                actual: "a".repeat(64),
             },
         };
 
@@ -3111,6 +3686,187 @@ spec:
     }
 
     #[test]
+    fn controller_trust_bundle_verifies_current_key_signature() {
+        let verifier = PublicKeySignatureVerifier;
+        let bundle = controller_trust_bundle();
+        let envelope = signed_envelope_with_signature(
+            "current-nonce",
+            at(25),
+            at(70),
+            "sig:new-controller-public-key:h",
+        );
+
+        let verification = verify_signed_envelope_with_controller_trust(
+            &envelope,
+            &AgentId::new("a1").unwrap(),
+            at(30),
+            &bundle,
+            None,
+            &verifier,
+        )
+        .unwrap();
+
+        assert_eq!(
+            verification,
+            ControllerSigningTrustVerification::VerifiedCurrent
+        );
+    }
+
+    #[test]
+    fn controller_trust_bundle_verifies_previous_key_within_window() {
+        let verifier = PublicKeySignatureVerifier;
+        let bundle = controller_trust_bundle();
+        let envelope = signed_envelope_with_signature(
+            "previous-nonce",
+            at(19),
+            at(70),
+            "sig:old-controller-public-key:h",
+        );
+
+        let verification = verify_signed_envelope_with_controller_trust(
+            &envelope,
+            &AgentId::new("a1").unwrap(),
+            at(39),
+            &bundle,
+            Some(&fingerprint("old-controller-key")),
+            &verifier,
+        )
+        .unwrap();
+
+        assert_eq!(
+            verification,
+            ControllerSigningTrustVerification::VerifiedPrevious
+        );
+    }
+
+    #[test]
+    fn controller_trust_bundle_rejects_previous_key_after_window() {
+        let verifier = PublicKeySignatureVerifier;
+        let bundle = controller_trust_bundle();
+        let envelope = signed_envelope_with_signature(
+            "expired-previous-nonce",
+            at(19),
+            at(90),
+            "sig:old-controller-public-key:h",
+        );
+
+        let error = verify_signed_envelope_with_controller_trust(
+            &envelope,
+            &AgentId::new("a1").unwrap(),
+            at(41),
+            &bundle,
+            Some(&fingerprint("old-controller-key")),
+            &verifier,
+        )
+        .expect_err("previous controller signing key should expire");
+
+        assert_eq!(error, RunnerError::ExpiredControllerSigningTrust);
+    }
+
+    #[test]
+    fn controller_trust_bundle_rejects_unknown_fingerprint() {
+        let verifier = PublicKeySignatureVerifier;
+        let bundle = controller_trust_bundle();
+        let envelope = signed_envelope_with_signature(
+            "unknown-nonce",
+            at(25),
+            at(70),
+            "sig:unknown-controller-public-key:h",
+        );
+
+        let error = verify_signed_envelope_with_controller_trust(
+            &envelope,
+            &AgentId::new("a1").unwrap(),
+            at(30),
+            &bundle,
+            Some(&fingerprint("unknown-controller-key")),
+            &verifier,
+        )
+        .expect_err("unknown controller signing fingerprint should fail");
+
+        assert_eq!(error, RunnerError::UnknownControllerSigningKey);
+    }
+
+    #[test]
+    fn controller_trust_bundle_preserves_target_and_replay_checks() {
+        let verifier = PublicKeySignatureVerifier;
+        let bundle = controller_trust_bundle();
+        let envelope = signed_envelope_with_signature(
+            "replay-nonce",
+            at(25),
+            at(70),
+            "sig:new-controller-public-key:h",
+        );
+        let mut replay_guard = NonceReplayGuard::default();
+
+        assert_eq!(
+            verify_signed_envelope_with_controller_trust(
+                &envelope,
+                &AgentId::new("a2").unwrap(),
+                at(30),
+                &bundle,
+                Some(&fingerprint("new-controller-key")),
+                &verifier,
+            ),
+            Err(RunnerError::Job(JobError::TargetAgentMismatch))
+        );
+
+        verify_signed_envelope_once_with_controller_trust(
+            &envelope,
+            &AgentId::new("a1").unwrap(),
+            at(30),
+            &bundle,
+            Some(&fingerprint("new-controller-key")),
+            &verifier,
+            &mut replay_guard,
+        )
+        .unwrap();
+
+        assert_eq!(
+            verify_signed_envelope_once_with_controller_trust(
+                &envelope,
+                &AgentId::new("a1").unwrap(),
+                at(30),
+                &bundle,
+                Some(&fingerprint("new-controller-key")),
+                &verifier,
+                &mut replay_guard,
+            ),
+            Err(RunnerError::ReplayedNonce)
+        );
+    }
+
+    #[test]
+    fn file_backed_nonce_guard_rejects_replay_after_restart() {
+        let dir = temp_test_dir("nonce-replay-guard");
+        let path = dir.join("task-nonces.log");
+        let mut first_guard = NonceReplayGuard::file_backed(&path).unwrap();
+
+        first_guard.accept_once("nonce-1").unwrap();
+        let mut restarted_guard = NonceReplayGuard::file_backed(&path).unwrap();
+
+        assert_eq!(
+            restarted_guard.accept_once("nonce-1"),
+            Err(RunnerError::ReplayedNonce)
+        );
+        restarted_guard.accept_once("nonce-2").unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn file_backed_nonce_guard_fails_closed_on_corrupt_store() {
+        let dir = temp_test_dir("nonce-replay-corrupt");
+        let path = dir.join("task-nonces.log");
+        fs::write(&path, "not-a-valid-record\n").unwrap();
+
+        assert!(matches!(
+            NonceReplayGuard::file_backed(&path),
+            Err(RunnerError::ReplayStoreUnavailable(_))
+        ));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn successful_command_returns_stdout_and_exit_code() {
         let output =
             run_command_with_spec(shell_spec("printf ok", Duration::from_secs(5))).unwrap();
@@ -3218,16 +3974,59 @@ spec:
     }
 
     fn signed_envelope(nonce: &str, expires_at: SystemTime) -> TaskEnvelope {
+        signed_envelope_with_signature(nonce, SystemTime::UNIX_EPOCH, expires_at, "sig")
+    }
+
+    fn signed_envelope_with_signature(
+        nonce: &str,
+        issued_at: SystemTime,
+        expires_at: SystemTime,
+        signature: &str,
+    ) -> TaskEnvelope {
         TaskEnvelope {
             job_id: JobId::new("j1").unwrap(),
             task_id: TaskId::new("t1").unwrap(),
             target_agent_id: AgentId::new("a1").unwrap(),
-            issued_at: SystemTime::UNIX_EPOCH,
+            issued_at,
             expires_at: TaskExpiry::new(expires_at),
             nonce: TaskNonce::new(nonce).unwrap(),
             payload_hash: "h".into(),
-            signature: Some(TaskSignature::new("sig").unwrap()),
+            signature: Some(TaskSignature::new(signature).unwrap()),
         }
+    }
+
+    fn at(seconds: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)
+    }
+
+    fn fingerprint(value: &str) -> SigningKeyFingerprint {
+        SigningKeyFingerprint::new(value).unwrap()
+    }
+
+    fn public_key(value: &str) -> ControllerSigningPublicKey {
+        ControllerSigningPublicKey::new(value).unwrap()
+    }
+
+    fn controller_trust_bundle() -> ControllerSigningTrustBundle {
+        ControllerSigningTrustBundle::new(vec![
+            ControllerSigningTrustEntry::new(
+                ControllerSigningTrustRole::Previous,
+                fingerprint("old-controller-key"),
+                public_key("old-controller-public-key"),
+                at(20),
+                Some(at(40)),
+            )
+            .unwrap(),
+            ControllerSigningTrustEntry::new(
+                ControllerSigningTrustRole::Current,
+                fingerprint("new-controller-key"),
+                public_key("new-controller-public-key"),
+                at(20),
+                None,
+            )
+            .unwrap(),
+        ])
+        .unwrap()
     }
 
     struct StaticVerifier {
@@ -3237,6 +4036,14 @@ spec:
     impl TaskSignatureVerifier for StaticVerifier {
         fn verify(&self, _payload_hash: &str, _signature: &str) -> bool {
             self.valid
+        }
+    }
+
+    struct PublicKeySignatureVerifier;
+
+    impl ControllerSigningMaterialVerifier for PublicKeySignatureVerifier {
+        fn verify(&self, public_key: &str, payload_hash: &str, signature: &str) -> bool {
+            signature == format!("sig:{public_key}:{payload_hash}")
         }
     }
 
@@ -3284,7 +4091,7 @@ spec:
                 PolicyCheck::FileChecksum {
                     id: "file-nginx".to_owned(),
                     path: "/etc/nginx/nginx.conf".to_owned(),
-                    sha256: "abc".to_owned(),
+                    sha256: "a".repeat(64),
                 },
             ],
             remediation: None,

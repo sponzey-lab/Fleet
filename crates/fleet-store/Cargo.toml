@@ -5,8 +5,15 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+postgres = ["dep:native-tls", "dep:postgres", "dep:postgres-native-tls"]
+
 [dependencies]
 fleet-application = { path = "../fleet-application" }
 fleet-domain = { path = "../fleet-domain" }
+postgres = { workspace = true, optional = true }
+postgres-native-tls = { workspace = true, optional = true }
+native-tls = { workspace = true, optional = true }
 rusqlite = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }

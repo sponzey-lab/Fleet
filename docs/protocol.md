@@ -107,6 +107,7 @@ Controller session implementation note:
 - agent id mismatch payload는 저장하지 않고 security audit 대상으로 처리한다.
 - DB write failure는 message만 조용히 무시하지 않고 `store_error` close reason으로 session cleanup 대상이 된다.
 - raw command output은 일반 product log로 흘리지 않고 job output storage에만 저장한다.
+- rendered artifact body는 `task_result.artifacts[].content_bytes`가 있을 때만 Controller `ArtifactStore`에 저장한다. Metadata-only artifact payload는 legacy compatible path로 계속 허용한다.
 - output chunk는 bounded runner output limit과 chunk sequence를 유지한다.
 - 같은 `(job_id, agent_id, stream, sequence)` output chunk가 같은 body로 다시 오면 idempotent duplicate로 보고 무시한다.
 - 같은 key의 output chunk가 다른 body로 오면 raw body를 audit/log에 남기지 않고 `websocket_output_chunk_conflict` security audit를 남긴 뒤 protocol error로 session cleanup 대상이 된다.
@@ -116,6 +117,191 @@ Controller session implementation note:
 - Cancel API는 queued assignment를 DB에서 terminal `canceled`로 바꾸고, 이미 `dispatched`, `accepted`, `started` 상태인 active session에는 `task_cancel`을 보낸다.
 - Agent는 `task_cancel`이 현재 실행 중인 task id와 일치하면 cancel flag를 설정하고, command runner는 child process를 kill한 뒤 `task_result.status = "canceled"`를 돌려보낸다.
 - session lifecycle audit action은 `agent_session_started`, `agent_session_ended`, `agent_session_replaced`, `agent_session_revoked_closed`, `agent_session_auth_failed`를 사용한다.
+
+## Controller Identity And Fingerprints
+
+The controller identity endpoint exposes the controller signing identity, not
+the TLS certificate identity.
+
+- `controller_public_key` is the controller Ed25519 signing public key.
+- `controller_fingerprint` and `controller_signing_fingerprint` are signing
+  public key fingerprints. They are used by agents to detect controller signing
+  key changes after enrollment.
+- `tls_enabled` only reports whether the controller listener is using TLS server
+  material.
+- TLS certificate fingerprints must not be substituted for
+  `controller_signing_fingerprint`.
+
+The TLS server certificate proves the transport endpoint for HTTPS/WSS. The
+controller signing key proves task envelopes. Future mTLS client certificates may
+add transport authentication, but they do not replace agent key proof,
+controller-signed task envelopes, expiry, nonce replay, or target validation.
+
+Controller signing key rotation uses a dual-trust policy:
+
+- before activation, the old signing key remains the signing key;
+- after activation, the new signing key signs new task envelopes;
+- the old signing key verifies only task envelopes signed before activation and
+  only until the explicit old-key verification expiry;
+- after old-key retirement, old-key signatures are rejected even if the task has
+  not expired.
+
+This policy is a domain state machine. Wire payloads and task verification must
+not infer it from TLS certificate fingerprints or local certificate files.
+The persisted rotation record stores only state, public fingerprints, and
+validity timestamps. Private key material and private key paths remain outside
+the protocol and rotation-state persistence model.
+Request, validation, activation, retirement, and failure operations are
+application use cases with security audit events. Protocol handlers and future
+admin APIs must not duplicate transition logic or inspect private key material.
+Validation requires a candidate signing keypair to sign/verify an explicit
+challenge and the derived public fingerprint to match the pending new
+fingerprint; private key material remains outside protocol payloads, persisted
+rotation state, and audit values.
+At controller bootstrap, the active signing keypair is validated and compared
+with persisted rotation state before any task-signing path is exposed. A
+mismatch is a startup failure, not a runtime config patch or handler-level
+fallback.
+
+Rotation readiness is exposed to operators through
+`GET /api/controller/signing-rotation/status` and the
+`sponzey controller signing-rotation-status` CLI command. That surface is
+read-only and returns state names, readiness names, fingerprint prefixes, and
+dual-trust timestamps only. It is not an agent protocol message and must not
+carry private key material, key paths, TLS certificate material, raw public key
+bodies, task payload bodies, or process environment values.
+
+Rotation mutation is exposed through admin REST endpoints under
+`/api/controller/signing-rotation/*` and CLI commands under
+`sponzey controller signing-rotation`. These commands call application
+request/validate/activate/retire/fail use cases and return the same
+secret-free readiness vocabulary as the status endpoint. They are not
+agent-controller wire messages. Candidate material validation uses explicit
+controller-local file paths through the controller filesystem boundary; private
+key bodies, raw public key bodies, TLS certificate material, task payload
+bodies, and runtime environment patches are outside the protocol.
+
+Agents verify controller-signed task envelopes through a controller signing
+trust bundle. The bundle contains only public key material, public
+fingerprints, a role (`current` or `previous`), `valid_from`, and optional
+`valid_until`. Existing enrolled agents that only have a pinned controller
+signing fingerprint use a backward-compatible single-entry `current` bundle.
+
+`controller_signing_trust_bundle_update` is a task-data channel control message
+for rotating controller signing trust during an authenticated agent session.
+Its payload is:
+
+```json
+{
+  "entries": [
+    {
+      "fingerprint": "public-signing-key-fingerprint",
+      "public_key": "public-signing-key",
+      "role": "current",
+      "valid_from_ms": 1710000000000,
+      "valid_until_ms": null
+    }
+  ]
+}
+```
+
+Allowed roles are `current` and `previous`. `previous` entries require
+`valid_until_ms`; duplicate fingerprints, missing current entry, invalid time
+windows, and malformed public key fields are rejected before the bundle is
+stored. Accepted bundles are stored in explicit in-memory agent session state
+and are used only for subsequent task envelope verification. Accepted bundles
+are also persisted to the agent config sidecar `controller_trust_bundle.json`
+using the same public-only schema so restart keeps the rolled-out trust window.
+The update does not mark any task accepted, started, or verified.
+
+Trust-bundle rollout messages must preserve this boundary and must not include
+private key material, key file paths, TLS certificate material, task payload
+bodies, process environment changes, or runtime config patches.
+
+Controller signing rotation status, mutation, and restart-plan APIs are REST/CLI
+operator surfaces, not agent protocol messages. Restart-plan output is
+read-only guidance derived from persisted rotation state and active runtime
+signer summary; it must not trigger WebSocket control messages, controller
+self-restart, key reload, or runtime config patching.
+
+Controller signing trust bundle rollout is the REST/CLI surface that may send
+`controller_signing_trust_bundle_update` to authenticated connected sessions.
+It uses public-only bundle entries, requires the active controller signer to
+match persisted selected rotation state, and reports disconnected targets as
+skipped. Sending this control message must not create Job or Assignment state
+and must not be interpreted as task acceptance or task execution.
+
+The rollout retry surface uses the same protocol message and adds only
+controller-side batch selection. `max_agent_count` limits how many target
+sessions are attempted in one operator-triggered retry. Already-current agents
+can be skipped only when the controller has explicit public ack state for the
+same bundle fingerprint set. The unattended staged rollout worker continues
+persisted public rollout state and must not persist request bodies, private key
+material, certificate paths, WebSocket handles, or process environment values.
+
+## Agent Client Certificate Lifecycle
+
+Agent client certificate lifecycle now has a public-only wire schema foundation
+on top of the domain state machine and application repository/use-case
+contract. Runtime controller/agent handlers that mutate lifecycle state must
+call the application use cases instead of mutating lifecycle snapshots in
+WebSocket handlers. The current runtime boundary does not mutate lifecycle
+state: the controller records lifecycle ack status in session runtime state and
+Security audit, and the agent rejects lifecycle updates with a bounded
+`certificate_lifecycle_runtime_not_implemented` acknowledgement until local
+certificate application and mTLS enforcement exist. The controller also has an
+internal dispatch helper that converts an application lifecycle record into a
+public-only `agent_certificate_lifecycle_update` message for an already
+authenticated connected session. The current public controller surfaces are
+limited to read-only status and issuance request:
+`GET /api/agents/{agent_id}/certificate-lifecycle/status`,
+`sponzey agents certificate-status <agent-id>`,
+`POST /api/agents/{agent_id}/certificate-lifecycle/request-issuance`, and
+`sponzey agents request-certificate-issuance <agent-id>`. Status requires
+`agent_read` and returns public state/prefix fields only. Issuance request
+requires `agent_write`, stores public lifecycle state through the application
+use case, writes Security audit, and reports dispatch status only. Dispatch
+success is not agent acceptance or certificate installation.
+
+The lifecycle states are:
+
+- `not_issued`
+- `issuance_requested`
+- `issued`
+- `renewal_requested`
+- `dual_certificate_active`
+- `revoked`
+- `expired`
+- `failed`
+
+The protocol messages are:
+
+- `agent_certificate_lifecycle_update`: controller-to-agent lifecycle action
+  and public certificate metadata.
+- `agent_certificate_lifecycle_ack`: agent-to-controller acknowledgement with
+  accepted/rejected status, resulting lifecycle state, current public
+  fingerprint, and bounded reason code.
+
+Certificate issuance and renewal payloads may carry only public certificate
+metadata needed by the domain/application contract: agent id, certificate
+serial, certificate fingerprint, validity timestamps, lifecycle action,
+bounded reason code, and correlation id. They must not carry private keys, PEM
+bodies, certificate file paths, CA paths, task payload bodies, process
+environment patches, WebSocket handles, or runtime config changes.
+
+During `dual_certificate_active`, the current client certificate is accepted
+only until the explicit grace deadline and the next certificate is accepted
+according to its validity window. The current application/store contract covers
+issuance request, issue, renewal request, renewal activation, rotation
+completion, snapshot save/load, public metadata persistence, and Security audit
+event creation. The current protocol contract covers message shape,
+serialization, public-only metadata, ack status, controller-side ack audit, and
+controller-side public update dispatch from application records. Agent-side
+runtime certificate application currently returns explicit rejection when
+unsupported. Listener-side mTLS verification, issue/renew/activate/revoke
+public controller surfaces, agent-side certificate application, revocation
+propagation, and renewal acknowledgement behavior remain future implementation
+tasks.
 
 Close reason policy:
 
@@ -150,6 +336,7 @@ task 실행과 결과 전달용 payload:
 - `security_event`
 - `facts_snapshot`
 - `metrics_snapshot`
+- `capability_snapshot`
 - `log_chunk`
 - `drift_report`
 
@@ -185,6 +372,38 @@ Metrics snapshot:
 ```
 
 Drift report does not carry an arbitrary JSON body, so controller uses the agent message envelope `timestamp_ms` as both `checked_at_ms` and `agent_system_time_ms`.
+
+Capability snapshot:
+
+```json
+{
+  "type": "capability_snapshot",
+  "payload": {
+    "agent_id": "agent-1",
+    "privilege_level": "sudo_available",
+    "package_manager": "apt",
+    "service_manager": "systemd",
+    "capabilities": [
+      "persistent_session",
+      "command_execution",
+      "package_install"
+    ],
+    "reported_at_ms": 1710000000000
+  }
+}
+```
+
+Capability contract rules:
+
+- Capability matching is a domain/application rule, not a controller HTTP handler or Web Admin rule.
+- `fleet-protocol` owns only the wire shape: privilege level, optional package manager, optional service manager, reported capability names, and `reported_at_ms`.
+- Domain capability snapshot states are `unknown`, `reported`, `stale`, `unsupported`, and `compatible`.
+- Privilege levels are `unprivileged`, `sudo_available`, and `root`. `root` satisfies requirements that need `sudo_available`.
+- Supported package manager values are currently `apt`, `dnf`, `yum`, `apk`, and `brew`.
+- Supported service manager values are currently `systemd`, `launchd`, and `openrc`.
+- Capability values are not overridden by YAML config, runtime env patching, or UI settings.
+- Dispatch treats a stored snapshot older than the current 24-hour application default as stale and rejects before WebSocket write.
+- Agent collection, controller persistence, dispatch rejection, API exposure, and Web Admin rendering now use this snapshot as the product capability boundary. Runtime session summaries are diagnostic metadata, not the dispatch gate source of truth.
 
 Agent operational log chunk:
 
@@ -265,11 +484,12 @@ agent는 실행 전에 최소한 다음을 확인해야 한다.
 - signature가 비어 있지 않다.
 - expiry가 지나지 않았다.
 - nonce replay가 아니다.
-- controller public key로 signature를 검증한다.
+- controller signing trust bundle에서 유효한 public key를 선택해 signature를
+  검증한다.
 
 검증에 실패하면 agent는 task를 실행하지 않고 `task_rejected`를 controller에 보낸다. Controller는 해당 assignment를 `rejected`로 저장하고 job audit event를 남긴다. 별도의 보안 이상 징후나 protocol mismatch는 `security_event`를 통해 Security audit event로 저장한다.
 
-MVP agent는 WebSocket session 안에서 nonce replay guard를 적용한다. Persistent nonce replay store와 장시간 live streaming은 후속 hardening 범위다.
+MVP agent는 agent data directory의 local file-backed nonce replay store를 사용해 restart 이후에도 consumed nonce를 거부한다. Replay store를 읽거나 기록할 수 없으면 task validation은 fail-closed로 종료되고 task execution으로 이어지지 않는다. 장시간 live streaming은 후속 hardening 범위다.
 
 ## Assignment Lifecycle, Output, and Result
 
@@ -359,7 +579,18 @@ command/runbook 실행 결과는 application log가 아니라 job output storage
     "task_id": "task-1",
     "exit_code": 0,
     "status": "succeeded",
-    "reason": ""
+    "reason": "",
+    "artifacts": [
+      {
+        "artifact_id": "artifact-1",
+        "step_id": "template:template",
+        "destination": "/etc/app.conf",
+        "checksum_sha256": "3f8a286ab667f1b60da3a12c138461dac343cab1eb3928c433a8062a61d417f8",
+        "size_bytes": 5,
+        "retention_class": "rendered_template",
+        "content_bytes": [104, 101, 108, 108, 111]
+      }
+    ]
   }
 }
 ```
@@ -367,6 +598,8 @@ command/runbook 실행 결과는 application log가 아니라 job output storage
 `output_chunk`는 final result가 아니다. Controller는 output chunk를 job output storage에 저장하지만 assignment를 `succeeded` 또는 `failed`로 바꾸지 않는다.
 
 Controller는 `task_result.status`가 있으면 이를 우선 사용한다. `succeeded`는 assignment `succeeded`와 job `success`, `failed`는 assignment `failed`와 job `failed`, `canceled`는 assignment/job `canceled`, `timed_out`은 assignment/job `expired`로 저장한다. 구버전 agent가 `status` 없이 `task_result`를 보내면 `exit_code == 0`은 success, 그 외는 failed로 fallback 처리한다. 이후 multi-agent fanout에서는 job aggregate 계산이 target별 assignment 결과를 기준으로 확장된다.
+
+`task_result.artifacts`는 rendered artifact metadata를 전달한다. `content_bytes`는 optional이다. 구버전 agent처럼 `content_bytes`가 없으면 Controller는 metadata row만 저장하고 retrieval API에서는 body missing으로 처리한다. `content_bytes`가 있으면 Controller는 `size_bytes`, `checksum_sha256`, `retention_class`를 검증한 뒤 `ArtifactStore`에 저장한다. Checksum mismatch, size mismatch, max-size 초과, store failure는 rendered body를 저장하지 않고 protocol/store error로 처리한다. Product log와 audit에는 artifact id, size, checksum prefix, status만 허용하며 destination path, local store path, body bytes, rendered template body, secret value를 남기지 않는다.
 
 이미 `canceled`, `expired`, `failed`, `succeeded`, `rejected` 같은 terminal assignment가 된 뒤에 늦은 `task_result`가 도착하면 Controller는 terminal 상태를 덮어쓰지 않고 `task_result_ignored` audit event만 남긴다. Disconnect나 duplicate session 때문에 늦은 success가 도착해도 canceled job을 success로 바꾸지 않는다.
 

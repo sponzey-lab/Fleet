@@ -38,6 +38,11 @@ assert(index.includes("id=\"agent-detail\""), "index must expose selected agent 
 assert(index.includes("id=\"revoke-agent-key\""), "index must expose agent key revocation");
 assert(index.includes(">Revoke Agent</button>"), "index must label agent revocation by agent");
 assert(index.includes("id=\"transport-warning\""), "index must expose HTTP transport warning");
+assert(index.includes("id=\"signing-rotation-panel\""), "index must expose controller signing surface");
+assert(index.includes("id=\"signing-rotation-status\""), "index must expose signing rotation status");
+assert(index.includes("id=\"refresh-signing-rotation\""), "index must expose signing rotation refresh action");
+assert(index.includes("id=\"staged-trust-bundle-form\""), "index must expose staged trust bundle form");
+assert(index.includes("id=\"staged-trust-bundle-result\""), "index must expose staged trust bundle result");
 assert(index.includes("id=\"refresh-telemetry\""), "index must expose selected agent telemetry refresh");
 assert(index.includes("id=\"facts-chart\""), "index must expose facts trend charts");
 assert(index.includes("id=\"disk-inventory\""), "index must expose disk and mount inventory");
@@ -50,12 +55,23 @@ assert(index.includes("id=\"drift-history\""), "index must expose drift history"
 assert(index.includes("id=\"audit-list\""), "index must expose the audit surface");
 assert(index.includes("id=\"run-command-form\""), "index must expose command execution");
 assert(index.includes('value="uptime"'), "run command form must default to a safe probe command");
+assert(index.includes("id=\"command-selector\""), "run command form must expose selector input");
+assert(index.includes("id=\"preview-command-targets\""), "run command form must expose target preview action");
+assert(index.includes("id=\"command-target-preview\""), "run command form must expose target preview result");
 assert(index.includes("id=\"job-targets\""), "index must expose target assignment table");
+assert(index.includes("id=\"job-artifacts\""), "index must expose rendered artifact list");
 assert(index.includes("id=\"job-output\""), "index must expose job output");
 assert(index.includes("Run a command or select a job"), "job output placeholder must not look like a completed empty result");
 assert(index.includes("id=\"jobs-list\""), "index must expose job history");
 assert(index.includes("id=\"approvals-list\""), "index must expose approval queue");
+assert(index.includes("id=\"remediations-list\""), "index must expose remediation queue");
+assert(index.includes("id=\"remediation-form\""), "index must expose remediation action form");
+assert(index.includes("id=\"remediation-runbook-document\""), "remediation approve form must expose request-only runbook input");
+assert(index.includes("id=\"remediation-result\""), "index must expose remediation action result");
 assert(index.includes("id=\"runbook-form\""), "index must expose runbook job form");
+assert(index.includes("id=\"runbook-selector\""), "runbook form must expose selector input");
+assert(index.includes("id=\"preview-runbook-targets\""), "runbook form must expose target preview action");
+assert(index.includes("id=\"runbook-target-preview\""), "runbook form must expose target preview result");
 assert(index.includes("id=\"runbook-result\""), "index must expose runbook result status");
 assert(index.includes("id=\"policy-form\""), "index must expose policy save form");
 assert(index.includes("id=\"policies-list\""), "index must expose policy list");
@@ -73,12 +89,18 @@ assert(styles.includes(".layout"), "styles must include the admin layout");
 assert(styles.includes(".warning-banner"), "styles must include HTTP warning banner");
 assert(styles.includes(".snapshot-time"), "styles must include snapshot time metadata");
 assert(styles.includes(".data-table"), "styles must include tabular assignment/inventory views");
+assert(styles.includes(".artifact-list"), "styles must include artifact list styling");
+assert(styles.includes(".signing-grid"), "styles must include signing status grid styling");
+assert(styles.includes(".signing-form"), "styles must include staged signing form styling");
+assert(styles.includes(".target-preview"), "styles must include selector preview surface");
+assert(styles.includes(".preview-warning"), "styles must include selector preview warnings");
 assert(styles.includes(".approval-row"), "styles must include approval queue rows");
 assert(styles.includes(".chart-grid"), "styles must include telemetry chart grid");
 assert(styles.includes(".sparkline"), "styles must include telemetry sparkline styling");
 assert(app.includes("./api-client.js"), "app must use the shared API client");
 assert(app.includes("handleAgentsListClick"), "app must use delegated agent selection handling");
 assert(app.includes("TELEMETRY_PAGE_LIMIT"), "app must fetch bounded telemetry history pages");
+assert(app.includes("Loading selector preview"), "app must render an explicit selector preview loading state");
 assert(
   !app.includes('querySelectorAll("[data-agent-id]")'),
   "app must not attach per-render agent button handlers",
@@ -101,14 +123,24 @@ for (const endpoint of [
   "listAgentPolicies",
   "listDueScheduledDrift",
   "revokeAgentKey",
+  "getControllerSigningRotationStatus",
+  "stageControllerSigningTrustBundle",
   "listJobs",
   "listApprovals",
   "approveApproval",
   "rejectApproval",
   "expireApprovals",
+  "listRemediations",
+  "getRemediation",
+  "createRemediationApprovalRequest",
+  "approveRemediationJob",
+  "markRemediationRunning",
+  "recordRemediationResult",
+  "verifyRemediation",
   "previewSelector",
   "getJob",
   "getJobOutput",
+  "getJobArtifact",
   "cancelJob",
   "listAudit",
   "listEnrollmentTokens",
@@ -147,6 +179,9 @@ const {
   parseCommandArgs,
   buildCommandJobRequest,
   buildRunbookJobRequest,
+  buildSelectorPreviewRequest,
+  renderSelectorPreview,
+  selectorPreviewSelectedCount,
   buildPolicySaveRequest,
   buildPolicyAssignmentRequest,
   buildPolicyScheduleRequest,
@@ -156,10 +191,14 @@ const {
   renderJobOutputStatus,
   renderJobOutputAfterPolling,
   renderJobTargetTable,
+  renderJobArtifacts,
+  renderArtifactBody,
   jobStatusMessage,
   isTerminalJob,
   isApprovalPendingJob,
   approvalDecisionJobToPoll,
+  renderRemediations,
+  renderRemediationActionResult,
   pollJobOutputOnce,
   renderJobs,
   renderApprovals,
@@ -169,6 +208,9 @@ const {
   renderEnrollmentTokens,
   renderCreatedEnrollmentToken,
   buildEnrollmentTokenRequest,
+  renderControllerSigningRotationStatus,
+  buildStagedTrustBundleRequest,
+  renderStagedTrustBundleResult,
   formatUnixMillis,
   renderTelemetryCharts,
   recentSnapshots,
@@ -212,14 +254,35 @@ await client.schedulePolicyDrift("policy/1", { agent_id: "agent/1", interval_sec
 await client.listAgentPolicies("agent/1");
 await client.listDueScheduledDrift();
 await client.revokeAgentKey("agent/1");
+await client.getControllerSigningRotationStatus();
+await client.stageControllerSigningTrustBundle({
+  previous_public_key_path: "/var/lib/sponzey-fleet/controller/controller_public.key.bak",
+  agent_ids: ["agent-1"],
+  batch_size: 1,
+  max_failures: 1,
+  ack_timeout_seconds: 30,
+});
 await client.listJobs();
 await client.listApprovals("pending");
 await client.approveApproval("approval/1", { actor: "manager-1", reason: "ok" });
 await client.rejectApproval("approval/2", { actor: "manager-1", reason: "not ok" });
 await client.expireApprovals();
+await client.listRemediations({ agentId: "agent/1", policyId: "nginx running", limit: 10 });
+await client.getRemediation("remediation/1");
+await client.createRemediationApprovalRequest("remediation/1", { approval_id: "approval-1" });
+await client.approveRemediationJob("remediation/1", { approval_id: "approval-1", job_id: "job-1" });
+await client.markRemediationRunning("remediation/1", { job_id: "job-1" });
+await client.recordRemediationResult("remediation/1", { job_id: "job-1", status: "succeeded" });
+await client.verifyRemediation("remediation/1", {
+  agent_id: "agent/1",
+  policy_id: "nginx-running",
+  policy_name: "nginx-running",
+  job_id: "job-1",
+});
 await client.previewSelector({ matchLabels: { role: "web" } });
 await client.getJob("job/1");
 await client.getJobOutput("job/1");
+await client.getJobArtifact("job/1", "artifact/1");
 await client.cancelJob("job/1", { reason: "operator requested cancel" });
 await client.listAudit();
 await client.listEnrollmentTokens();
@@ -282,6 +345,23 @@ assert(
   findCall("/api/agents/agent%2F1/revoke-key", "POST").options.method === "POST",
   "client must POST agent key revocation",
 );
+assert(
+  findCall("/api/controller/signing-rotation/status"),
+  "client must call signing rotation status endpoint",
+);
+assert(
+  findCall("/api/controller/signing-rotation/rollout-trust-bundle/staged", "POST"),
+  "client must call staged signing rollout endpoint",
+);
+assert(
+  findCall("/api/controller/signing-rotation/rollout-trust-bundle/staged", "POST").options.method === "POST",
+  "client must POST staged signing rollout ticks",
+);
+assert(
+  JSON.parse(findCall("/api/controller/signing-rotation/rollout-trust-bundle/staged", "POST").options.body)
+    .batch_size === 1,
+  "client must serialize staged signing rollout body",
+);
 assert(findCall("/api/jobs"), "client must call jobs list endpoint");
 assert(findCall("/api/approvals?status=pending"), "client must call filtered approvals endpoint");
 assert(
@@ -301,8 +381,37 @@ assert(
   "client must POST rejection decisions",
 );
 assert(findCall("/api/approvals/expire", "POST"), "client must call approval expiry endpoint");
+assert(
+  findCall("/api/remediations?agent_id=agent%2F1&policy_id=nginx+running&limit=10"),
+  "client must call filtered remediation list endpoint",
+);
+assert(
+  findCall("/api/remediations/remediation%2F1"),
+  "client must encode remediation ids in detail paths",
+);
+assert(
+  findCall("/api/remediations/remediation%2F1/approval-request", "POST"),
+  "client must POST remediation approval requests",
+);
+assert(
+  findCall("/api/remediations/remediation%2F1/approve", "POST"),
+  "client must POST remediation job approval",
+);
+assert(
+  findCall("/api/remediations/remediation%2F1/running", "POST"),
+  "client must POST remediation running transitions",
+);
+assert(
+  findCall("/api/remediations/remediation%2F1/result", "POST"),
+  "client must POST remediation result",
+);
+assert(
+  findCall("/api/remediations/remediation%2F1/verify", "POST"),
+  "client must POST remediation verification",
+);
 assert(findCall("/api/jobs/job%2F1"), "client must call job detail endpoint");
 assert(findCall("/api/jobs/job%2F1/output"), "client must call job output endpoint");
+assert(findCall("/api/jobs/job%2F1/artifacts/artifact%2F1"), "client must call encoded artifact endpoint");
 assert(findCall("/api/jobs/job%2F1/cancel", "POST"), "client must call job cancel endpoint");
 assert(findCall("/api/jobs/job%2F1/cancel", "POST").options.method === "POST", "client must POST job cancel");
 assert(findCall("/api/audit"), "client must call audit endpoint");
@@ -436,9 +545,17 @@ const detailHtml = renderAgentDetail({
   os: "linux",
   arch: "x86_64",
   assigned_policy_ids: ["nginx-running"],
+  capabilities: ["persistent_session", "command_execution"],
+  capability_reported_at_ms: 2000,
 });
 assert(detailHtml.includes("Assigned policies"), "agent detail must include policy assignment summary");
 assert(detailHtml.includes("nginx-running"), "agent detail must render assigned policy ids");
+assert(detailHtml.includes("Capabilities"), "agent detail must include capability summary");
+assert(detailHtml.includes("command_execution"), "agent detail must render reported capabilities");
+assert(
+  detailHtml.includes("1970-01-01T00:00:02.000Z"),
+  "agent detail must render capability reported time",
+);
 
 const factsText = renderSnapshot(
   {
@@ -593,6 +710,79 @@ const auditHtml = renderAudit([
   { category: "security", action: "invalid_signature", actor: "system", target: "agent-1", value_kind: "redacted", value: "redacted" },
 ]);
 assert(auditHtml.includes("invalid_signature"), "audit renderer must include event action");
+const signingStatusHtml = renderControllerSigningRotationStatus({
+  controller_id: "default-controller",
+  persisted_record_present: true,
+  persisted_state: "dual_trust_active",
+  readiness: "dual_trust_active_agents_migrating",
+  active_signing_fingerprint_prefix: "new-fp-12345678",
+  selected_signing_fingerprint_prefix: "new-fp-12345678",
+  old_fingerprint_prefix: "old-fp-12345678",
+  new_fingerprint_prefix: "new-fp-12345678",
+  requested_at_ms: 1000,
+  validated_at_ms: 2000,
+  activated_at_ms: 3000,
+  old_key_verifies_until_ms: 4000,
+  retired_at_ms: null,
+  failed_at_ms: null,
+  bootstrap_guard: "active_matches_selected",
+  agent_trust_rollout: "agents_migrating",
+  previous_public_key_path: "/var/lib/sponzey-fleet/controller/controller_public.key.bak",
+  controller_public_key: "-----BEGIN PUBLIC KEY-----secret-marker",
+  admin_token: "admin-token-secret",
+});
+assert(signingStatusHtml.includes("dual_trust_active"), "signing status must render persisted state");
+assert(signingStatusHtml.includes("agents_migrating"), "signing status must render agent rollout state");
+assert(signingStatusHtml.includes("new-fp-12345678"), "signing status must render fingerprint prefixes");
+assert(!signingStatusHtml.includes("BEGIN PUBLIC KEY"), "signing status must not render key bodies");
+assert(!signingStatusHtml.includes("controller_public.key.bak"), "signing status must not render local key paths");
+assert(!signingStatusHtml.includes("admin-token-secret"), "signing status must not render admin tokens");
+const stagedRequest = buildStagedTrustBundleRequest({
+  previousPublicKeyPath: " /var/lib/sponzey-fleet/controller/controller_public.key.bak ",
+  agentIds: "agent-1, agent-2\nagent-3",
+  batchSize: "2",
+  maxFailures: "1",
+  ackTimeoutSeconds: "30",
+});
+assert(stagedRequest.previous_public_key_path?.endsWith("controller_public.key.bak"), "staged request must trim previous public key path");
+assert(stagedRequest.agent_ids.length === 3, "staged request must parse explicit agent ids");
+assert(stagedRequest.batch_size === 2, "staged request must parse batch size");
+assert(stagedRequest.max_failures === 1, "staged request must parse max failures");
+assert(stagedRequest.ack_timeout_seconds === 30, "staged request must parse ack timeout");
+let invalidStagedRequestFailed = false;
+try {
+  buildStagedTrustBundleRequest({ batchSize: "0", maxFailures: "0", ackTimeoutSeconds: "30" });
+} catch {
+  invalidStagedRequestFailed = true;
+}
+assert(invalidStagedRequestFailed, "staged request must reject invalid batch size");
+const stagedResultHtml = renderStagedTrustBundleResult({
+  controller_id: "default-controller",
+  persisted_state: "dual_trust_active",
+  rollout_state: "waiting_for_ack",
+  target_count: 3,
+  planned_count: 1,
+  attempted_count: 1,
+  updated_count: 1,
+  skipped_count: 1,
+  failed_count: 0,
+  already_current_count: 1,
+  unavailable_count: 0,
+  pending_count: 1,
+  entries_count: 2,
+  current_fingerprint_prefix: "new-fp-12345678",
+  previous_fingerprint_prefix: "old-fp-12345678",
+  agent_results: [{ agent_id: "agent-2", status: "sent" }],
+  previous_public_key_path: "/var/lib/sponzey-fleet/controller/controller_public.key.bak",
+  controller_public_key: "-----BEGIN PUBLIC KEY-----secret-marker",
+  admin_token: "admin-token-secret",
+});
+assert(stagedResultHtml.includes("waiting_for_ack"), "staged result must render rollout state");
+assert(stagedResultHtml.includes("agent-2"), "staged result must render agent result ids");
+assert(stagedResultHtml.includes("sent"), "staged result must render agent result status");
+assert(!stagedResultHtml.includes("BEGIN PUBLIC KEY"), "staged result must not render key bodies");
+assert(!stagedResultHtml.includes("controller_public.key.bak"), "staged result must not render local key paths");
+assert(!stagedResultHtml.includes("admin-token-secret"), "staged result must not render admin tokens");
 const jobsHtml = renderJobs([
   {
     id: "job-1",
@@ -633,6 +823,40 @@ assert(jobsHtml.includes("uptime -a"), "job renderer must include command summar
 assert(jobsHtml.includes("delivered"), "job renderer must include controller dispatch state");
 assert(jobsHtml.includes("1 target(s), 1 connected"), "job renderer must use API target connection state");
 assert(jobsHtml.includes("1 started"), "job renderer must include per-target assignment state");
+const artifactsHtml = renderJobArtifacts({
+  id: "job-1",
+  rendered_artifacts: [
+    {
+      artifact_id: "artifact-1",
+      task_id: "task-1",
+      agent_id: "agent-1",
+      retention_class: "rendered_template",
+      checksum_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      size_bytes: 13,
+      destination: "/etc/secret.conf",
+      content_bytes: [115, 101, 99, 114, 101, 116],
+    },
+  ],
+});
+assert(artifactsHtml.includes("artifact-1"), "artifact renderer must include artifact id");
+assert(artifactsHtml.includes("aaaaaaaaaaaa"), "artifact renderer must include checksum prefix");
+assert(artifactsHtml.includes("Open"), "artifact renderer must include retrieval action");
+assert(!artifactsHtml.includes("/etc/secret.conf"), "artifact renderer must not show destination path");
+assert(!artifactsHtml.includes("secret"), "artifact renderer must not show rendered body");
+const artifactBody = renderArtifactBody({
+  job_id: "job-1",
+  artifact_id: "artifact-1",
+  task_id: "task-1",
+  agent_id: "agent-1",
+  retention_class: "rendered_template",
+  checksum_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  size_bytes: 5,
+  content_bytes: [104, 101, 108, 108, 111],
+});
+assert(artifactBody.includes("Artifact: artifact-1"), "artifact body renderer must identify artifact");
+assert(artifactBody.includes("Preview:"), "artifact body renderer must show printable preview");
+assert(artifactBody.includes("hello"), "artifact body renderer must render printable content");
+assert(!artifactBody.includes("/etc/"), "artifact body renderer must not include local paths");
 const targetTableHtml = renderJobTargetTable({
   target_agents: [
     {
@@ -677,6 +901,43 @@ assert(approvalsHtml.includes("job-approval-1"), "approval queue must include jo
 assert(approvalsHtml.includes("agent-1:queued"), "approval queue must include target snapshot summary");
 assert(approvalsHtml.includes("Approve"), "approval queue must expose approve action");
 assert(approvalsHtml.includes("Reject"), "approval queue must expose reject action");
+const remediationHtml = renderRemediations([
+  {
+    id: "rem-1",
+    policy_id: "nginx-running",
+    policy_name: "nginx-running",
+    agent_id: "agent-1",
+    runbook_ref: "runbooks/remediate.yml",
+    status: "proposed",
+    risk_summary: "drifted policy requires approved remediation",
+    job_id: null,
+    updated_at_ms: 2000,
+    runbook_document: "kind: Runbook\n# secret-value-should-not-leak",
+    command_output: "secret-value-should-not-leak",
+  },
+], "rem-1");
+assert(remediationHtml.includes("rem-1") || remediationHtml.includes("nginx-running"), "remediation list must render metadata");
+assert(remediationHtml.includes("selected"), "remediation list must mark selected row");
+assert(remediationHtml.includes("runbooks/remediate.yml"), "remediation list must render runbook ref");
+assert(!remediationHtml.includes("kind: Runbook"), "remediation list must not render raw runbook body");
+assert(!remediationHtml.includes("secret-value-should-not-leak"), "remediation list must not render secret marker");
+const remediationResult = renderRemediationActionResult({
+  remediation: {
+    id: "rem-1",
+    policy_id: "nginx-running",
+    agent_id: "agent-1",
+    runbook_ref: "runbooks/remediate.yml",
+    status: "job_created",
+    job_id: "job-rem-1",
+    runbook_document: "kind: Runbook\n# secret-value-should-not-leak",
+  },
+  approval: { id: "approval-1", status: "approved" },
+  assignment_count: 1,
+});
+assert(remediationResult.includes("remediation_id=rem-1"), "remediation action result must include id");
+assert(remediationResult.includes("approval_id=approval-1"), "remediation action result must include approval id");
+assert(!remediationResult.includes("kind: Runbook"), "remediation action result must not render raw runbook body");
+assert(!remediationResult.includes("secret-value-should-not-leak"), "remediation action result must not render secret marker");
 const policiesHtml = renderPolicies([{ id: "nginx-running", name: "nginx-running", version: 2 }], "nginx-running");
 assert(policiesHtml.includes("selected"), "policy list must mark selected policy");
 assert(policiesHtml.includes("v2"), "policy list must show policy version");
@@ -747,6 +1008,15 @@ const jobRequest = buildCommandJobRequest({
 assert(jobRequest.confirmed_high_risk, "job request must include high-risk confirmation");
 assert(jobRequest.target_agent_ids.includes("agent-1"), "job request must target selected agent");
 assert(jobRequest.expires_in_seconds === 300, "command jobs must leave enough time for approval");
+const selectorJobRequest = buildCommandJobRequest({
+  agentId: "",
+  selector: " role=web ",
+  program: "uptime",
+  args: "",
+  confirmed: true,
+});
+assert(selectorJobRequest.selector === "role=web", "selector command requests must trim selector input");
+assert(selectorJobRequest.target_agent_ids.length === 0, "selector command requests must not duplicate target ids");
 const runbookRequest = buildRunbookJobRequest({
   agentId: "agent-1",
   document: "apiVersion: fleet.sponzey.dev/v1alpha1\nkind: Runbook\nsteps: []",
@@ -754,6 +1024,47 @@ const runbookRequest = buildRunbookJobRequest({
 });
 assert(runbookRequest.runbook_document.includes("Runbook"), "runbook request must include document");
 assert(runbookRequest.target_agent_ids.includes("agent-1"), "runbook request must target selected agent");
+const selectorRunbookRequest = buildRunbookJobRequest({
+  agentId: "",
+  selector: " label:role=web ",
+  document: "apiVersion: fleet.sponzey.dev/v1alpha1\nkind: Runbook\nsteps: []",
+  confirmed: true,
+});
+assert(selectorRunbookRequest.selector === "label:role=web", "selector runbook requests must trim selector input");
+assert(selectorRunbookRequest.target_agent_ids.length === 0, "selector runbook requests must not duplicate target ids");
+const selectorPreviewRequest = buildSelectorPreviewRequest({ selector: " role=web " });
+assert(selectorPreviewRequest.selector === "role=web", "selector preview requests must trim selector input");
+const selectorPreviewHtml = renderSelectorPreview({
+  matched_count: 2,
+  selected_count: 1,
+  disabled_count: 1,
+  offline_count: 0,
+  warnings: [{ code: "disabled_agents_excluded", message: "1 disabled agent was excluded" }],
+  agents: [
+    {
+      agent_id: "agent-1",
+      name: "web-01",
+      status: "online",
+      labels: [{ key: "role", value: "web" }],
+      selected_for_dispatch: true,
+    },
+    {
+      agent_id: "agent-2",
+      name: "web-02",
+      status: "disabled",
+      labels: [{ key: "role", value: "web" }],
+      selected_for_dispatch: false,
+    },
+  ],
+});
+assert(selectorPreviewHtml.includes("Matched"), "selector preview must render matched count");
+assert(selectorPreviewHtml.includes("Selected"), "selector preview must render selected count");
+assert(selectorPreviewHtml.includes("Disabled"), "selector preview must render disabled count");
+assert(selectorPreviewHtml.includes("1 disabled agent was excluded"), "selector preview must render warnings");
+assert(selectorPreviewHtml.includes("role=web"), "selector preview must render agent labels from the API response");
+assert(selectorPreviewHtml.includes("selected"), "selector preview must show dispatch selection from the API response");
+assert(selectorPreviewHtml.includes("excluded"), "selector preview must show excluded matches from the API response");
+assert(selectorPreviewSelectedCount({ selected_count: 2 }) === 2, "selector preview helper must read selected count");
 assert(buildPolicySaveRequest({ source: "kind: Policy" }).source === "kind: Policy", "policy save request must trim source");
 assert(
   buildPolicyAssignmentRequest({ policyId: "policy-1", agentId: "agent-1" }).agent_id === "agent-1",

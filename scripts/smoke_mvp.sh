@@ -234,6 +234,6 @@ case "$RUNBOOK_JOB_API:$RUNBOOK_OUTPUT_API" in
     ;;
 esac
 
-"$BIN" retention cleanup --data-dir "$WORK_DIR" --older-than-days 0 --dry-run
+"$BIN" retention cleanup --data-dir "$WORK_DIR" --older-than-days 1 --dry-run
 
 echo "smoke ok"

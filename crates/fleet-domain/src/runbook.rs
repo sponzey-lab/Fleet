@@ -1,4 +1,4 @@
-use crate::{Selector, SelectorError};
+use crate::{SecretRef, SecretRefError, Selector, SelectorError};
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 
@@ -36,6 +36,7 @@ pub enum RunbookTask {
     Package(PackagePrimitive),
     Service(ServicePrimitive),
     FileCopy(FileCopyPrimitive),
+    FileTemplate(FileTemplatePrimitive),
     PortCheck(PortCheckPrimitive),
     ProcessCheck(ProcessCheckPrimitive),
     FactsCollect(FactsCollectPrimitive),
@@ -74,6 +75,94 @@ pub struct FileCopyPrimitive {
     pub dest: String,
     pub content: String,
     pub mode: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileTemplatePrimitive {
+    pub id: String,
+    pub dest: String,
+    pub content: String,
+    pub mode: Option<String>,
+    pub variables: BTreeMap<String, TemplateVariableValue>,
+    pub checksum: TemplateChecksumPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TemplateVariableValue {
+    Plain(String),
+    SecretRef(SecretRef),
+}
+
+impl TemplateVariableValue {
+    pub fn redacted_kind(&self) -> &'static str {
+        match self {
+            Self::Plain(_) => "plain",
+            Self::SecretRef(_) => "secret_ref",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TemplateChecksumPolicy {
+    Sha256,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TemplateRenderError {
+    MissingVariable {
+        key: String,
+    },
+    SecretRefRequiresProvider {
+        key: String,
+    },
+    SecretRefResolutionFailed {
+        key: String,
+        reason: TemplateSecretResolutionFailure,
+    },
+    UnsupportedExpression(String),
+    UnclosedExpression,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TemplateSecretResolutionFailure {
+    NotFound,
+    Denied,
+    Provider,
+}
+
+impl Display for TemplateRenderError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingVariable { key } => {
+                write!(formatter, "missing template variable: {key}")
+            }
+            Self::SecretRefRequiresProvider { key } => {
+                write!(formatter, "secret variable requires provider: {key}")
+            }
+            Self::SecretRefResolutionFailed { key, reason } => {
+                write!(
+                    formatter,
+                    "secret variable resolution failed for {key}: {reason}"
+                )
+            }
+            Self::UnsupportedExpression(expression) => {
+                write!(formatter, "unsupported template expression: {expression}")
+            }
+            Self::UnclosedExpression => write!(formatter, "unclosed template expression"),
+        }
+    }
+}
+
+impl std::error::Error for TemplateRenderError {}
+
+impl Display for TemplateSecretResolutionFailure {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => write!(formatter, "not_found"),
+            Self::Denied => write!(formatter, "denied"),
+            Self::Provider => write!(formatter, "provider_error"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,11 +207,15 @@ pub enum RunbookParseError {
     UnsupportedPackageState(String),
     UnsupportedServiceState(String),
     UnsupportedSnapshotScope(String),
+    UnsupportedTemplateChecksum(String),
     InvalidPort(String),
     InvalidSelector(String),
     InvalidYaml(String),
     InvalidBoolean { field: &'static str, value: String },
     InvalidStrategy { field: &'static str, value: String },
+    InvalidTemplateVariableKey(String),
+    InvalidTemplateVariablePair(String),
+    InvalidTemplateSecretRef { key: String, reason: SecretRefError },
     UnsafeFileDestination(String),
 }
 
@@ -155,6 +248,12 @@ impl Display for RunbookParseError {
             Self::UnsupportedSnapshotScope(scope) => {
                 write!(formatter, "unsupported snapshot scope: {scope}")
             }
+            Self::UnsupportedTemplateChecksum(checksum) => {
+                write!(
+                    formatter,
+                    "unsupported template checksum policy: {checksum}"
+                )
+            }
             Self::InvalidPort(value) => write!(formatter, "invalid port value: {value}"),
             Self::InvalidSelector(selector) => {
                 write!(formatter, "invalid runbook selector: {selector}")
@@ -165,6 +264,18 @@ impl Display for RunbookParseError {
             }
             Self::InvalidStrategy { field, value } => {
                 write!(formatter, "invalid strategy value for {field}: {value}")
+            }
+            Self::InvalidTemplateVariableKey(key) => {
+                write!(formatter, "invalid template variable key: {key}")
+            }
+            Self::InvalidTemplateVariablePair(pair) => {
+                write!(formatter, "invalid template variable pair: {pair}")
+            }
+            Self::InvalidTemplateSecretRef { key, reason } => {
+                write!(
+                    formatter,
+                    "invalid template secret reference for {key}: {reason}"
+                )
             }
             Self::UnsafeFileDestination(path) => {
                 write!(formatter, "unsafe file destination: {path}")
@@ -212,6 +323,7 @@ pub fn runbook_schema_json() -> &'static str {
           {"required": ["id", "package"]},
           {"required": ["id", "service"]},
           {"required": ["id", "file.copy"]},
+          {"required": ["id", "file.template"]},
           {"required": ["id", "port.check"]},
           {"required": ["id", "process.check"]},
           {"required": ["id", "facts.collect"]},
@@ -262,6 +374,7 @@ pub fn runbook_schema_json() -> &'static str {
               {"required": ["id", "package"]},
               {"required": ["id", "service"]},
               {"required": ["id", "file.copy"]},
+              {"required": ["id", "file.template"]},
               {"required": ["id", "port.check"]},
               {"required": ["id", "process.check"]},
               {"required": ["id", "facts.collect"]},
@@ -520,6 +633,10 @@ pub fn parse_runbook_document(body: &str) -> Result<Runbook, RunbookParseError> 
                 builder.kind = Some("file.copy".to_owned());
                 continue;
             }
+            if line == "file.template:" {
+                builder.kind = Some("file.template".to_owned());
+                continue;
+            }
             if line == "port.check:" {
                 builder.kind = Some("port.check".to_owned());
                 continue;
@@ -710,6 +827,41 @@ impl TaskBuilder {
                     mode: self.fields.get("mode").cloned(),
                 }))
             }
+            Some("file.template") => {
+                self.reject_unknown_fields(&[
+                    "dest",
+                    "content",
+                    "mode",
+                    "variables",
+                    "secretRefs",
+                    "checksum",
+                ])?;
+                let dest = required_field(&self.fields, "dest", "file.template.dest")?;
+                validate_file_destination(&dest)?;
+                let mut variables = BTreeMap::new();
+                if let Some(value) = self.fields.get("variables") {
+                    parse_template_variable_pairs(
+                        value,
+                        TemplateVariableKind::Plain,
+                        &mut variables,
+                    )?;
+                }
+                if let Some(value) = self.fields.get("secretRefs") {
+                    parse_template_variable_pairs(
+                        value,
+                        TemplateVariableKind::SecretRef,
+                        &mut variables,
+                    )?;
+                }
+                Ok(RunbookTask::FileTemplate(FileTemplatePrimitive {
+                    id: self.id,
+                    dest,
+                    content: required_field(&self.fields, "content", "file.template.content")?,
+                    mode: self.fields.get("mode").cloned(),
+                    variables,
+                    checksum: parse_template_checksum(self.fields.get("checksum"))?,
+                }))
+            }
             Some("port.check") => {
                 self.reject_unknown_fields(&["host", "port"])?;
                 Ok(RunbookTask::PortCheck(PortCheckPrimitive {
@@ -802,6 +954,177 @@ fn parse_snapshot_scope(value: Option<&String>) -> Result<SnapshotScope, Runbook
             scope.to_owned(),
         )),
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TemplateVariableKind {
+    Plain,
+    SecretRef,
+}
+
+fn parse_template_variable_pairs(
+    value: &str,
+    kind: TemplateVariableKind,
+    output: &mut BTreeMap<String, TemplateVariableValue>,
+) -> Result<(), RunbookParseError> {
+    let value = clean_scalar(value);
+    if value.is_empty() {
+        return Ok(());
+    }
+    for pair in value
+        .split(',')
+        .map(str::trim)
+        .filter(|pair| !pair.is_empty())
+    {
+        let Some((key, raw_value)) = pair.split_once('=') else {
+            return Err(RunbookParseError::InvalidTemplateVariablePair(
+                pair.to_owned(),
+            ));
+        };
+        let key = key.trim();
+        validate_template_variable_key(key)?;
+        let raw_value = raw_value.trim();
+        if raw_value.is_empty() {
+            return Err(RunbookParseError::InvalidTemplateVariablePair(
+                pair.to_owned(),
+            ));
+        }
+        let value = match kind {
+            TemplateVariableKind::Plain => TemplateVariableValue::Plain(raw_value.to_owned()),
+            TemplateVariableKind::SecretRef => {
+                TemplateVariableValue::SecretRef(SecretRef::parse(raw_value).map_err(|reason| {
+                    RunbookParseError::InvalidTemplateSecretRef {
+                        key: key.to_owned(),
+                        reason,
+                    }
+                })?)
+            }
+        };
+        if output.insert(key.to_owned(), value).is_some() {
+            return Err(RunbookParseError::InvalidTemplateVariablePair(format!(
+                "duplicate key {key}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_template_variable_key(key: &str) -> Result<(), RunbookParseError> {
+    let mut chars = key.chars();
+    let Some(first) = chars.next() else {
+        return Err(RunbookParseError::InvalidTemplateVariableKey(
+            key.to_owned(),
+        ));
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return Err(RunbookParseError::InvalidTemplateVariableKey(
+            key.to_owned(),
+        ));
+    }
+    if !chars.all(|character| character == '_' || character.is_ascii_alphanumeric()) {
+        return Err(RunbookParseError::InvalidTemplateVariableKey(
+            key.to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_template_checksum(
+    value: Option<&String>,
+) -> Result<TemplateChecksumPolicy, RunbookParseError> {
+    match value
+        .map(|value| clean_scalar(value))
+        .as_deref()
+        .unwrap_or("sha256")
+    {
+        "sha256" => Ok(TemplateChecksumPolicy::Sha256),
+        value => Err(RunbookParseError::UnsupportedTemplateChecksum(
+            value.to_owned(),
+        )),
+    }
+}
+
+pub fn render_template_content(
+    template: &str,
+    variables: &BTreeMap<String, TemplateVariableValue>,
+) -> Result<String, TemplateRenderError> {
+    render_template_content_internal(
+        template,
+        variables,
+        None::<fn(&SecretRef) -> Result<String, TemplateSecretResolutionFailure>>,
+    )
+}
+
+pub fn render_template_content_with_secret_resolver(
+    template: &str,
+    variables: &BTreeMap<String, TemplateVariableValue>,
+    mut resolve_secret: impl FnMut(&SecretRef) -> Result<String, TemplateSecretResolutionFailure>,
+) -> Result<String, TemplateRenderError> {
+    render_template_content_internal(template, variables, Some(&mut resolve_secret))
+}
+
+fn render_template_content_internal(
+    template: &str,
+    variables: &BTreeMap<String, TemplateVariableValue>,
+    mut resolve_secret: Option<
+        impl FnMut(&SecretRef) -> Result<String, TemplateSecretResolutionFailure>,
+    >,
+) -> Result<String, TemplateRenderError> {
+    let mut rendered = String::with_capacity(template.len());
+    let mut remainder = template;
+    while let Some(start) = remainder.find("{{") {
+        rendered.push_str(&remainder[..start]);
+        let expression_start = start + 2;
+        let Some(end) = remainder[expression_start..].find("}}") else {
+            return Err(TemplateRenderError::UnclosedExpression);
+        };
+        let expression_end = expression_start + end;
+        let expression = remainder[expression_start..expression_end].trim();
+        validate_template_expression(expression)?;
+        match variables.get(expression) {
+            Some(TemplateVariableValue::Plain(value)) => rendered.push_str(value),
+            Some(TemplateVariableValue::SecretRef(reference)) => {
+                let Some(resolve_secret) = resolve_secret.as_mut() else {
+                    return Err(TemplateRenderError::SecretRefRequiresProvider {
+                        key: expression.to_owned(),
+                    });
+                };
+                let secret = resolve_secret(reference).map_err(|reason| {
+                    TemplateRenderError::SecretRefResolutionFailed {
+                        key: expression.to_owned(),
+                        reason,
+                    }
+                })?;
+                rendered.push_str(&secret);
+            }
+            None => {
+                return Err(TemplateRenderError::MissingVariable {
+                    key: expression.to_owned(),
+                });
+            }
+        }
+        remainder = &remainder[expression_end + 2..];
+    }
+    rendered.push_str(remainder);
+    Ok(rendered)
+}
+
+fn validate_template_expression(expression: &str) -> Result<(), TemplateRenderError> {
+    if expression.is_empty()
+        || expression.starts_with('#')
+        || expression.starts_with('/')
+        || expression.starts_with('^')
+        || expression.starts_with('>')
+        || expression.starts_with('!')
+        || expression.starts_with('&')
+        || expression.starts_with('{')
+    {
+        return Err(TemplateRenderError::UnsupportedExpression(
+            expression.to_owned(),
+        ));
+    }
+    validate_template_variable_key(expression)
+        .map_err(|_| TemplateRenderError::UnsupportedExpression(expression.to_owned()))
 }
 
 #[cfg(test)]
@@ -933,6 +1256,189 @@ steps:
             parse_runbook_document(&unsafe_body),
             Err(RunbookParseError::UnsafeFileDestination(_))
         ));
+    }
+
+    #[test]
+    fn parses_file_template_task_with_plain_and_secret_variables() {
+        let body = r#"
+apiVersion: fleet.sponzey.dev/v1alpha1
+kind: Runbook
+name: file-template
+selector: role=web
+steps:
+  - id: render-nginx
+    file.template:
+      dest: /tmp/nginx.conf
+      content: server_name {{ server_name }};
+      mode: "0644"
+      variables: server_name=example.test,port=8080
+      secretRefs: api_token=secret://nginx/token
+      checksum: sha256
+"#;
+
+        let runbook = parse_runbook_document(body).unwrap();
+
+        assert!(matches!(
+            &runbook.tasks[0],
+            RunbookTask::FileTemplate(task)
+                if task.id == "render-nginx"
+                    && task.dest == "/tmp/nginx.conf"
+                    && task.variables.get("server_name")
+                        == Some(&TemplateVariableValue::Plain("example.test".to_owned()))
+                    && task.variables.get("api_token")
+                        == Some(&TemplateVariableValue::SecretRef(
+                            SecretRef::parse("secret://nginx/token").unwrap()
+                        ))
+                    && task.checksum == TemplateChecksumPolicy::Sha256
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_file_template_fields() {
+        let body = r#"
+apiVersion: fleet.sponzey.dev/v1alpha1
+kind: Runbook
+name: invalid-template
+selector: role=web
+steps:
+  - id: render
+    file.template:
+      dest: /tmp/app.conf
+      content: hello {{ app }}
+      variables: invalid-name=app
+"#;
+
+        assert!(matches!(
+            parse_runbook_document(body),
+            Err(RunbookParseError::InvalidTemplateVariableKey(_))
+        ));
+
+        let unknown_field = body.replace(
+            "variables: invalid-name=app",
+            "variables: app=web\n      include: /etc/passwd",
+        );
+        assert!(matches!(
+            parse_runbook_document(&unknown_field),
+            Err(RunbookParseError::UnknownTaskField { .. })
+        ));
+
+        let unsupported_checksum = body.replace(
+            "variables: invalid-name=app",
+            "checksum: md5\n      variables: app=web",
+        );
+        assert!(matches!(
+            parse_runbook_document(&unsupported_checksum),
+            Err(RunbookParseError::UnsupportedTemplateChecksum(_))
+        ));
+
+        let invalid_secret_ref = body.replace(
+            "variables: invalid-name=app",
+            "secretRefs: api_token=token=raw-secret-value",
+        );
+        let error = parse_runbook_document(&invalid_secret_ref)
+            .expect_err("inline secret material should be rejected");
+        assert!(matches!(
+            error,
+            RunbookParseError::InvalidTemplateSecretRef { .. }
+        ));
+        assert!(!error.to_string().contains("raw-secret-value"));
+    }
+
+    #[test]
+    fn renders_template_with_explicit_plain_variables_only() {
+        let body = r#"
+apiVersion: fleet.sponzey.dev/v1alpha1
+kind: Runbook
+name: render-template
+selector: role=web
+steps:
+  - id: render
+    file.template:
+      dest: /tmp/app.conf
+      content: listen {{ port }} for {{ service_name }}
+      variables: port=8080,service_name=web
+"#;
+        let runbook = parse_runbook_document(body).unwrap();
+        let RunbookTask::FileTemplate(task) = &runbook.tasks[0] else {
+            panic!("expected file.template task");
+        };
+
+        assert_eq!(
+            render_template_content(&task.content, &task.variables).unwrap(),
+            "listen 8080 for web"
+        );
+    }
+
+    #[test]
+    fn rejects_missing_control_and_secret_template_values() {
+        let mut variables = BTreeMap::new();
+        variables.insert(
+            "api_token".to_owned(),
+            TemplateVariableValue::SecretRef(SecretRef::parse("secret://raw-token").unwrap()),
+        );
+
+        assert!(matches!(
+            render_template_content("token={{ api_token }}", &variables),
+            Err(TemplateRenderError::SecretRefRequiresProvider { key }) if key == "api_token"
+        ));
+        assert!(matches!(
+            render_template_content("port={{ missing_port }}", &variables),
+            Err(TemplateRenderError::MissingVariable { key }) if key == "missing_port"
+        ));
+        assert!(matches!(
+            render_template_content("{{#each servers}}x{{/each}}", &variables),
+            Err(TemplateRenderError::UnsupportedExpression(_))
+        ));
+    }
+
+    #[test]
+    fn renders_template_with_explicit_secret_resolver() {
+        let mut variables = BTreeMap::new();
+        variables.insert(
+            "api_token".to_owned(),
+            TemplateVariableValue::SecretRef(SecretRef::parse("secret://app/token").unwrap()),
+        );
+        variables.insert(
+            "host".to_owned(),
+            TemplateVariableValue::Plain("example.test".to_owned()),
+        );
+
+        let rendered = render_template_content_with_secret_resolver(
+            "host={{ host }} token={{ api_token }}",
+            &variables,
+            |reference| {
+                assert_eq!(reference.as_str(), "secret://app/token");
+                Ok("resolved-secret-value".to_owned())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(rendered, "host=example.test token=resolved-secret-value");
+    }
+
+    #[test]
+    fn secret_resolver_errors_are_typed_and_redacted() {
+        let mut variables = BTreeMap::new();
+        variables.insert(
+            "api_token".to_owned(),
+            TemplateVariableValue::SecretRef(SecretRef::parse("secret://app/token").unwrap()),
+        );
+
+        let error = render_template_content_with_secret_resolver(
+            "token={{ api_token }}",
+            &variables,
+            |_| Err(TemplateSecretResolutionFailure::Denied),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            TemplateRenderError::SecretRefResolutionFailed {
+                ref key,
+                reason: TemplateSecretResolutionFailure::Denied
+            } if key == "api_token"
+        ));
+        assert!(!error.to_string().contains("secret://app/token"));
     }
 
     #[test]
@@ -1080,6 +1586,7 @@ steps:
         assert!(schema.contains("\"dryRun\""));
         assert!(schema.contains("\"steps\""));
         assert!(schema.contains("\"matchLabels\""));
+        assert!(schema.contains("\"file.template\""));
         assert!(schema.contains("\"port.check\""));
         assert!(schema.contains("\"metrics.snapshot\""));
         assert!(!schema.contains("ansible"));

@@ -16,6 +16,21 @@ function pageQuery({ limit, before } = {}) {
   return query ? `?${query}` : "";
 }
 
+function remediationQuery({ agentId, policyId, limit } = {}) {
+  const params = new URLSearchParams();
+  if (agentId) {
+    params.set("agent_id", String(agentId));
+  }
+  if (policyId) {
+    params.set("policy_id", String(policyId));
+  }
+  if (limit !== undefined && limit !== null && limit !== "") {
+    params.set("limit", String(limit));
+  }
+  const query = params.toString();
+  return query ? `?${query}` : "";
+}
+
 function defaultFormatApiError(path, status) {
   if (status === 401 || status === 403) {
     return "Controller rejected this request. Check the admin token and permissions.";
@@ -90,6 +105,24 @@ export function createApiClient({ fetchImpl = globalThis.fetch, tokenProvider = 
         body: JSON.stringify(body),
       });
     },
+    getAgentCertificateLifecycleStatus(agentId) {
+      return request(`/api/agents/${encodePathValue(agentId)}/certificate-lifecycle/status`);
+    },
+    requestAgentCertificateIssuance(agentId, body = {}) {
+      return request(`/api/agents/${encodePathValue(agentId)}/certificate-lifecycle/request-issuance`, {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+    },
+    getControllerSigningRotationStatus() {
+      return request("/api/controller/signing-rotation/status");
+    },
+    stageControllerSigningTrustBundle(body = {}) {
+      return request("/api/controller/signing-rotation/rollout-trust-bundle/staged", {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+    },
     listJobs() {
       return request("/api/jobs");
     },
@@ -142,6 +175,42 @@ export function createApiClient({ fetchImpl = globalThis.fetch, tokenProvider = 
         body: JSON.stringify(body),
       });
     },
+    listRemediations(filters = {}) {
+      return request(`/api/remediations${remediationQuery(filters)}`);
+    },
+    getRemediation(remediationId) {
+      return request(`/api/remediations/${encodePathValue(remediationId)}`);
+    },
+    createRemediationApprovalRequest(remediationId, body = {}) {
+      return request(`/api/remediations/${encodePathValue(remediationId)}/approval-request`, {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+    },
+    approveRemediationJob(remediationId, body = {}) {
+      return request(`/api/remediations/${encodePathValue(remediationId)}/approve`, {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+    },
+    markRemediationRunning(remediationId, body = {}) {
+      return request(`/api/remediations/${encodePathValue(remediationId)}/running`, {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+    },
+    recordRemediationResult(remediationId, body = {}) {
+      return request(`/api/remediations/${encodePathValue(remediationId)}/result`, {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+    },
+    verifyRemediation(remediationId, body = {}) {
+      return request(`/api/remediations/${encodePathValue(remediationId)}/verify`, {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+    },
     previewSelector(body) {
       return request("/api/selectors/preview", {
         method: "POST",
@@ -153,6 +222,9 @@ export function createApiClient({ fetchImpl = globalThis.fetch, tokenProvider = 
     },
     getJobOutput(jobId) {
       return request(`/api/jobs/${encodePathValue(jobId)}/output`);
+    },
+    getJobArtifact(jobId, artifactId) {
+      return request(`/api/jobs/${encodePathValue(jobId)}/artifacts/${encodePathValue(artifactId)}`);
     },
     cancelJob(jobId, body = {}) {
       return request(`/api/jobs/${encodePathValue(jobId)}/cancel`, {

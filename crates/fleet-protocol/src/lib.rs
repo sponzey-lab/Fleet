@@ -80,6 +80,32 @@ pub enum WirePayload {
         agent_id: String,
         status: String,
     },
+    ControllerSigningTrustBundleUpdate {
+        entries: Vec<ControllerSigningTrustEntryWire>,
+    },
+    ControllerSigningTrustBundleAck {
+        agent_id: String,
+        accepted: bool,
+        current_fingerprint: Option<String>,
+        entries_count: usize,
+        reason_code: Option<String>,
+    },
+    AgentCertificateLifecycleUpdate {
+        agent_id: String,
+        action: AgentCertificateLifecycleActionWire,
+        state: AgentCertificateLifecycleStateWire,
+        current_certificate: Option<AgentCertificateMetadataWire>,
+        next_certificate: Option<AgentCertificateMetadataWire>,
+        grace_until_ms: Option<u64>,
+        reason_code: Option<String>,
+    },
+    AgentCertificateLifecycleAck {
+        agent_id: String,
+        accepted: bool,
+        state: AgentCertificateLifecycleStateWire,
+        current_fingerprint: Option<String>,
+        reason_code: Option<String>,
+    },
     TaskAssignment {
         envelope: SignedTaskEnvelopeWire,
         task: TaskWire,
@@ -118,6 +144,8 @@ pub enum WirePayload {
         status: Option<TaskResultStatus>,
         #[serde(default)]
         reason: String,
+        #[serde(default)]
+        artifacts: Vec<TaskResultArtifactWire>,
     },
     SecurityEvent {
         agent_id: String,
@@ -131,6 +159,14 @@ pub enum WirePayload {
     MetricsSnapshot {
         agent_id: String,
         body: String,
+    },
+    CapabilitySnapshot {
+        agent_id: String,
+        privilege_level: CapabilityPrivilegeLevelWire,
+        package_manager: Option<PackageManagerWire>,
+        service_manager: Option<ServiceManagerWire>,
+        capabilities: Vec<String>,
+        reported_at_ms: u64,
     },
     LogChunk {
         agent_id: String,
@@ -154,7 +190,11 @@ impl WirePayload {
             | Self::AuthResponse { .. }
             | Self::AuthAccepted
             | Self::Heartbeat { .. } => ProtocolChannel::AuthSession,
-            Self::TaskAssignment { .. }
+            Self::ControllerSigningTrustBundleUpdate { .. }
+            | Self::ControllerSigningTrustBundleAck { .. }
+            | Self::AgentCertificateLifecycleUpdate { .. }
+            | Self::AgentCertificateLifecycleAck { .. }
+            | Self::TaskAssignment { .. }
             | Self::TaskAck { .. }
             | Self::TaskStarted { .. }
             | Self::TaskRejected { .. }
@@ -164,6 +204,7 @@ impl WirePayload {
             | Self::SecurityEvent { .. }
             | Self::FactsSnapshot { .. }
             | Self::MetricsSnapshot { .. }
+            | Self::CapabilitySnapshot { .. }
             | Self::LogChunk { .. }
             | Self::DriftReport { .. } => ProtocolChannel::TaskData,
         }
@@ -180,6 +221,82 @@ pub enum ProtocolChannel {
 pub struct WireLabel {
     pub key: String,
     pub value: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityPrivilegeLevelWire {
+    Unprivileged,
+    SudoAvailable,
+    Root,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageManagerWire {
+    Apt,
+    Dnf,
+    Yum,
+    Apk,
+    Brew,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceManagerWire {
+    Systemd,
+    Launchd,
+    OpenRc,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControllerSigningTrustEntryWire {
+    pub fingerprint: String,
+    pub public_key: String,
+    pub role: ControllerSigningTrustRoleWire,
+    pub valid_from_ms: u64,
+    pub valid_until_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControllerSigningTrustRoleWire {
+    Current,
+    Previous,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentCertificateMetadataWire {
+    pub serial: String,
+    pub fingerprint: String,
+    pub not_before_ms: u64,
+    pub not_after_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentCertificateLifecycleActionWire {
+    RequestIssuance,
+    Issue,
+    RequestRenewal,
+    ActivateRenewal,
+    CompleteRotation,
+    Revoke,
+    Expire,
+    Fail,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentCertificateLifecycleStateWire {
+    NotIssued,
+    IssuanceRequested,
+    Issued,
+    RenewalRequested,
+    DualCertificateActive,
+    Revoked,
+    Expired,
+    Failed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -256,6 +373,18 @@ pub enum TaskResultStatus {
     Failed,
     Canceled,
     TimedOut,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskResultArtifactWire {
+    pub artifact_id: String,
+    pub step_id: String,
+    pub destination: String,
+    pub checksum_sha256: String,
+    pub size_bytes: u64,
+    pub retention_class: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_bytes: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -516,6 +645,17 @@ mod tests {
                 exit_code: 0,
                 status: Some(TaskResultStatus::Succeeded),
                 reason: String::new(),
+                artifacts: vec![TaskResultArtifactWire {
+                    artifact_id: "artifact-1".to_owned(),
+                    step_id: "template:template".to_owned(),
+                    destination: "/etc/app.conf".to_owned(),
+                    checksum_sha256:
+                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                            .to_owned(),
+                    size_bytes: 42,
+                    retention_class: "rendered_template".to_owned(),
+                    content_bytes: None,
+                }],
             },
         ] {
             let message = WireMessage::new(
@@ -552,12 +692,409 @@ mod tests {
         }"#;
 
         let decoded = decode_message(body).unwrap();
-        let WirePayload::TaskResult { status, reason, .. } = decoded.payload else {
+        let WirePayload::TaskResult {
+            status,
+            reason,
+            artifacts,
+            ..
+        } = decoded.payload
+        else {
             panic!("expected task result");
         };
 
         assert_eq!(status, None);
         assert_eq!(reason, "");
+        assert!(artifacts.is_empty());
+    }
+
+    #[test]
+    fn legacy_task_result_artifact_without_body_still_decodes() {
+        let body = r#"{
+            "protocol_version":1,
+            "message_id":"msg-result",
+            "correlation_id":"corr-result",
+            "agent_id":"agent-1",
+            "timestamp_ms":1,
+            "payload":{
+                "type":"task_result",
+                "payload":{
+                    "job_id":"job-1",
+                    "task_id":"task-1",
+                    "exit_code":0,
+                    "artifacts":[{
+                        "artifact_id":"artifact-1",
+                        "step_id":"template:template",
+                        "destination":"/etc/app.conf",
+                        "checksum_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "size_bytes":42,
+                        "retention_class":"rendered_template"
+                    }]
+                }
+            }
+        }"#;
+
+        let decoded = decode_message(body).unwrap();
+        let WirePayload::TaskResult { artifacts, .. } = decoded.payload else {
+            panic!("expected task result");
+        };
+
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].artifact_id, "artifact-1");
+        assert_eq!(artifacts[0].content_bytes, None);
+    }
+
+    #[test]
+    fn task_result_artifact_body_roundtrips() {
+        let message = WireMessage::new(
+            "msg-result",
+            "corr-result",
+            Some("agent-1".to_owned()),
+            1,
+            WirePayload::TaskResult {
+                job_id: "job-1".to_owned(),
+                task_id: "task-1".to_owned(),
+                exit_code: 0,
+                status: Some(TaskResultStatus::Succeeded),
+                reason: String::new(),
+                artifacts: vec![TaskResultArtifactWire {
+                    artifact_id: "artifact-1".to_owned(),
+                    step_id: "template:template".to_owned(),
+                    destination: "/etc/app.conf".to_owned(),
+                    checksum_sha256:
+                        "3f8a286ab667f1b60da3a12c138461dac343cab1eb3928c433a8062a61d417f8"
+                            .to_owned(),
+                    size_bytes: 5,
+                    retention_class: "rendered_template".to_owned(),
+                    content_bytes: Some(b"hello".to_vec()),
+                }],
+            },
+        );
+
+        let encoded = encode_message(&message).unwrap();
+        let decoded = decode_message(&encoded).unwrap();
+        let WirePayload::TaskResult { artifacts, .. } = decoded.payload else {
+            panic!("expected task result");
+        };
+
+        assert_eq!(artifacts[0].content_bytes.as_deref(), Some(&b"hello"[..]));
+    }
+
+    #[test]
+    fn old_agent_hello_without_capability_snapshot_still_decodes() {
+        let body = r#"{
+            "protocol_version":1,
+            "message_id":"msg-hello",
+            "correlation_id":"corr-hello",
+            "agent_id":"agent-1",
+            "timestamp_ms":1,
+            "payload":{
+                "type":"agent_hello",
+                "payload":{
+                    "agent_id":"agent-1",
+                    "fingerprint":"0123456789abcdef"
+                }
+            }
+        }"#;
+
+        let decoded = decode_message(body).unwrap();
+
+        assert!(matches!(
+            decoded.payload,
+            WirePayload::AgentHello {
+                agent_id,
+                fingerprint
+            } if agent_id == "agent-1" && fingerprint == "0123456789abcdef"
+        ));
+    }
+
+    #[test]
+    fn capability_snapshot_roundtrips() {
+        let message = WireMessage::new(
+            "msg-capability",
+            "corr-capability",
+            Some("agent-1".to_owned()),
+            1,
+            WirePayload::CapabilitySnapshot {
+                agent_id: "agent-1".to_owned(),
+                privilege_level: CapabilityPrivilegeLevelWire::SudoAvailable,
+                package_manager: Some(PackageManagerWire::Apt),
+                service_manager: Some(ServiceManagerWire::Systemd),
+                capabilities: vec![
+                    "persistent_session".to_owned(),
+                    "command_execution".to_owned(),
+                    "package_install".to_owned(),
+                ],
+                reported_at_ms: 1_710_000_000_000,
+            },
+        );
+
+        let encoded = encode_message(&message).unwrap();
+        let decoded = decode_message(&encoded).unwrap();
+
+        assert!(encoded.contains("\"capability_snapshot\""));
+        assert!(encoded.contains("\"sudo_available\""));
+        assert_eq!(decoded.payload, message.payload);
+        assert_eq!(decoded.payload.channel(), ProtocolChannel::TaskData);
+    }
+
+    #[test]
+    fn trust_bundle_update_roundtrips_current_and_previous_entries() {
+        let payload = WirePayload::ControllerSigningTrustBundleUpdate {
+            entries: vec![
+                ControllerSigningTrustEntryWire {
+                    fingerprint: "controller-fp-new".to_owned(),
+                    public_key: "controller-public-new".to_owned(),
+                    role: ControllerSigningTrustRoleWire::Current,
+                    valid_from_ms: 1_710_000_000_000,
+                    valid_until_ms: None,
+                },
+                ControllerSigningTrustEntryWire {
+                    fingerprint: "controller-fp-old".to_owned(),
+                    public_key: "controller-public-old".to_owned(),
+                    role: ControllerSigningTrustRoleWire::Previous,
+                    valid_from_ms: 1_710_000_000_000,
+                    valid_until_ms: Some(1_710_000_300_000),
+                },
+            ],
+        };
+        let message = WireMessage::new(
+            "msg-trust-update",
+            "corr-trust-update",
+            Some("agent-1".to_owned()),
+            1,
+            payload.clone(),
+        );
+
+        let encoded = encode_message(&message).unwrap();
+        let decoded = decode_message(&encoded).unwrap();
+
+        assert!(encoded.contains("\"controller_signing_trust_bundle_update\""));
+        assert!(encoded.contains("\"current\""));
+        assert!(encoded.contains("\"previous\""));
+        assert_eq!(decoded.payload, payload);
+        assert_eq!(decoded.payload.channel(), ProtocolChannel::TaskData);
+    }
+
+    #[test]
+    fn trust_bundle_update_ignores_private_material_like_unknown_fields() {
+        let body = r#"{
+            "protocol_version": 1,
+            "message_id": "msg-trust-update",
+            "correlation_id": "corr-trust-update",
+            "agent_id": "agent-1",
+            "timestamp_ms": 1,
+            "payload": {
+                "type": "controller_signing_trust_bundle_update",
+                "payload": {
+                    "entries": [{
+                        "fingerprint": "controller-fp-new",
+                        "public_key": "controller-public-new",
+                        "role": "current",
+                        "valid_from_ms": 1710000000000,
+                        "valid_until_ms": null,
+                        "private_key": "must-not-enter-model",
+                        "key_path": "/tmp/controller_private.key",
+                        "tls_certificate": "must-not-enter-model"
+                    }]
+                }
+            }
+        }"#;
+
+        let decoded = decode_message(body).unwrap();
+        let WirePayload::ControllerSigningTrustBundleUpdate { entries } = decoded.payload else {
+            panic!("expected trust bundle update");
+        };
+        let reencoded = encode_message(&WireMessage::new(
+            "msg-trust-update",
+            "corr-trust-update",
+            Some("agent-1".to_owned()),
+            1,
+            WirePayload::ControllerSigningTrustBundleUpdate { entries },
+        ))
+        .unwrap();
+
+        assert!(reencoded.contains("controller-public-new"));
+        assert!(!reencoded.contains("must-not-enter-model"));
+        assert!(!reencoded.contains("controller_private.key"));
+    }
+
+    #[test]
+    fn trust_bundle_ack_roundtrips_public_status_only() {
+        let payload = WirePayload::ControllerSigningTrustBundleAck {
+            agent_id: "agent-1".to_owned(),
+            accepted: true,
+            current_fingerprint: Some("controller-fp-new".to_owned()),
+            entries_count: 2,
+            reason_code: None,
+        };
+        let message = WireMessage::new(
+            "msg-trust-ack",
+            "corr-trust-ack",
+            Some("agent-1".to_owned()),
+            1,
+            payload.clone(),
+        );
+
+        let encoded = encode_message(&message).unwrap();
+        let decoded = decode_message(&encoded).unwrap();
+
+        assert!(encoded.contains("\"controller_signing_trust_bundle_ack\""));
+        assert!(encoded.contains("\"accepted\":true"));
+        assert!(encoded.contains("\"entries_count\":2"));
+        assert_eq!(decoded.payload, payload);
+        assert_eq!(decoded.payload.channel(), ProtocolChannel::TaskData);
+        assert!(!encoded.contains("public_key"));
+        assert!(!encoded.contains("private_key"));
+        assert!(!encoded.contains("key_path"));
+        assert!(!encoded.contains("tls_certificate"));
+    }
+
+    #[test]
+    fn agent_certificate_lifecycle_update_roundtrips_public_metadata_only() {
+        let payload = WirePayload::AgentCertificateLifecycleUpdate {
+            agent_id: "agent-1".to_owned(),
+            action: AgentCertificateLifecycleActionWire::ActivateRenewal,
+            state: AgentCertificateLifecycleStateWire::DualCertificateActive,
+            current_certificate: Some(AgentCertificateMetadataWire {
+                serial: "serial-1".to_owned(),
+                fingerprint: "0123456789abcdef".to_owned(),
+                not_before_ms: 1_710_000_000_000,
+                not_after_ms: 1_710_003_600_000,
+            }),
+            next_certificate: Some(AgentCertificateMetadataWire {
+                serial: "serial-2".to_owned(),
+                fingerprint: "fedcba9876543210".to_owned(),
+                not_before_ms: 1_710_002_000_000,
+                not_after_ms: 1_710_006_000_000,
+            }),
+            grace_until_ms: Some(1_710_002_300_000),
+            reason_code: None,
+        };
+        let message = WireMessage::new(
+            "msg-agent-cert",
+            "corr-agent-cert",
+            Some("agent-1".to_owned()),
+            1,
+            payload.clone(),
+        );
+
+        let encoded = encode_message(&message).unwrap();
+        let decoded = decode_message(&encoded).unwrap();
+
+        assert!(encoded.contains("\"agent_certificate_lifecycle_update\""));
+        assert!(encoded.contains("\"activate_renewal\""));
+        assert!(encoded.contains("\"dual_certificate_active\""));
+        assert_eq!(decoded.payload, payload);
+        assert_eq!(decoded.payload.channel(), ProtocolChannel::TaskData);
+        for forbidden in [
+            "PRIVATE KEY",
+            "private_key",
+            "certificate_body",
+            "pem_body",
+            "ca_path",
+            "runtime_env",
+            "websocket_handle",
+        ] {
+            assert!(
+                !encoded.contains(forbidden),
+                "agent certificate lifecycle update must not expose {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_certificate_lifecycle_update_ignores_private_material_like_unknown_fields() {
+        let body = r#"{
+            "protocol_version": 1,
+            "message_id": "msg-agent-cert",
+            "correlation_id": "corr-agent-cert",
+            "agent_id": "agent-1",
+            "timestamp_ms": 1,
+            "payload": {
+                "type": "agent_certificate_lifecycle_update",
+                "payload": {
+                    "agent_id": "agent-1",
+                    "action": "issue",
+                    "state": "issued",
+                    "current_certificate": {
+                        "serial": "serial-1",
+                        "fingerprint": "0123456789abcdef",
+                        "not_before_ms": 1710000000000,
+                        "not_after_ms": 1710003600000,
+                        "private_key": "must-not-enter-model",
+                        "certificate_body": "must-not-enter-model",
+                        "ca_path": "/etc/sponzey/ca.pem"
+                    },
+                    "next_certificate": null,
+                    "grace_until_ms": null,
+                    "reason_code": null
+                }
+            }
+        }"#;
+
+        let decoded = decode_message(body).unwrap();
+        let WirePayload::AgentCertificateLifecycleUpdate {
+            agent_id,
+            action,
+            state,
+            current_certificate,
+            next_certificate,
+            grace_until_ms,
+            reason_code,
+        } = decoded.payload
+        else {
+            panic!("expected agent certificate lifecycle update");
+        };
+        let reencoded = encode_message(&WireMessage::new(
+            "msg-agent-cert",
+            "corr-agent-cert",
+            Some("agent-1".to_owned()),
+            1,
+            WirePayload::AgentCertificateLifecycleUpdate {
+                agent_id,
+                action,
+                state,
+                current_certificate,
+                next_certificate,
+                grace_until_ms,
+                reason_code,
+            },
+        ))
+        .unwrap();
+
+        assert!(reencoded.contains("\"agent_certificate_lifecycle_update\""));
+        assert!(!reencoded.contains("must-not-enter-model"));
+        assert!(!reencoded.contains("/etc/sponzey/ca.pem"));
+    }
+
+    #[test]
+    fn agent_certificate_lifecycle_ack_roundtrips_public_status_only() {
+        let payload = WirePayload::AgentCertificateLifecycleAck {
+            agent_id: "agent-1".to_owned(),
+            accepted: true,
+            state: AgentCertificateLifecycleStateWire::Issued,
+            current_fingerprint: Some("0123456789abcdef".to_owned()),
+            reason_code: None,
+        };
+        let message = WireMessage::new(
+            "msg-agent-cert-ack",
+            "corr-agent-cert",
+            Some("agent-1".to_owned()),
+            1,
+            payload.clone(),
+        );
+
+        let encoded = encode_message(&message).unwrap();
+        let decoded = decode_message(&encoded).unwrap();
+
+        assert!(encoded.contains("\"agent_certificate_lifecycle_ack\""));
+        assert!(encoded.contains("\"accepted\":true"));
+        assert_eq!(decoded.payload, payload);
+        assert_eq!(decoded.payload.channel(), ProtocolChannel::TaskData);
+        assert!(!encoded.contains("serial"));
+        assert!(!encoded.contains("private_key"));
+        assert!(!encoded.contains("certificate_body"));
+        assert!(!encoded.contains("ca_path"));
     }
 
     #[test]

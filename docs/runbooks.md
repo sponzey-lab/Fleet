@@ -168,6 +168,9 @@ Controlled mutation declarations:
 - `package` with `name` and `state: present`
 - `service` with `name`, `state: started|restarted`, optional `enabled: true|false`
 - `file.copy` with absolute safe `dest`, inline `content`, optional `mode`
+- `file.template` with absolute safe `dest`, inline `content`, optional `mode`,
+  optional comma-separated `variables`, optional comma-separated `secretRefs`,
+  and optional `checksum: sha256`
 
 Deferred dangerous declarations:
 
@@ -210,6 +213,57 @@ The file-copy primitive is intentionally narrow:
 - unchanged content returns `changed=false`,
 - before/after SHA-256 checksums are returned in the diff,
 - owner/group management is out of scope and must be modeled as a later explicit primitive.
+
+The `file.template` primitive uses the same file write path after rendering:
+
+- template syntax is limited to `{{ variable_name }}` replacement,
+- variables come only from the runbook document `variables` field,
+- `variables` uses comma-separated `name=value` pairs with ASCII identifier
+  names,
+- `secretRefs` uses comma-separated `name=secret://scope/name` pairs and stores
+  only a validated `SecretRef` marker in the parsed runbook,
+- `secretRefs` reject empty values, unsupported schemes, traversal segments,
+  query strings, whitespace, and inline `token=`/`secret=` material,
+- templates that reference a `secretRefs` variable fail unless an explicit
+  SecretProvider-compatible resolver is injected into the runner planning path,
+- secret provider mode is a startup-only setting. The default is disabled, and
+  the current `static-test` settings mode is limited to JSON fixture paths for
+  contract tests/local development; runbooks, API requests, and Web Admin UI do
+  not select or modify the provider,
+- controller bootstrap constructs the provider from typed settings only. A
+  disabled provider denies every secret reference, and `static-test` requires an
+  explicit fixture source supplied by local/test code rather than environment or
+  request state,
+- agent runbook execution passes the selected provider as an explicit resolver
+  closure to the runner. The runner does not discover providers itself,
+- `sponzey apply` validates runbook structure and primitive planning only. It
+  does not resolve `secretRefs`, read provider configuration, or prove that a
+  secret-backed template can execute in a running agent context,
+- unsupported Mustache control expressions such as sections, partials, comments,
+  unescaped variables, external includes, and loops are rejected,
+- rendered content is passed to the existing `file.copy` atomic write/checksum
+  path,
+- rendered artifact metadata is reported through the agent `task_result`
+  protocol and stored by the controller,
+- the reported artifact SHA-256 can be used as a policy `file.sha256` expected
+  value for later drift checks,
+- SecretProvider-backed rendering writes the resolved content to the destination
+  file only; artifact metadata is still reported, but artifact `content_bytes`
+  are omitted for secret-backed templates so raw rendered secrets are not sent
+  to controller artifact body storage by default.
+
+Example:
+
+```yaml
+steps:
+  - id: nginx-template
+    file.template:
+      dest: /etc/nginx/conf.d/sponzey.conf
+      content: server { listen {{ port }}; server_name {{ host }}; }
+      mode: "0644"
+      variables: port=8080,host=example.test
+      checksum: sha256
+```
 
 ### Check Primitives
 

@@ -74,6 +74,6 @@ This is a skeleton for the later systemd/journald adapter. It validates the serv
 
 - Product application logs do not include tailed log lines.
 - Log stream output is redacted independently from application logging.
-- Agent operational log chunks are persisted in `agent_log_chunks` and cleaned by explicit retention cleanup.
+- Agent operational log chunks are persisted in `agent_log_chunks` and cleaned by the controller retention worker or explicit retention cleanup command.
 - Raw file tail and journald stream artifacts are not persisted separately in MVP.
 - Remote raw file or journald log streaming remains a later signed task/streaming protocol feature.

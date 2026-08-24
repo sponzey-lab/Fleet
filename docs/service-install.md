@@ -9,6 +9,7 @@ sponzey controller install-service --data-dir /var/lib/sponzey-fleet --dry-run
 sponzey agent install-service --data-dir /var/lib/sponzey-fleet --dry-run
 sponzey controller start-service --dry-run
 sponzey agent start-service --dry-run
+sponzey controller restart-service --dry-run
 sponzey controller status-service --dry-run
 sponzey agent status-service --dry-run
 sponzey controller logs-service --lines 50 --dry-run
@@ -17,11 +18,16 @@ sponzey controller uninstall-service --dry-run
 sponzey agent uninstall-service --dry-run
 ```
 
-Without `--dry-run`, `install-service` writes `/etc/systemd/system/sponzey-fleet-controller.service` or `/etc/systemd/system/sponzey-fleet-agent.service`, then runs `systemctl daemon-reload` and `systemctl enable ...`. `start-service` runs `systemctl start ...`. `status-service` runs `systemctl status ... --no-pager`. `logs-service` runs `journalctl -u ... --no-pager -n <lines>`. `uninstall-service` runs `systemctl disable --now ...`, removes the service file, then runs `systemctl daemon-reload`.
+Without `--dry-run`, `install-service` writes `/etc/systemd/system/sponzey-fleet-controller.service` or `/etc/systemd/system/sponzey-fleet-agent.service`, then runs `systemctl daemon-reload` and `systemctl enable ...`. `start-service` runs `systemctl start ...`. `restart-service` runs `systemctl restart ...` for the controller service. `status-service` runs `systemctl status ... --no-pager`. `logs-service` runs `journalctl -u ... --no-pager -n <lines>`. `uninstall-service` runs `systemctl disable --now ...`, removes the service file, then runs `systemctl daemon-reload`.
 
 Non-Linux hosts fail with a clear Linux requirement. Install/start/uninstall
 operations require root. Status/log queries require Linux/systemd but do not
 require root. Dry-run never writes system files.
+
+For controller signing key rotation, record restart intent first through
+`sponzey controller signing-rotation restart-action --confirm-external-restart`,
+then run `sponzey controller restart-service`. The API records audit intent but
+does not self-restart the HTTP handler or reload key material in-process.
 
 The MVP repository also provides foreground scripts for local development:
 
@@ -94,6 +100,57 @@ WantedBy=multi-user.target
 
 HTTP transport is test-only. Product, customer, production, shared, and long-running environments must use HTTPS.
 
+## TLS And Signing Identity
+
+Controller service TLS options and controller task-signing keys are separate
+trust materials.
+
+- `--tls-cert` and `--tls-key` configure only the TLS server identity used by
+  HTTPS/WSS.
+- Controller task-signing keys stay under the controller data directory as
+  `controller/controller_public.key` and `controller/controller_private.key`.
+- Do not reuse the TLS private key as the controller signing private key.
+- Do not treat a TLS certificate fingerprint as the controller signing
+  fingerprint pinned by agents.
+- Provide `--tls-cert` and `--tls-key` together. Supplying only one is rejected
+  during controller bootstrap.
+- Service units must pass key paths as explicit CLI arguments or data directory
+  arguments. They must not inject, change, or discover trust settings by editing
+  process environment variables after startup.
+
+Agent client certificates are not a product mTLS requirement yet. When that
+feature is added, it must be configured as explicit startup trust settings and
+must not bypass agent key proof or controller-signed task verification.
+`--agent-client-ca-cert` is reserved for that future mTLS trust material and is
+currently rejected during controller bootstrap because the built-in listener
+does not enforce agent client certificates yet. The rejection must not expose
+the local CA certificate path.
+
+Controller signing key replacement is not a runtime environment edit. The
+controller filesystem boundary validates staged signing files with an explicit
+challenge, rejects TLS/active path reuse, requires private key file permissions
+that are not group/other accessible, writes backups, replaces through temporary
+files, verifies the swapped pair, and rolls back on partial failure. A later
+API/CLI command may call that boundary, but service units must still pass
+startup settings explicitly and restart/reload through an explicit operation.
+On controller start, active signing material is validated and compared with the
+persisted signing rotation state. If the selected signing fingerprint does not
+match the active keypair, the controller fails closed before accepting API or
+WebSocket traffic.
+
+Agents treat the enrolled controller signing fingerprint as a public trust
+anchor. Current agent builds adapt that pinned fingerprint and the controller
+signing public key into a one-entry trust bundle before verifying task
+envelopes. Agent sessions can accept a controller signing trust bundle update
+message containing only public fingerprints, public keys, roles, and validity
+windows, then store the accepted bundle in explicit in-memory session state for
+subsequent task verification. Accepted updates are persisted as
+`controller_trust_bundle.json` beside `agent.conf` using the same public-only
+schema, so agent restart keeps the rotation trust window. Service units must
+not inject trust changes by editing process environment variables while the
+agent is running. Operator-facing rotation commands and controller-side rollout
+scheduling are separate follow-up work.
+
 ## Upgrade Policy
 
 `sponzey upgrade` is intentionally a dry-run planning command in the current
@@ -109,7 +166,8 @@ The supported upgrade path is:
 1. Stop controller and agent services.
 2. Back up controller data with `sponzey controller backup`.
 3. Download an npm package update or standalone release archive.
-4. Verify release artifact integrity with `SHA256SUMS`.
+4. Verify release artifact integrity with `SHA256SUMS` and, when published,
+   `SHA256SUMS.sig`.
 5. Replace the `sponzey` binary through the chosen package/artifact mechanism.
 6. Start services and verify with `status-service` and `/healthz`.
 
@@ -125,16 +183,21 @@ Stable/beta channel policy:
 - Automatic downgrade is not supported; restore the previous binary and backup
   manually when rollback is required.
 
-Package formats not yet implemented:
+Package formats not yet implemented and owning phase:
 
-- `.deb`
-- `.rpm`
-- Homebrew formula
-- Docker image
-- Windows service package
+- `.deb`: Phase 9, with systemd unit render test and signature/version pinning.
+- `.rpm`: Phase 9, with systemd unit render test and signature/version pinning.
+- Homebrew formula: Phase 9 decision record and smoke command.
+- Docker image: Phase 9 decision record, image tag/version pinning, and checksum/signature policy for embedded binary.
+- Windows service package: Phase 12 agent/service support first, then Phase 9 packaging track.
 
 Windows production service support is not currently published. Unsupported npm
 platforms fail with a clear `unsupported platform` error.
+
+One-line installer is Phase 9 work. It must provide `--dry-run`, explicit
+version/channel selection, checksum verification, release signature
+verification, and must not silently edit shell profiles or runtime environment
+variables.
 
 ## Standalone Artifact Integrity
 
@@ -160,8 +223,22 @@ The verification script checks:
 - the archive extracts successfully,
 - an executable `sponzey` binary is present.
 
-Signature verification is not implemented yet and remains a follow-up hardening
-task.
+Release checksum signatures cover the `SHA256SUMS` manifest. When
+`SHA256SUMS.sig` is published, verify it with the pinned release public key from
+the project release channel:
+
+```bash
+./scripts/verify_release_signature.sh dist/release ./release-public-key.pem
+```
+
+Maintainers sign the manifest with an explicit private key path:
+
+```bash
+./scripts/sign_release_sums.sh dist/release ./release-private-key.pem
+```
+
+The public key must not be trusted merely because it was downloaded inside an
+artifact archive.
 
 ## Manual Reboot Smoke
 

@@ -75,10 +75,12 @@ export PATH="$(npm prefix -g)/bin:$PATH"
 
 Standalone release archives are the non-npm install path. GitHub release
 artifacts are named `sponzey-<os>-<arch>.tar.gz` and are published with
-`SHA256SUMS`. Verify them before installing:
+`SHA256SUMS`. Verify them before installing, and verify `SHA256SUMS.sig` with
+the pinned release public key when a signature is published:
 
 ```sh
 ./scripts/verify_standalone_artifacts.sh dist/release
+./scripts/verify_release_signature.sh dist/release ./release-public-key.pem
 ```
 
 For Linux services, install the resolved Rust binary rather than an npm shim:

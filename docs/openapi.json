@@ -18,8 +18,9 @@
     { "name": "Agents", "description": "Agent inventory, labels, key revocation, and latest snapshots." },
     { "name": "Jobs", "description": "Command, runbook, drift check, and job output APIs." },
     { "name": "Approvals", "description": "Approval request lifecycle for high-risk and broad-target jobs." },
+    { "name": "Remediations", "description": "Policy remediation request lifecycle, approval-to-job creation, result recording, and resolution verification." },
     { "name": "Policy", "description": "Policy source, agent assignment, and scheduled drift APIs." },
-    { "name": "Audit", "description": "Recent audit events." }
+    { "name": "Audit", "description": "Recent and exportable audit events." }
   ],
   "components": {
     "securitySchemes": {
@@ -76,6 +77,462 @@
           "controller_signing_public_key": { "type": "string", "example": "<controller-public-key-hex>" },
           "controller_signing_fingerprint": { "type": "string", "example": "<controller-fingerprint>" },
           "tls_endpoint": { "$ref": "#/components/schemas/ControllerTlsEndpointResponse" }
+        },
+        "additionalProperties": false
+      },
+      "ControllerSigningRotationStatusResponse": {
+        "type": "object",
+        "required": [
+          "controller_id",
+          "persisted_record_present",
+          "persisted_state",
+          "readiness",
+          "active_signing_fingerprint_prefix",
+          "selected_signing_fingerprint_prefix",
+          "old_fingerprint_prefix",
+          "new_fingerprint_prefix",
+          "requested_at_ms",
+          "validated_at_ms",
+          "activated_at_ms",
+          "old_key_verifies_until_ms",
+          "retired_at_ms",
+          "failed_at_ms",
+          "bootstrap_guard",
+          "agent_trust_rollout"
+        ],
+        "properties": {
+          "controller_id": { "type": "string", "example": "default-controller" },
+          "persisted_record_present": {
+            "type": "boolean",
+            "description": "False when no rotation record has been created and the controller is treated as active steady.",
+            "example": true
+          },
+          "persisted_state": {
+            "type": "string",
+            "enum": [
+              "steady",
+              "rotation_requested",
+              "new_material_validated",
+              "dual_trust_active",
+              "old_key_retired",
+              "rotation_failed",
+              "canceled_before_activation"
+            ],
+            "example": "dual_trust_active"
+          },
+          "readiness": {
+            "type": "string",
+            "enum": [
+              "steady_ready",
+              "rotation_requested_not_validated",
+              "new_material_validated_waiting_activation",
+              "dual_trust_active_agents_migrating",
+              "old_key_retirement_available",
+              "terminal_failed",
+              "terminal_canceled",
+              "terminal_retired"
+            ],
+            "example": "dual_trust_active_agents_migrating"
+          },
+          "active_signing_fingerprint_prefix": {
+            "type": "string",
+            "description": "Prefix of the active runtime signing fingerprint; never a public key body.",
+            "example": "new-fp-12345678"
+          },
+          "selected_signing_fingerprint_prefix": {
+            "type": "string",
+            "description": "Prefix of the domain-selected signing fingerprint; never a public key body.",
+            "example": "new-fp-12345678"
+          },
+          "old_fingerprint_prefix": { "type": "string", "example": "old-fp-12345678" },
+          "new_fingerprint_prefix": { "type": ["string", "null"], "example": "new-fp-12345678" },
+          "requested_at_ms": { "type": ["integer", "null"], "example": 1710000000000 },
+          "validated_at_ms": { "type": ["integer", "null"], "example": 1710000001000 },
+          "activated_at_ms": { "type": ["integer", "null"], "example": 1710000002000 },
+          "old_key_verifies_until_ms": { "type": ["integer", "null"], "example": 1710003600000 },
+          "retired_at_ms": { "type": ["integer", "null"], "example": null },
+          "failed_at_ms": { "type": ["integer", "null"], "example": null },
+          "bootstrap_guard": {
+            "type": "string",
+            "description": "Summary of whether the active runtime key matches the domain-selected key.",
+            "example": "active_matches_selected"
+          },
+          "agent_trust_rollout": {
+            "type": "string",
+            "description": "Readiness summary for agent trust-bundle rollout.",
+            "example": "agents_migrating"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ControllerSigningRotationRestartPlanResponse": {
+        "type": "object",
+        "required": [
+          "controller_id",
+          "restart_required",
+          "reload_supported",
+          "recommended_action",
+          "readiness",
+          "bootstrap_guard",
+          "agent_trust_rollout",
+          "active_signing_fingerprint_prefix",
+          "selected_signing_fingerprint_prefix",
+          "blocked_reason",
+          "verification_commands",
+          "safety_notes"
+        ],
+        "description": "Read-only operator guidance for controller signing rotation restart/reload verification. This response never performs restart, reload, key swap, runtime config patching, or secret material exposure.",
+        "properties": {
+          "controller_id": { "type": "string", "example": "default-controller" },
+          "restart_required": {
+            "type": "boolean",
+            "description": "True when active runtime signer does not match the persisted selected signing key.",
+            "example": true
+          },
+          "reload_supported": {
+            "type": "boolean",
+            "description": "False until an audited hot reload action is explicitly implemented.",
+            "example": false
+          },
+          "recommended_action": {
+            "type": "string",
+            "enum": [
+              "none",
+              "activate_rotation_when_ready",
+              "restart_controller_process",
+              "retire_old_key_when_agents_verified",
+              "review_terminal_rotation_state"
+            ],
+            "example": "restart_controller_process"
+          },
+          "readiness": { "type": "string", "example": "dual_trust_active_agents_migrating" },
+          "bootstrap_guard": { "type": "string", "example": "active_mismatch_selected" },
+          "agent_trust_rollout": { "type": "string", "example": "agents_migrating" },
+          "active_signing_fingerprint_prefix": { "type": "string", "example": "old-fp-12345678" },
+          "selected_signing_fingerprint_prefix": { "type": "string", "example": "new-fp-12345678" },
+          "blocked_reason": {
+            "type": ["string", "null"],
+            "example": "active signer does not match persisted selected signer; restart controller with validated signing material and verify status before retiring old key"
+          },
+          "verification_commands": {
+            "type": "array",
+            "items": { "type": "string" },
+            "example": [
+              "sponzey controller signing-rotation-status --controller-url <controller-url>",
+              "sponzey controller signing-rotation restart-plan --controller-url <controller-url>"
+            ]
+          },
+          "safety_notes": {
+            "type": "array",
+            "items": { "type": "string" },
+            "example": [
+              "this version does not support in-process controller signing key reload",
+              "restart the controller process through the service manager after validated material is in place",
+              "verify bootstrap_guard is active_matches_selected before retiring the old key"
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "ControllerSigningRotationRestartActionBody": {
+        "type": "object",
+        "description": "Record an audited external controller restart intent. The controller API does not self-restart, reload key files, or mutate runtime config.",
+        "properties": {
+          "confirm_external_restart": {
+            "type": "boolean",
+            "description": "Must be true to confirm the operator will restart the controller through an external service manager.",
+            "example": true
+          },
+          "reason": {
+            "type": ["string", "null"],
+            "description": "Optional operator reason. Secret-like markers are redacted before audit storage.",
+            "example": "approved maintenance window"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ControllerSigningRotationRestartActionResponse": {
+        "type": "object",
+        "required": [
+          "controller_id",
+          "action",
+          "action_status",
+          "restart_required",
+          "reload_supported",
+          "readiness",
+          "bootstrap_guard",
+          "active_signing_fingerprint_prefix",
+          "selected_signing_fingerprint_prefix",
+          "service_command",
+          "verification_commands",
+          "safety_notes"
+        ],
+        "description": "Secret-free audit result for an external controller restart action. This response never includes key paths, key bodies, TLS material, task payloads, or process environment values.",
+        "properties": {
+          "controller_id": { "type": "string", "example": "default-controller" },
+          "action": {
+            "type": "string",
+            "enum": ["external_service_manager_restart"],
+            "example": "external_service_manager_restart"
+          },
+          "action_status": {
+            "type": "string",
+            "enum": ["audit_recorded_external_restart_required"],
+            "example": "audit_recorded_external_restart_required"
+          },
+          "restart_required": { "type": "boolean", "example": true },
+          "reload_supported": { "type": "boolean", "example": false },
+          "readiness": { "type": "string", "example": "dual_trust_active_agents_migrating" },
+          "bootstrap_guard": { "type": "string", "example": "active_mismatch_selected" },
+          "active_signing_fingerprint_prefix": { "type": "string", "example": "old-fp-12345678" },
+          "selected_signing_fingerprint_prefix": { "type": "string", "example": "new-fp-12345678" },
+          "service_command": {
+            "type": "string",
+            "example": "sponzey controller restart-service --dry-run"
+          },
+          "verification_commands": {
+            "type": "array",
+            "items": { "type": "string" },
+            "example": [
+              "sponzey controller signing-rotation-status --controller-url <controller-url>",
+              "sponzey controller signing-rotation restart-plan --controller-url <controller-url>"
+            ]
+          },
+          "safety_notes": {
+            "type": "array",
+            "items": { "type": "string" },
+            "example": [
+              "controller restart is executed outside the HTTP handler through an explicit service-manager command",
+              "this action records operator intent only and does not reload keys or mutate runtime config",
+              "after service restart, verify bootstrap_guard is active_matches_selected"
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "ControllerSigningRotationRequestBody": {
+        "type": "object",
+        "required": ["new_fingerprint"],
+        "description": "Request a controller signing rotation using public fingerprint metadata only. Raw key bodies, PEM bodies, TLS certificate material, task payload bodies, and process environment values are not accepted.",
+        "properties": {
+          "new_fingerprint": {
+            "type": "string",
+            "description": "Fingerprint of the candidate controller signing public key.",
+            "example": "<candidate-signing-fingerprint>"
+          },
+          "old_key_verifies_for_seconds": {
+            "type": ["integer", "null"],
+            "minimum": 1,
+            "description": "Relative verification window for the old signing key. Provide exactly one of this field or old_key_verifies_until_ms.",
+            "example": 3600
+          },
+          "old_key_verifies_until_ms": {
+            "type": ["integer", "null"],
+            "description": "Absolute old-key verification expiry in Unix epoch milliseconds. Provide exactly one of this field or old_key_verifies_for_seconds.",
+            "example": 1710003600000
+          },
+          "reason": { "type": ["string", "null"], "example": "scheduled signing key rotation" }
+        },
+        "additionalProperties": false
+      },
+      "ControllerSigningRotationValidateBody": {
+        "type": "object",
+        "required": ["candidate_public_key_path", "candidate_private_key_path"],
+        "description": "Validate candidate controller signing material using explicit file paths on the controller host. The API does not accept key bodies.",
+        "properties": {
+          "candidate_public_key_path": {
+            "type": "string",
+            "description": "Controller-local candidate public key file path.",
+            "example": "/var/lib/sponzey-fleet/controller/candidate_public.key"
+          },
+          "candidate_private_key_path": {
+            "type": "string",
+            "description": "Controller-local candidate private key file path. The response never echoes this value.",
+            "example": "/var/lib/sponzey-fleet/controller/candidate_private.key"
+          },
+          "reason": { "type": ["string", "null"], "example": "candidate keypair validated on controller host" }
+        },
+        "additionalProperties": false
+      },
+      "ControllerSigningRotationReasonBody": {
+        "type": "object",
+        "properties": {
+          "reason": { "type": ["string", "null"], "example": "operator requested state change" }
+        },
+        "additionalProperties": false
+      },
+      "ControllerSigningTrustBundleRolloutBody": {
+        "type": "object",
+        "description": "Dispatch a public-only controller signing trust bundle update to authenticated connected agent sessions. Private key material, key bodies, TLS material, task payloads, and process environment values are not accepted.",
+        "properties": {
+          "previous_public_key_path": {
+            "type": ["string", "null"],
+            "description": "Controller-local public key file path for the previous signing key during dual-trust rollout. The path is not returned or logged.",
+            "example": "/var/lib/sponzey-fleet/controller/controller_public.key.bak"
+          },
+          "agent_ids": {
+            "type": "array",
+            "description": "Optional target agent ids. When omitted or empty, all authenticated connected sessions are targeted.",
+            "items": { "type": "string" },
+            "example": ["agent-1", "agent-2"]
+          },
+          "max_agent_count": {
+            "type": ["integer", "null"],
+            "minimum": 1,
+            "description": "Optional bounded batch limit for rollout/retry dispatch. Omit to attempt every selected target; zero is rejected.",
+            "example": 25
+          }
+        },
+        "additionalProperties": false
+      },
+      "ControllerSigningTrustBundleRolloutResponse": {
+        "type": "object",
+        "required": [
+          "controller_id",
+          "persisted_state",
+          "attempted_count",
+          "updated_count",
+          "skipped_count",
+          "failed_count",
+          "entries_count",
+          "current_fingerprint_prefix",
+          "previous_fingerprint_prefix",
+          "agent_results"
+        ],
+        "properties": {
+          "controller_id": { "type": "string", "example": "default-controller" },
+          "persisted_state": { "type": "string", "example": "dual_trust_active" },
+          "attempted_count": { "type": "integer", "example": 2 },
+          "updated_count": { "type": "integer", "example": 1 },
+          "skipped_count": { "type": "integer", "example": 1 },
+          "failed_count": { "type": "integer", "example": 0 },
+          "entries_count": { "type": "integer", "example": 2 },
+          "current_fingerprint_prefix": { "type": "string", "example": "new-fp-12345678" },
+          "previous_fingerprint_prefix": { "type": ["string", "null"], "example": "old-fp-12345678" },
+          "agent_results": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["agent_id", "status"],
+              "properties": {
+                "agent_id": { "type": "string", "example": "agent-1" },
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "sent",
+                    "skipped_not_connected",
+                    "skipped_already_current",
+                    "failed_queue_full",
+                    "failed_queue_closed"
+                  ],
+                  "example": "sent"
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "ControllerSigningTrustBundleStagedRolloutBody": {
+        "type": "object",
+        "description": "Run one explicit staged controller signing trust bundle coordinator tick. The request supplies the rollout controls; no hidden global defaults, runtime environment changes, private key material, key bodies, TLS material, task payloads, or process environment values are accepted.",
+        "required": ["batch_size", "max_failures", "ack_timeout_seconds"],
+        "properties": {
+          "previous_public_key_path": {
+            "type": ["string", "null"],
+            "description": "Controller-local public key file path for the previous signing key during dual-trust rollout. The path is used only to build the public-only trust bundle and is not returned or logged.",
+            "example": "/var/lib/sponzey-fleet/controller/controller_public.key.bak"
+          },
+          "agent_ids": {
+            "type": "array",
+            "description": "Optional target agent ids. When omitted or empty, the tick targets the currently authenticated connected sessions observed in the session registry.",
+            "items": { "type": "string" },
+            "example": ["agent-1", "agent-2", "agent-3"]
+          },
+          "batch_size": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Maximum number of non-current connected agents the domain staged rollout planner may dispatch in this tick.",
+            "example": 10
+          },
+          "max_failures": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Maximum failed target count the staged rollout state machine may tolerate before failing the rollout.",
+            "example": 1
+          },
+          "ack_timeout_seconds": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Acknowledgement timeout used by the staged rollout state machine for dispatched batches.",
+            "example": 30
+          }
+        },
+        "additionalProperties": false
+      },
+      "ControllerSigningTrustBundleStagedRolloutResponse": {
+        "type": "object",
+        "required": [
+          "controller_id",
+          "persisted_state",
+          "rollout_state",
+          "target_count",
+          "planned_count",
+          "attempted_count",
+          "updated_count",
+          "skipped_count",
+          "failed_count",
+          "already_current_count",
+          "unavailable_count",
+          "pending_count",
+          "entries_count",
+          "current_fingerprint_prefix",
+          "previous_fingerprint_prefix",
+          "agent_results"
+        ],
+        "properties": {
+          "controller_id": { "type": "string", "example": "default-controller" },
+          "persisted_state": { "type": "string", "example": "dual_trust_active" },
+          "rollout_state": {
+            "type": "string",
+            "enum": ["planned", "dispatching_batch", "waiting_for_ack", "completed", "failed"],
+            "example": "waiting_for_ack"
+          },
+          "target_count": { "type": "integer", "example": 3 },
+          "planned_count": { "type": "integer", "example": 1 },
+          "attempted_count": { "type": "integer", "example": 1 },
+          "updated_count": { "type": "integer", "example": 1 },
+          "skipped_count": { "type": "integer", "example": 1 },
+          "failed_count": { "type": "integer", "example": 0 },
+          "already_current_count": { "type": "integer", "example": 1 },
+          "unavailable_count": { "type": "integer", "example": 0 },
+          "pending_count": { "type": "integer", "example": 1 },
+          "entries_count": { "type": "integer", "example": 2 },
+          "current_fingerprint_prefix": { "type": "string", "example": "new-fp-12345678" },
+          "previous_fingerprint_prefix": { "type": ["string", "null"], "example": "old-fp-12345678" },
+          "agent_results": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["agent_id", "status"],
+              "properties": {
+                "agent_id": { "type": "string", "example": "agent-2" },
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "sent",
+                    "skipped_not_connected",
+                    "skipped_already_current",
+                    "failed_queue_full",
+                    "failed_queue_closed"
+                  ],
+                  "example": "sent"
+                }
+              },
+              "additionalProperties": false
+            }
+          }
         },
         "additionalProperties": false
       },
@@ -171,6 +628,8 @@
           "fingerprint",
           "labels",
           "assigned_policy_ids",
+          "capabilities",
+          "capability_reported_at_ms",
           "last_seen_at_ms",
           "last_seen_age_seconds",
           "hostname",
@@ -198,6 +657,17 @@
             "description": "Policy ids directly assigned to this agent.",
             "example": ["nginx-running"]
           },
+          "capabilities": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Latest agent-reported capability names stored by the controller. Dispatch decisions are still made by the controller/application layer, not by clients.",
+            "example": ["persistent_session", "command_execution"]
+          },
+          "capability_reported_at_ms": {
+            "type": ["integer", "null"],
+            "description": "Agent system time when the latest capability snapshot was reported. Null when no capability snapshot has been stored yet.",
+            "example": 1710000000000
+          },
           "last_seen_at_ms": { "type": ["integer", "null"], "example": 1710000000000 },
           "last_seen_age_seconds": { "type": ["integer", "null"], "example": 12 },
           "hostname": { "type": ["string", "null"], "example": "web-01" },
@@ -214,6 +684,80 @@
             "type": "array",
             "items": { "$ref": "#/components/schemas/AgentLabel" }
           }
+        },
+        "additionalProperties": false
+      },
+      "AgentCertificateIssuanceRequestResponse": {
+        "type": "object",
+        "required": [
+          "agent_id",
+          "action",
+          "lifecycle_state",
+          "dispatch_status",
+          "current_fingerprint_prefix",
+          "next_fingerprint_prefix",
+          "audit_event_action",
+          "updated_at_ms"
+        ],
+        "description": "Result of requesting agent client certificate issuance. Dispatch status means the controller queued a public lifecycle update to an authenticated session; it does not mean the agent accepted or installed certificate material.",
+        "properties": {
+          "agent_id": { "type": "string", "example": "agent-web-01" },
+          "action": { "type": "string", "enum": ["request_issuance"], "example": "request_issuance" },
+          "lifecycle_state": { "type": "string", "enum": ["issuance_requested"], "example": "issuance_requested" },
+          "dispatch_status": {
+            "type": "string",
+            "enum": ["sent", "not_connected", "queue_full", "closed"],
+            "example": "sent"
+          },
+          "current_fingerprint_prefix": { "type": ["string", "null"], "example": null },
+          "next_fingerprint_prefix": { "type": ["string", "null"], "example": null },
+          "audit_event_action": {
+            "type": "string",
+            "example": "agent_certificate_issuance_requested"
+          },
+          "updated_at_ms": { "type": "integer", "example": 1710000000000 }
+        },
+        "additionalProperties": false
+      },
+      "AgentCertificateLifecycleStatusResponse": {
+        "type": "object",
+        "required": [
+          "agent_id",
+          "record_present",
+          "lifecycle_state",
+          "current_fingerprint_prefix",
+          "next_fingerprint_prefix",
+          "grace_until_ms",
+          "revocation_reason",
+          "updated_at_ms"
+        ],
+        "description": "Read-only public agent client certificate lifecycle status. This response does not include certificate bodies, private keys, certificate file paths, CA paths, runtime environment values, or WebSocket handles.",
+        "properties": {
+          "agent_id": { "type": "string", "example": "agent-web-01" },
+          "record_present": {
+            "type": "boolean",
+            "description": "False when the agent exists but no lifecycle record has been created yet.",
+            "example": true
+          },
+          "lifecycle_state": {
+            "type": "string",
+            "enum": [
+              "not_issued",
+              "issuance_requested",
+              "issued",
+              "renewal_requested",
+              "dual_certificate_active",
+              "revoked",
+              "expired",
+              "failed"
+            ],
+            "example": "dual_certificate_active"
+          },
+          "current_fingerprint_prefix": { "type": ["string", "null"], "example": "0123456789ab" },
+          "next_fingerprint_prefix": { "type": ["string", "null"], "example": "fedcba987654" },
+          "grace_until_ms": { "type": ["integer", "null"], "example": 1710003600000 },
+          "revocation_reason": { "type": ["string", "null"], "example": null },
+          "updated_at_ms": { "type": ["integer", "null"], "example": 1710000000000 }
         },
         "additionalProperties": false
       },
@@ -804,6 +1348,142 @@
         },
         "additionalProperties": false
       },
+      "RemediationStatus": {
+        "type": "string",
+        "enum": [
+          "proposed",
+          "pending_approval",
+          "approved",
+          "job_created",
+          "running",
+          "succeeded_pending_verify",
+          "resolved",
+          "failed",
+          "rejected",
+          "expired",
+          "canceled"
+        ],
+        "example": "proposed"
+      },
+      "RemediationRequestResponse": {
+        "type": "object",
+        "description": "Remediation metadata only. Raw runbook documents, rendered bodies, command output, tokens, and secrets are not returned by remediation metadata endpoints.",
+        "required": [
+          "id",
+          "policy_id",
+          "policy_name",
+          "agent_id",
+          "runbook_ref",
+          "status",
+          "approval_required",
+          "risk_summary",
+          "job_id",
+          "created_at_ms",
+          "updated_at_ms"
+        ],
+        "properties": {
+          "id": { "type": "string", "example": "remediation-nginx-running-agent-web-01" },
+          "policy_id": { "type": "string", "example": "nginx-running" },
+          "policy_name": { "type": "string", "example": "nginx-running" },
+          "agent_id": { "type": "string", "example": "agent-web-01" },
+          "runbook_ref": { "type": "string", "example": "runbooks/nginx-remediate.yml" },
+          "status": { "$ref": "#/components/schemas/RemediationStatus" },
+          "approval_required": { "type": "boolean", "example": true },
+          "risk_summary": { "type": "string", "example": "drifted policy requires approved remediation" },
+          "job_id": { "type": ["string", "null"], "example": "job-remediation-01" },
+          "created_at_ms": { "type": "integer", "example": 1710000000000 },
+          "updated_at_ms": { "type": "integer", "example": 1710000000000 }
+        },
+        "additionalProperties": false
+      },
+      "CreateRemediationApprovalRequest": {
+        "type": "object",
+        "properties": {
+          "approval_id": {
+            "type": ["string", "null"],
+            "description": "Optional deterministic id for tests or external automation. Omit to let the controller generate one."
+          },
+          "job_id": {
+            "type": ["string", "null"],
+            "description": "Optional reserved remediation job id. The job row is created only after approval."
+          },
+          "reason": { "type": "string", "default": "", "example": "drift remediation requires approval" },
+          "expires_in_seconds": { "type": "integer", "minimum": 1, "default": 300, "example": 600 }
+        },
+        "additionalProperties": false
+      },
+      "CreateRemediationApprovalResponse": {
+        "type": "object",
+        "required": ["remediation", "approval"],
+        "properties": {
+          "remediation": { "$ref": "#/components/schemas/RemediationRequestResponse" },
+          "approval": { "$ref": "#/components/schemas/ApprovalRequestResponse" }
+        },
+        "additionalProperties": false
+      },
+      "ApproveRemediationJobRequest": {
+        "type": "object",
+        "required": ["approval_id", "job_id", "runbook_document"],
+        "properties": {
+          "approval_id": { "type": "string", "example": "approval-remediation-01" },
+          "job_id": { "type": "string", "example": "job-remediation-01" },
+          "runbook_document": {
+            "type": "string",
+            "description": "Approved runbook source used to create the signed remediation job. The raw document is accepted in the request only and is not returned by remediation responses.",
+            "example": "apiVersion: fleet.sponzey.dev/v1alpha1\nkind: Runbook\nmetadata:\n  name: nginx-remediate\nspec:\n  tasks: []\n"
+          },
+          "timeout_seconds": { "type": "integer", "minimum": 1, "default": 30, "example": 30 },
+          "expires_in_seconds": { "type": "integer", "minimum": 1, "default": 300, "example": 600 },
+          "nonce_prefix": { "type": ["string", "null"], "example": "nonce-remediation-01" },
+          "reason": { "type": "string", "default": "", "example": "approved remediation window" }
+        },
+        "additionalProperties": false
+      },
+      "ApproveRemediationJobResponse": {
+        "type": "object",
+        "required": ["remediation", "approval", "job_id", "assignment_count", "status"],
+        "properties": {
+          "remediation": { "$ref": "#/components/schemas/RemediationRequestResponse" },
+          "approval": { "$ref": "#/components/schemas/ApprovalRequestResponse" },
+          "job_id": { "type": "string", "example": "job-remediation-01" },
+          "assignment_count": { "type": "integer", "example": 1 },
+          "status": { "$ref": "#/components/schemas/RemediationStatus" }
+        },
+        "additionalProperties": false
+      },
+      "RemediationJobRunningRequest": {
+        "type": "object",
+        "required": ["job_id"],
+        "properties": {
+          "job_id": { "type": "string", "example": "job-remediation-01" }
+        },
+        "additionalProperties": false
+      },
+      "RemediationJobResultRequest": {
+        "type": "object",
+        "required": ["job_id", "status"],
+        "properties": {
+          "job_id": { "type": "string", "example": "job-remediation-01" },
+          "status": {
+            "type": "string",
+            "enum": ["succeeded", "failed"],
+            "description": "Success moves the remediation to succeeded_pending_verify. Failure moves it to failed.",
+            "example": "succeeded"
+          }
+        },
+        "additionalProperties": false
+      },
+      "RemediationVerifyRequest": {
+        "type": "object",
+        "required": ["agent_id", "policy_id", "policy_name", "job_id"],
+        "properties": {
+          "agent_id": { "type": "string", "example": "agent-web-01" },
+          "policy_id": { "type": "string", "example": "nginx-running" },
+          "policy_name": { "type": "string", "example": "nginx-running" },
+          "job_id": { "type": "string", "example": "job-remediation-01" }
+        },
+        "additionalProperties": false
+      },
       "CancelJobRequest": {
         "type": "object",
         "properties": {
@@ -888,6 +1568,35 @@
         "description": "Per-agent task assignment state. This is distinct from target agent connectivity status; output_received is an event, not an assignment state.",
         "example": "started"
       },
+      "RenderedArtifactMetadataResponse": {
+        "type": "object",
+        "required": [
+          "artifact_id",
+          "task_id",
+          "agent_id",
+          "retention_class",
+          "checksum_sha256",
+          "size_bytes"
+        ],
+        "properties": {
+          "artifact_id": { "type": "string", "example": "artifact-1" },
+          "task_id": { "type": "string", "example": "task-job-1-agent-web-01" },
+          "agent_id": { "type": "string", "example": "agent-web-01" },
+          "retention_class": {
+            "type": "string",
+            "enum": ["rendered_template"],
+            "example": "rendered_template"
+          },
+          "checksum_sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$",
+            "example": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "size_bytes": { "type": "integer", "minimum": 1, "example": 13 }
+        },
+        "description": "Rendered artifact metadata only. The job summary does not include rendered body, local filesystem path, or destination path.",
+        "additionalProperties": false
+      },
       "JobSummary": {
         "type": "object",
         "required": [
@@ -904,6 +1613,7 @@
           "target_agent_ids",
           "target_agents",
           "assignment_summary",
+          "rendered_artifacts",
           "target_connected",
           "created_at_ms",
           "updated_at_ms",
@@ -947,6 +1657,11 @@
             "items": { "$ref": "#/components/schemas/JobTargetSummary" }
           },
           "assignment_summary": { "$ref": "#/components/schemas/JobAssignmentSummary" },
+          "rendered_artifacts": {
+            "type": "array",
+            "description": "Rendered artifact metadata for this job. Body bytes are available only through the artifact retrieval endpoint.",
+            "items": { "$ref": "#/components/schemas/RenderedArtifactMetadataResponse" }
+          },
           "target_connected": {
             "type": "boolean",
             "description": "True when at least one target currently has an authenticated persistent session.",
@@ -1087,6 +1802,48 @@
         },
         "additionalProperties": false
       },
+      "JobArtifactBodyResponse": {
+        "type": "object",
+        "required": [
+          "job_id",
+          "artifact_id",
+          "task_id",
+          "agent_id",
+          "retention_class",
+          "checksum_sha256",
+          "size_bytes",
+          "content_bytes"
+        ],
+        "properties": {
+          "job_id": { "type": "string", "example": "job-1" },
+          "artifact_id": { "type": "string", "example": "artifact-1" },
+          "task_id": { "type": "string", "example": "task-job-1-agent-web-01" },
+          "agent_id": { "type": "string", "example": "agent-web-01" },
+          "retention_class": {
+            "type": "string",
+            "enum": ["rendered_template"],
+            "description": "Artifact retention class recorded with the metadata."
+          },
+          "checksum_sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$",
+            "description": "Expected SHA-256 checksum verified before the body is returned.",
+            "example": "1f3d9a0a6c0f9f4c1f7a7b9e8d2b4c6a7e8f9a0b1c2d3e4f5061728394051627"
+          },
+          "size_bytes": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Stored artifact byte size from metadata.",
+            "example": 42
+          },
+          "content_bytes": {
+            "type": "array",
+            "items": { "type": "integer", "minimum": 0, "maximum": 255 },
+            "description": "Verified artifact content bytes. The response never includes the local filesystem path."
+          }
+        },
+        "additionalProperties": false
+      },
       "AuditEvent": {
         "type": "object",
         "required": ["category", "action", "actor", "target", "value_kind", "value", "occurred_at_ms"],
@@ -1098,6 +1855,49 @@
           "value_kind": { "type": "string", "example": "plain" },
           "value": { "type": "string", "example": "status=revoked" },
           "occurred_at_ms": { "type": "integer", "example": 1710000000000 }
+        },
+        "additionalProperties": false
+      },
+      "AuditExportEvent": {
+        "type": "object",
+        "required": ["category", "action", "actor", "target", "value_kind", "value", "occurred_at_ms", "cursor"],
+        "properties": {
+          "category": {
+            "type": "string",
+            "enum": ["agent", "enrollment", "job", "approval", "drift", "policy", "security"],
+            "example": "security"
+          },
+          "action": { "type": "string", "example": "insecure_http_transport_enabled" },
+          "actor": { "type": "string", "example": "system" },
+          "target": { "type": "string", "example": "controller" },
+          "value_kind": { "type": "string", "enum": ["plain", "secret_ref", "redacted"], "example": "redacted" },
+          "value": {
+            "type": "string",
+            "description": "Redacted value. SecretRef values are exposed only as the marker 'secret_ref'.",
+            "example": "redacted"
+          },
+          "occurred_at_ms": { "type": "integer", "example": 1710000000000 },
+          "cursor": {
+            "type": "string",
+            "description": "Opaque cursor for requesting the next older page.",
+            "example": "1710000000:42"
+          }
+        },
+        "additionalProperties": false
+      },
+      "AuditExportPage": {
+        "type": "object",
+        "required": ["items", "next_cursor"],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/AuditExportEvent" }
+          },
+          "next_cursor": {
+            "type": ["string", "null"],
+            "description": "Cursor to pass as the next request's before query. Null means no next page.",
+            "example": "1710000000:41"
+          }
         },
         "additionalProperties": false
       }
@@ -1225,6 +2025,349 @@
               }
             }
           }
+        }
+      }
+    },
+    "/api/controller/signing-rotation/status": {
+      "get": {
+        "tags": ["System"],
+        "summary": "Read controller signing rotation readiness status.",
+        "description": "Admin-only read-only endpoint. Returns persisted rotation state, readiness, fingerprint prefixes, and dual-trust timing without private key material, key paths, TLS certificate material, raw public key bodies, or task payload bodies.",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Secret-free controller signing rotation readiness status.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ControllerSigningRotationStatusResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      }
+    },
+    "/api/controller/signing-rotation/restart-plan": {
+      "get": {
+        "tags": ["System"],
+        "summary": "Read controller signing rotation restart/reload operator plan.",
+        "description": "Admin-only read-only endpoint. Returns restart-required guidance, verification commands, and safety notes derived from status. It does not restart the controller, reload key files, swap signing material, patch runtime config, or expose key paths/material.",
+        "security": [{ "bearerAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Secret-free controller signing rotation restart plan.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ControllerSigningRotationRestartPlanResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      }
+    },
+    "/api/controller/signing-rotation/restart-action": {
+      "post": {
+        "tags": ["System"],
+        "summary": "Record audited external restart intent for controller signing rotation.",
+        "description": "Admin-only mutation endpoint. Requires explicit confirmation, writes a security audit event, and returns external service-manager restart guidance. It does not self-restart the HTTP handler, invoke systemd, reload key files, swap signing material, patch runtime config, or expose key paths/material.",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ControllerSigningRotationRestartActionBody" },
+              "example": {
+                "confirm_external_restart": true,
+                "reason": "approved maintenance window"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Secret-free audited external restart action response.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ControllerSigningRotationRestartActionResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "409": { "$ref": "#/components/responses/Conflict" }
+        }
+      }
+    },
+    "/api/controller/signing-rotation/request": {
+      "post": {
+        "tags": ["System"],
+        "summary": "Request controller signing key rotation.",
+        "description": "Admin-only mutation endpoint. Creates a rotation_requested state using public fingerprints and an old-key verification window. Raw key bodies, PEM bodies, TLS certificate material, task payload bodies, and process environment values are not accepted.",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ControllerSigningRotationRequestBody" },
+              "example": {
+                "new_fingerprint": "<candidate-signing-fingerprint>",
+                "old_key_verifies_for_seconds": 3600,
+                "reason": "scheduled signing key rotation"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Secret-free rotation readiness after the mutation.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ControllerSigningRotationStatusResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "409": { "$ref": "#/components/responses/Conflict" }
+        }
+      }
+    },
+    "/api/controller/signing-rotation/validate": {
+      "post": {
+        "tags": ["System"],
+        "summary": "Validate candidate controller signing material.",
+        "description": "Admin-only mutation endpoint. Validates candidate signing material using explicit controller-local file paths, then records new_material_validated. It does not accept or return key bodies.",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ControllerSigningRotationValidateBody" },
+              "example": {
+                "candidate_public_key_path": "/var/lib/sponzey-fleet/controller/candidate_public.key",
+                "candidate_private_key_path": "/var/lib/sponzey-fleet/controller/candidate_private.key",
+                "reason": "candidate keypair validated on controller host"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Secret-free rotation readiness after the mutation.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ControllerSigningRotationStatusResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "409": { "$ref": "#/components/responses/Conflict" }
+        }
+      }
+    },
+    "/api/controller/signing-rotation/activate": {
+      "post": {
+        "tags": ["System"],
+        "summary": "Activate dual trust for controller signing rotation.",
+        "description": "Admin-only mutation endpoint. Transitions validated rotation state to dual_trust_active. It does not implicitly read or swap key material.",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ControllerSigningRotationReasonBody" },
+              "example": { "reason": "activate after candidate validation" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Secret-free rotation readiness after the mutation.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ControllerSigningRotationStatusResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "409": { "$ref": "#/components/responses/Conflict" }
+        }
+      }
+    },
+    "/api/controller/signing-rotation/retire": {
+      "post": {
+        "tags": ["System"],
+        "summary": "Retire the old controller signing key.",
+        "description": "Admin-only mutation endpoint. Retires the old signing key only after the domain old-key verification window guard allows it.",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ControllerSigningRotationReasonBody" },
+              "example": { "reason": "old-key verification window elapsed" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Secret-free rotation readiness after the mutation.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ControllerSigningRotationStatusResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "409": { "$ref": "#/components/responses/Conflict" }
+        }
+      }
+    },
+    "/api/controller/signing-rotation/fail": {
+      "post": {
+        "tags": ["System"],
+        "summary": "Mark controller signing rotation failed.",
+        "description": "Admin-only mutation endpoint. Records a terminal failed state with redacted reason handling. Secret-like reason content is not returned or stored in the rotation state.",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ControllerSigningRotationReasonBody" },
+              "example": { "reason": "candidate validation failed" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Secret-free rotation readiness after the mutation.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ControllerSigningRotationStatusResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "409": { "$ref": "#/components/responses/Conflict" }
+        }
+      }
+    },
+    "/api/controller/signing-rotation/rollout-trust-bundle": {
+      "post": {
+        "tags": ["System"],
+        "summary": "Roll out controller signing trust bundle to connected agents.",
+        "description": "Admin-only mutation endpoint. Builds a public-only controller_signing_trust_bundle_update payload from active runtime signing identity and persisted rotation state, then sends it to authenticated connected sessions. Agents answer with public-only controller_signing_trust_bundle_ack; already-current acknowledged sessions are reported as skipped_already_current. It does not include private key material, create Job/Assignment state, or treat delivery as task acceptance.",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ControllerSigningTrustBundleRolloutBody" },
+              "example": {
+                "previous_public_key_path": "/var/lib/sponzey-fleet/controller/controller_public.key.bak",
+                "agent_ids": ["agent-1", "agent-2"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Secret-free rollout dispatch summary.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ControllerSigningTrustBundleRolloutResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "409": { "$ref": "#/components/responses/Conflict" }
+        }
+      }
+    },
+    "/api/controller/signing-rotation/rollout-trust-bundle/staged": {
+      "post": {
+        "tags": ["System"],
+        "summary": "Run one staged controller signing trust bundle rollout coordinator tick.",
+        "description": "Admin-only mutation endpoint. Converts active session registry connection and public-only acknowledgement state into domain staged rollout observations, asks the domain state machine for one bounded batch, and dispatches a public-only controller_signing_trust_bundle_update payload. This is a synchronous coordinator tick; it does not create a background scheduler, persist scheduler continuity, create Job/Assignment state, store WebSocket handles in domain/storage, or treat delivery as task acceptance.",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ControllerSigningTrustBundleStagedRolloutBody" },
+              "example": {
+                "previous_public_key_path": "/var/lib/sponzey-fleet/controller/controller_public.key.bak",
+                "agent_ids": ["agent-1", "agent-2", "agent-3"],
+                "batch_size": 10,
+                "max_failures": 1,
+                "ack_timeout_seconds": 30
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Secret-free staged coordinator tick summary.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ControllerSigningTrustBundleStagedRolloutResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "409": { "$ref": "#/components/responses/Conflict" }
+        }
+      }
+    },
+    "/api/controller/signing-rotation/rollout-trust-bundle/retry": {
+      "post": {
+        "tags": ["System"],
+        "summary": "Retry controller signing trust bundle rollout with an explicit batch limit.",
+        "description": "Admin-only mutation endpoint. Reuses the public-only trust bundle construction boundary and attempts a bounded retry against selected authenticated connected sessions. It uses observable session registry state and public-only ack state only and does not infer hidden key paths, store WebSocket handles, create Job/Assignment state, or treat delivery as task acceptance.",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ControllerSigningTrustBundleRolloutBody" },
+              "example": {
+                "previous_public_key_path": "/var/lib/sponzey-fleet/controller/controller_public.key.bak",
+                "agent_ids": ["agent-1", "agent-2", "agent-3"],
+                "max_agent_count": 25
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Secret-free retry dispatch summary.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ControllerSigningTrustBundleRolloutResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "409": { "$ref": "#/components/responses/Conflict" }
         }
       }
     },
@@ -1414,6 +2557,57 @@
           "401": { "$ref": "#/components/responses/Unauthorized" },
           "403": { "$ref": "#/components/responses/Forbidden" },
           "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/api/agents/{agent_id}/certificate-lifecycle/status": {
+      "get": {
+        "tags": ["Agents"],
+        "summary": "Get public agent client certificate lifecycle status.",
+        "description": "Returns stored public lifecycle state for a known agent. If the agent exists but no lifecycle record exists, the response is `not_issued` with `record_present=false`. This endpoint is read-only and does not inspect runtime WebSocket ack state.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "agent_id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "Public certificate lifecycle status.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AgentCertificateLifecycleStatusResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/api/agents/{agent_id}/certificate-lifecycle/request-issuance": {
+      "post": {
+        "tags": ["Agents"],
+        "summary": "Request agent client certificate issuance.",
+        "description": "Creates or updates the public agent certificate lifecycle state through the application use case, writes Security audit, and attempts to dispatch a public-only lifecycle update to the connected authenticated agent session. This endpoint does not issue certificate material, install certificates, mutate runtime configuration, or enforce listener mTLS.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "agent_id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "202": {
+            "description": "Issuance request persisted. Dispatch status is observational only.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AgentCertificateIssuanceRequestResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": { "$ref": "#/components/responses/Conflict" }
         }
       }
     },
@@ -1756,7 +2950,7 @@
       "post": {
         "tags": ["Policy"],
         "summary": "Configure scheduled drift for a policy-agent pair.",
-        "description": "Stores schedule metadata. The background worker that creates drift-check jobs from due schedules is a follow-up capability.",
+        "description": "Stores schedule metadata consumed by the controller scheduled drift worker, which creates signed drift-check jobs from due schedules.",
         "security": [{ "bearerAuth": [] }],
         "parameters": [
           { "name": "policy_id", "in": "path", "required": true, "schema": { "type": "string" } }
@@ -2172,6 +3366,248 @@
         }
       }
     },
+    "/api/remediations": {
+      "get": {
+        "tags": ["Remediations"],
+        "summary": "List remediation requests.",
+        "description": "Returns remediation metadata only. Raw runbook bodies, rendered artifacts, command output, tokens, and secrets are not returned.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "agent_id",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "string" },
+            "description": "Optional agent id filter."
+          },
+          {
+            "name": "policy_id",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "string" },
+            "description": "Optional policy id filter."
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 500,
+              "default": 100
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Remediation metadata list.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": { "$ref": "#/components/schemas/RemediationRequestResponse" }
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      }
+    },
+    "/api/remediations/{remediation_id}": {
+      "get": {
+        "tags": ["Remediations"],
+        "summary": "Get remediation request metadata.",
+        "description": "Returns one remediation metadata record without raw runbook bodies, rendered artifacts, command output, tokens, or secrets.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "remediation_id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "Remediation metadata.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/RemediationRequestResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/api/remediations/{remediation_id}/approval-request": {
+      "post": {
+        "tags": ["Remediations"],
+        "summary": "Create a remediation approval request.",
+        "description": "Moves a proposed remediation to pending_approval and stores an approval request for a reserved remediation job id. No job or task assignment is created by this endpoint.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "remediation_id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CreateRemediationApprovalRequest" }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Remediation approval request was created.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/CreateRemediationApprovalResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": { "$ref": "#/components/responses/Conflict" }
+        }
+      }
+    },
+    "/api/remediations/{remediation_id}/approve": {
+      "post": {
+        "tags": ["Remediations"],
+        "summary": "Approve remediation and create a signed runbook job.",
+        "description": "Approves the linked approval request, creates a queued signed runbook job for the remediation target snapshot, stores task assignment metadata, writes audit events, and dispatches only after store persistence when an active authenticated agent session exists.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "remediation_id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ApproveRemediationJobRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Remediation job was created.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ApproveRemediationJobResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": { "$ref": "#/components/responses/Conflict" }
+        }
+      }
+    },
+    "/api/remediations/{remediation_id}/running": {
+      "post": {
+        "tags": ["Remediations"],
+        "summary": "Mark remediation job running.",
+        "description": "Moves a job_created remediation to running after the linked job starts. The request must provide the matching job id.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "remediation_id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/RemediationJobRunningRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated remediation metadata.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/RemediationRequestResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/api/remediations/{remediation_id}/result": {
+      "post": {
+        "tags": ["Remediations"],
+        "summary": "Record remediation job result.",
+        "description": "Records the linked remediation job result. Success moves the remediation to succeeded_pending_verify; it does not mark drift resolved until verification evidence matches.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "remediation_id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/RemediationJobResultRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Updated remediation metadata.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/RemediationRequestResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/api/remediations/{remediation_id}/verify": {
+      "post": {
+        "tags": ["Remediations"],
+        "summary": "Verify remediation resolution.",
+        "description": "Marks remediation resolved only when agent id, policy id, policy name, job id, and latest drift evidence match. Mismatched evidence is rejected.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "remediation_id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/RemediationVerifyRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Resolved remediation metadata.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/RemediationRequestResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
     "/api/jobs/{job_id}/output": {
       "get": {
         "tags": ["Jobs"],
@@ -2196,6 +3632,40 @@
         }
       }
     },
+    "/api/jobs/{job_id}/artifacts/{artifact_id}": {
+      "get": {
+        "tags": ["Jobs"],
+        "summary": "Get a verified rendered artifact body.",
+        "description": "Looks up rendered artifact metadata by job id and artifact id, verifies the ArtifactStore checksum, and returns bytes without exposing local filesystem paths.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "job_id", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "artifact_id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "Verified artifact body.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/JobArtifactBodyResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": {
+            "description": "Artifact body checksum mismatch.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ErrorResponse" }
+              }
+            }
+          },
+          "500": { "$ref": "#/components/responses/InternalServerError" }
+        }
+      }
+    },
     "/api/audit": {
       "get": {
         "tags": ["Audit"],
@@ -2214,6 +3684,57 @@
             }
           },
           "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/api/audit/export": {
+      "get": {
+        "tags": ["Audit"],
+        "summary": "Export audit events with cursor paging.",
+        "description": "Returns audit events in newest-first order. Optional category filters to one audit category. SecretRef values are not exposed; they are returned as the marker 'secret_ref'. No audit update or delete API is exposed.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          {
+            "name": "category",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": ["agent", "enrollment", "job", "approval", "drift", "policy", "security"]
+            },
+            "description": "Optional audit category filter."
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 500,
+              "default": 50
+            }
+          },
+          {
+            "name": "before",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "string" },
+            "description": "Opaque cursor returned as next_cursor from the previous page."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Paged audit event export.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AuditExportPage" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
         }
       }
     }

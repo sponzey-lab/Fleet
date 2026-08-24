@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+postgres = ["fleet-store/postgres"]
+
 [dependencies]
 axum = { workspace = true }
 fleet-core = { path = "../fleet-core" }

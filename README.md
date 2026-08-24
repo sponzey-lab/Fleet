@@ -32,13 +32,15 @@ Important terms:
 | Admin token      | Printed by `sponzey controller init`. Use it only for the Web Admin UI and protected APIs.                |
 | Enrollment token | Created by `sponzey enroll-token create`. Use it once when registering an agent.                          |
 | Controller URL   | Address agents use to reach the controller. The setup flow is the same whether the URL is local or HTTPS. |
+| Runbook          | A one-time YAML operation plan that becomes a signed job and runs ordered steps on selected agents.       |
+| Policy           | A saved desired-state document used to check drift and decide whether remediation should be requested.    |
 
 Facts and metrics mean different things:
 
-| Data    | Meaning                                                                                           |
-| ------- | ------------------------------------------------------------------------------------------------- |
+| Data    | Meaning                                                                                                                                                               |
+| ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Facts   | Mostly stable inventory, such as OS, architecture, hostname, CPU core count, memory total/modules, disk devices, mount layout, disk capacity, and network interfaces. |
-| Metrics | Time-series usage telemetry, such as CPU usage, memory usage, disk usage, process count, and service failure counts. |
+| Metrics | Time-series usage telemetry, such as CPU usage, memory usage, disk usage, process count, and service failure counts.                                                  |
 
 ## Install
 
@@ -91,15 +93,18 @@ sponzey-linux-arm64.tar.gz
 sponzey-linux-x64.tar.gz
 ```
 
-Verify the archive checksum before installing:
+Verify the archive checksum before installing. If the release publishes
+`SHA256SUMS.sig`, verify the signed checksum manifest with the pinned release
+public key before trusting the archive:
 
 ```bash
 ./scripts/verify_standalone_artifacts.sh dist/release
+./scripts/verify_release_signature.sh dist/release ./release-public-key.pem
 ```
 
 The release workflow publishes `SHA256SUMS` with the archives. Signature
-verification is not implemented yet; treat checksum verification plus release
-provenance as the current integrity boundary.
+verification signs that checksum manifest; the release public key must come from
+the project release channel, not from inside the downloaded archive.
 
 For long-running Linux hosts, install the resolved binary as a systemd service:
 
@@ -148,6 +153,24 @@ tests because tokens and request payloads are not encrypted. The detailed API
 contract, public/internal endpoint boundary, pagination shape, and deprecation
 policy are maintained in [docs/api.md](docs/api.md). The agent WebSocket
 protocol is documented separately in [docs/protocol.md](docs/protocol.md).
+
+For repeated CLI operations, store the controller endpoint and admin token in a
+local profile:
+
+```bash
+sponzey login --controller-url https://fleet.example.com --admin-token <admin-token>
+sponzey agents remote-list
+sponzey selectors preview --selector role=web
+sponzey jobs list
+sponzey approvals list
+sponzey audit export --category security --limit 100 > audit-security.jsonl
+```
+
+The default profile path is `.sponzey/cli-profile.json`. Treat it as a secret:
+the CLI writes it with owner-only permissions and protected remote commands
+refuse group/world-readable profile files. Command flags such as
+`--controller-url` and `--admin-token` override the profile for that one
+process only.
 
 The current bootstrap admin token maps to the `bootstrap-admin` actor with the
 `owner` role. Minimal role and permission boundaries are documented in
@@ -304,6 +327,126 @@ Usage metrics default to every 30 seconds with `--metrics-interval-seconds`.
 Task assignments are pushed on the persistent session independently from those
 telemetry intervals.
 
+## Runbooks And Policies
+
+Runbooks and policies solve different problems.
+
+| Feature | Use it when you want to                                                                                                                          | What happens                                                                                                                                                   |
+| ------- | ------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Runbook | Execute an ordered operation once, such as collecting local facts, checking a port, installing a package, starting a service, or copying a file. | The controller validates the YAML, creates a signed runbook job, waits for approval when required, then dispatches it to the selected agent session.           |
+| Policy  | Define what a machine should look like over time, such as "nginx should be running on web agents".                                               | The controller stores the policy source, can assign it to agents, can store drift schedules, and drift checks compare actual state against that desired state. |
+
+### Runbooks
+
+A runbook is a small Sponzey YAML document for repeatable operational steps. It
+is not an Ansible playbook and does not try to be Ansible-compatible. The goal is
+predictable execution and audit: every runbook becomes a job with assignment
+state, output chunks, result status, approval events, and audit events.
+
+Minimal runbook:
+
+```yaml
+apiVersion: fleet.sponzey.dev/v1alpha1
+kind: Runbook
+name: quick-inventory
+matchLabels:
+  role: web
+steps:
+  - id: collect-facts
+    facts.collect: {}
+```
+
+Common supported steps include:
+
+- `facts.collect` and `metrics.snapshot` for read-only snapshots.
+- `port.check` and `process.check` for read-only checks.
+- `package`, `service`, and `file.copy` for controlled idempotent mutations.
+
+Important behavior:
+
+- `sponzey apply <file>` validates a runbook locally. It does not execute remote
+
+  privileged changes.
+- `POST /api/jobs/runbook` and the Web Admin Runbooks panel create the actual
+
+  controller-signed execution job.
+- Runbook jobs are treated as high-risk because one document can contain several
+
+  mutation steps. Approval is required before dispatch when the controller marks
+  the job as `pending_approval`.
+- If a runbook request specifies `target_agent_ids`, `selector`, or
+
+  `matchLabels`, those request targets win. If the request does not specify a
+  target, the controller uses the selector inside the runbook document.
+- `dryRun: true` skips every primitive. `checkMode: true` allows read-only checks
+
+  but skips mutation steps.
+
+In Web Admin, either select one agent or enter a target selector in the Runbooks
+panel and use "Preview targets" before creating the job. The preview comes from
+the controller selector API and shows matched, dispatchable, disabled, and
+offline counts. Check the confirmation box, create the runbook job, and approve
+it from the Approvals panel when required. The job output and target assignment
+state appear in the Run and Jobs areas.
+
+See [docs/runbooks.md](docs/runbooks.md) for the full schema, primitive list,
+idempotency rules, and signed dispatch details.
+
+### Policies
+
+A policy is a desired-state document. It answers "what should be true for this
+agent or group of agents?" rather than "run these steps right now".
+
+Minimal policy:
+
+```yaml
+apiVersion: fleet.sponzey.dev/v1alpha1
+kind: Policy
+metadata:
+  id: policy-nginx-running
+  name: nginx-running
+  version: 1
+spec:
+  selector:
+    matchLabels:
+      role: web
+  checks:
+    - id: nginx-service
+      service:
+        name: nginx
+        state: running
+  schedule:
+    intervalSeconds: 300
+  remediation:
+    runbookRef: runbooks/nginx-restart.yml
+    approvalRequired: true
+```
+
+Current policy behavior:
+
+- Policies are stored as source documents after domain validation.
+- Web Admin can save policies, list policies, assign a selected policy directly
+
+  to a selected agent, and store a drift interval for that policy-agent pair.
+- Agent inventory includes assigned policy ids.
+- Drift reports can be viewed as latest and paged history.
+- A policy does not change a host by itself. Remediation must go through an
+
+  approval workflow and a runbook-style execution path.
+- Scheduled drift entries are stored and queried. The controller scheduled
+
+  drift worker creates signed due drift-check jobs automatically; create an
+  explicit drift-check job when you need an immediate out-of-cycle check.
+
+In Web Admin, paste a policy into the Policies panel and save it. Select an
+agent, select the policy, then use "Assign selected policy" to attach it to that
+agent. Set "Drift interval seconds" and schedule drift when you want the
+controller to remember the intended check cadence. Use the Drift area to inspect
+the latest report and history.
+
+See [docs/policy.md](docs/policy.md) and [docs/api.md](docs/api.md) for the
+policy API, drift report fields, and current scheduling boundary.
+
 ## How Run Works
 
 The controller does not open a connection to an agent. Each agent opens one
@@ -353,6 +496,11 @@ queued until they reconnect.
 When a job is created, the controller stores the selector source and a target
 snapshot. Later label or status changes do not change the job's original target
 set.
+
+The Web Admin Run and Runbooks panels expose selector input and "Preview
+targets" controls for command and runbook jobs. The UI displays the controller
+preview response and blocks selector-based submission only when the response has
+zero dispatchable targets.
 
 For multi-agent jobs, create the job after checking the preview result. The
 controller creates one assignment per target in that snapshot. The optional job

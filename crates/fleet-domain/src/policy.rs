@@ -110,6 +110,77 @@ pub struct PolicyRemediation {
     pub approval_required: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemediationPlan {
+    pub runbook_ref: String,
+    pub approval_required: bool,
+    pub risk_summary: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemediationStatus {
+    Proposed,
+    PendingApproval,
+    Approved,
+    JobCreated,
+    Running,
+    SucceededPendingVerify,
+    Resolved,
+    Failed,
+    Rejected,
+    Expired,
+    Canceled,
+}
+
+impl RemediationStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Proposed => "proposed",
+            Self::PendingApproval => "pending_approval",
+            Self::Approved => "approved",
+            Self::JobCreated => "job_created",
+            Self::Running => "running",
+            Self::SucceededPendingVerify => "succeeded_pending_verify",
+            Self::Resolved => "resolved",
+            Self::Failed => "failed",
+            Self::Rejected => "rejected",
+            Self::Expired => "expired",
+            Self::Canceled => "canceled",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "proposed" => Some(Self::Proposed),
+            "pending_approval" => Some(Self::PendingApproval),
+            "approved" => Some(Self::Approved),
+            "job_created" => Some(Self::JobCreated),
+            "running" => Some(Self::Running),
+            "succeeded_pending_verify" => Some(Self::SucceededPendingVerify),
+            "resolved" => Some(Self::Resolved),
+            "failed" => Some(Self::Failed),
+            "rejected" => Some(Self::Rejected),
+            "expired" => Some(Self::Expired),
+            "canceled" => Some(Self::Canceled),
+            _ => None,
+        }
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Resolved | Self::Failed | Self::Rejected | Self::Expired | Self::Canceled
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemediationResult {
+    pub job_id: String,
+    pub status: RemediationStatus,
+    pub evidence: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DriftSchedule {
     pub interval: Duration,
@@ -174,10 +245,26 @@ pub fn scheduled_drift_due(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemediationRequest {
+    pub id: String,
     pub policy_id: String,
+    pub policy_name: String,
     pub agent_id: String,
     pub runbook_ref: String,
     pub approval_required: bool,
+    pub status: RemediationStatus,
+    pub risk_summary: String,
+    pub job_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemediationError {
+    MissingRemediation,
+    ApprovalRequired,
+    DriftNotEligible,
+    InvalidTransition {
+        from: RemediationStatus,
+        event: &'static str,
+    },
 }
 
 impl RemediationRequest {
@@ -185,6 +272,7 @@ impl RemediationRequest {
         policy: &Policy,
         agent_id: impl Into<String>,
     ) -> Result<Self, PolicyParseError> {
+        let agent_id = agent_id.into();
         let remediation = policy
             .remediation
             .as_ref()
@@ -193,11 +281,175 @@ impl RemediationRequest {
             return Err(PolicyParseError::RemediationRequiresApproval);
         }
         Ok(Self {
+            id: format!("remediation-{}-{agent_id}", policy.id),
             policy_id: policy.id.clone(),
+            policy_name: policy.name.clone(),
+            agent_id,
+            runbook_ref: remediation.runbook_ref.clone(),
+            approval_required: true,
+            status: RemediationStatus::Proposed,
+            risk_summary: "policy remediation requires approval".to_owned(),
+            job_id: None,
+        })
+    }
+
+    pub fn propose_from_drift(
+        id: impl Into<String>,
+        policy: &Policy,
+        agent_id: impl Into<String>,
+        drift: &DriftReport,
+    ) -> Result<Self, RemediationError> {
+        if drift.status != DriftStatus::Drifted || drift.policy_name != policy.name {
+            return Err(RemediationError::DriftNotEligible);
+        }
+        let remediation = policy
+            .remediation
+            .as_ref()
+            .ok_or(RemediationError::MissingRemediation)?;
+        if !remediation.approval_required {
+            return Err(RemediationError::ApprovalRequired);
+        }
+        Ok(Self {
+            id: id.into(),
+            policy_id: policy.id.clone(),
+            policy_name: policy.name.clone(),
             agent_id: agent_id.into(),
             runbook_ref: remediation.runbook_ref.clone(),
             approval_required: true,
+            status: RemediationStatus::Proposed,
+            risk_summary: format!(
+                "drifted policy {} requires approved runbook remediation",
+                policy.id
+            ),
+            job_id: None,
         })
+    }
+
+    pub fn plan(&self) -> RemediationPlan {
+        RemediationPlan {
+            runbook_ref: self.runbook_ref.clone(),
+            approval_required: self.approval_required,
+            risk_summary: self.risk_summary.clone(),
+        }
+    }
+
+    pub fn request_approval(&mut self) -> Result<(), RemediationError> {
+        self.transition(
+            "request_approval",
+            &[RemediationStatus::Proposed],
+            RemediationStatus::PendingApproval,
+        )
+    }
+
+    pub fn approve(&mut self) -> Result<(), RemediationError> {
+        self.transition(
+            "approve",
+            &[RemediationStatus::PendingApproval],
+            RemediationStatus::Approved,
+        )
+    }
+
+    pub fn create_job(&mut self, job_id: impl Into<String>) -> Result<(), RemediationError> {
+        self.transition(
+            "create_job",
+            &[RemediationStatus::Approved],
+            RemediationStatus::JobCreated,
+        )?;
+        self.job_id = Some(job_id.into());
+        Ok(())
+    }
+
+    pub fn mark_running(&mut self) -> Result<(), RemediationError> {
+        self.transition(
+            "mark_running",
+            &[RemediationStatus::JobCreated],
+            RemediationStatus::Running,
+        )
+    }
+
+    pub fn job_succeeded(&mut self) -> Result<(), RemediationError> {
+        self.transition(
+            "job_succeeded",
+            &[RemediationStatus::Running],
+            RemediationStatus::SucceededPendingVerify,
+        )
+    }
+
+    pub fn verify_resolved(&mut self) -> Result<RemediationResult, RemediationError> {
+        self.transition(
+            "verify_resolved",
+            &[RemediationStatus::SucceededPendingVerify],
+            RemediationStatus::Resolved,
+        )?;
+        Ok(RemediationResult {
+            job_id: self.job_id.clone().unwrap_or_default(),
+            status: self.status,
+            evidence: "drift evidence verified".to_owned(),
+        })
+    }
+
+    pub fn reject(&mut self) -> Result<(), RemediationError> {
+        self.transition(
+            "reject",
+            &[
+                RemediationStatus::Proposed,
+                RemediationStatus::PendingApproval,
+            ],
+            RemediationStatus::Rejected,
+        )
+    }
+
+    pub fn expire(&mut self) -> Result<(), RemediationError> {
+        self.transition(
+            "expire",
+            &[
+                RemediationStatus::Proposed,
+                RemediationStatus::PendingApproval,
+            ],
+            RemediationStatus::Expired,
+        )
+    }
+
+    pub fn cancel(&mut self) -> Result<(), RemediationError> {
+        self.transition(
+            "cancel",
+            &[
+                RemediationStatus::Proposed,
+                RemediationStatus::PendingApproval,
+                RemediationStatus::Approved,
+                RemediationStatus::JobCreated,
+                RemediationStatus::Running,
+            ],
+            RemediationStatus::Canceled,
+        )
+    }
+
+    pub fn mark_failed(&mut self) -> Result<(), RemediationError> {
+        self.transition(
+            "fail",
+            &[
+                RemediationStatus::JobCreated,
+                RemediationStatus::Running,
+                RemediationStatus::SucceededPendingVerify,
+            ],
+            RemediationStatus::Failed,
+        )
+    }
+
+    fn transition(
+        &mut self,
+        event: &'static str,
+        allowed_from: &[RemediationStatus],
+        to: RemediationStatus,
+    ) -> Result<(), RemediationError> {
+        if self.status.is_terminal() || !allowed_from.contains(&self.status) {
+            return Err(RemediationError::InvalidTransition {
+                from: self.status,
+                event,
+            });
+        }
+        self.status = to;
+        Ok(())
     }
 }
 
@@ -207,6 +459,7 @@ pub enum PolicyParseError {
     UnsupportedKind(String),
     UnsupportedCheck(String),
     UnsupportedServiceState(String),
+    InvalidChecksum(String),
     InvalidVersion(String),
     InvalidSchedule(String),
     InvalidSelector(String),
@@ -224,6 +477,7 @@ impl Display for PolicyParseError {
             Self::UnsupportedServiceState(state) => {
                 write!(formatter, "unsupported service state: {state}")
             }
+            Self::InvalidChecksum(value) => write!(formatter, "invalid file sha256: {value}"),
             Self::InvalidVersion(value) => write!(formatter, "invalid policy version: {value}"),
             Self::InvalidSchedule(value) => write!(formatter, "invalid drift schedule: {value}"),
             Self::InvalidSelector(selector) => {
@@ -385,7 +639,12 @@ pub fn parse_policy_document(body: &str) -> Result<Policy, PolicyParseError> {
                     "package:" => builder.kind = Some("package".to_owned()),
                     "file:" => builder.kind = Some("file".to_owned()),
                     value if value.ends_with(':') => {
-                        builder.kind = Some(value.trim_end_matches(':').to_owned());
+                        let key = value.trim_end_matches(':').trim();
+                        if matches!(key, "name" | "state" | "path" | "sha256") {
+                            builder.fields.insert(key.to_owned(), String::new());
+                        } else {
+                            builder.kind = Some(key.to_owned());
+                        }
                     }
                     _ => {
                         if let Some((key, value)) = line.split_once(':') {
@@ -522,6 +781,7 @@ impl CheckBuilder {
                     .get("sha256")
                     .ok_or(PolicyParseError::MissingField("file.sha256"))?
                     .to_owned();
+                validate_file_sha256(&sha256)?;
                 Ok(PolicyCheck::FileChecksum {
                     id: self.id,
                     path,
@@ -531,6 +791,20 @@ impl CheckBuilder {
             Some(kind) => Err(PolicyParseError::UnsupportedCheck(kind.to_owned())),
             None => Err(PolicyParseError::MissingField("check kind")),
         }
+    }
+}
+
+fn validate_file_sha256(value: &str) -> Result<(), PolicyParseError> {
+    if value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        Ok(())
+    } else {
+        Err(PolicyParseError::InvalidChecksum(
+            "file.sha256 must be 64 lowercase hex characters".to_owned(),
+        ))
     }
 }
 
@@ -685,6 +959,96 @@ spec:
     }
 
     #[test]
+    fn remediation_request_requires_drifted_policy_with_remediation() {
+        let policy = parse_policy_document(&format!(
+            "{NGINX_RUNNING}\nremediation:\n  runbookRef: fix-nginx.yml\n  approvalRequired: true\n"
+        ))
+        .unwrap();
+        let compliant = DriftReport {
+            policy_name: "nginx-running".to_owned(),
+            status: DriftStatus::Compliant,
+            severity: DriftSeverity::None,
+            acknowledgement: DriftAcknowledgement::Open,
+            expected: "service nginx running".to_owned(),
+            actual: "active".to_owned(),
+        };
+        let unknown = DriftReport {
+            policy_name: "nginx-running".to_owned(),
+            status: DriftStatus::Unknown,
+            severity: DriftSeverity::Unknown,
+            acknowledgement: DriftAcknowledgement::Open,
+            expected: "service nginx running".to_owned(),
+            actual: "systemd unavailable".to_owned(),
+        };
+        let drifted = DriftReport::drifted("nginx-running", "expected", "actual");
+        let no_remediation = parse_policy_document(NGINX_RUNNING).unwrap();
+
+        assert!(matches!(
+            RemediationRequest::propose_from_drift("rem-1", &policy, "agent-1", &compliant),
+            Err(RemediationError::DriftNotEligible)
+        ));
+        assert!(matches!(
+            RemediationRequest::propose_from_drift("rem-1", &policy, "agent-1", &unknown),
+            Err(RemediationError::DriftNotEligible)
+        ));
+        assert!(matches!(
+            RemediationRequest::propose_from_drift("rem-1", &no_remediation, "agent-1", &drifted),
+            Err(RemediationError::MissingRemediation)
+        ));
+    }
+
+    #[test]
+    fn remediation_request_state_machine_rejects_invalid_transitions() {
+        let policy = parse_policy_document(&format!(
+            "{NGINX_RUNNING}\nremediation:\n  runbookRef: fix-nginx.yml\n  approvalRequired: true\n"
+        ))
+        .unwrap();
+        let drifted = DriftReport::drifted("nginx-running", "expected", "actual");
+        let mut request =
+            RemediationRequest::propose_from_drift("rem-1", &policy, "agent-1", &drifted).unwrap();
+
+        assert_eq!(request.status, RemediationStatus::Proposed);
+        assert!(matches!(
+            request.create_job("job-1"),
+            Err(RemediationError::InvalidTransition { .. })
+        ));
+
+        request.request_approval().unwrap();
+        assert_eq!(request.status, RemediationStatus::PendingApproval);
+        request.approve().unwrap();
+        request.create_job("job-1").unwrap();
+        request.mark_running().unwrap();
+        request.job_succeeded().unwrap();
+        request.verify_resolved().unwrap();
+        assert_eq!(request.status, RemediationStatus::Resolved);
+        assert_eq!(request.job_id.as_deref(), Some("job-1"));
+        assert!(matches!(
+            request.reject(),
+            Err(RemediationError::InvalidTransition { .. })
+        ));
+    }
+
+    #[test]
+    fn remediation_status_parse_roundtrips_persisted_values() {
+        for status in [
+            RemediationStatus::Proposed,
+            RemediationStatus::PendingApproval,
+            RemediationStatus::Approved,
+            RemediationStatus::JobCreated,
+            RemediationStatus::Running,
+            RemediationStatus::SucceededPendingVerify,
+            RemediationStatus::Resolved,
+            RemediationStatus::Failed,
+            RemediationStatus::Rejected,
+            RemediationStatus::Expired,
+            RemediationStatus::Canceled,
+        ] {
+            assert_eq!(RemediationStatus::parse(status.as_str()), Some(status));
+        }
+        assert_eq!(RemediationStatus::parse("unknown"), None);
+    }
+
+    #[test]
     fn parses_file_checksum_check() {
         let body = r#"
 apiVersion: fleet.sponzey.dev/v1alpha1
@@ -699,14 +1063,49 @@ spec:
     - id: config-file
       file:
         path: /etc/nginx/nginx.conf
-        sha256: abc123
+        sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 "#;
 
         let policy = parse_policy_document(body).unwrap();
 
         assert!(matches!(
             policy.checks[0],
-            PolicyCheck::FileChecksum { ref path, .. } if path == "/etc/nginx/nginx.conf"
+            PolicyCheck::FileChecksum { ref path, ref sha256, .. }
+                if path == "/etc/nginx/nginx.conf"
+                    && sha256 == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         ));
+    }
+
+    #[test]
+    fn rejects_invalid_file_checksum_values() {
+        for invalid in [
+            "",
+            "abc123",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+        ] {
+            let body = format!(
+                r#"
+apiVersion: fleet.sponzey.dev/v1alpha1
+kind: Policy
+metadata:
+  name: file-check
+spec:
+  selector:
+    matchLabels:
+      role: web
+  checks:
+    - id: config-file
+      file:
+        path: /etc/nginx/nginx.conf
+        sha256: {invalid}
+"#
+            );
+
+            assert!(matches!(
+                parse_policy_document(&body),
+                Err(PolicyParseError::InvalidChecksum(_))
+            ));
+        }
     }
 }

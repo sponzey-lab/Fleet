@@ -13,18 +13,23 @@ This document captures the current post-MVP state and known limits.
 - Heartbeat, facts, metrics, operational log upload, and task dispatch are separate intervals/flows.
 - Controller-signed command task envelope.
 - Agent-side signature, expiry, replay nonce, and target validation.
+- Agent local file-backed replay nonce store rejects consumed task nonce after restart and fails closed if the store is unreadable or corrupt.
 - High-risk command confirmation boundary.
+- Approval request lifecycle with approve/reject/expire APIs and Web Admin queue.
+- Selector preview, target snapshot storage, assignment state tracking, fanout concurrency, maxFailures, and partial-success aggregation.
 - Command output storage separated from application logs.
 - Facts, metrics, and drift snapshot storage with cursor paging API and agent/controller time fields.
 - Agent inventory and label update API.
 - Controller-served static `/admin` Web Admin UI.
 - MVP runbook parser, `sponzey apply` validation-only command, and signed controller-to-agent runbook dispatch API.
-- Explicit retention cleanup command for bounded job output, facts, and metrics storage.
+- Explicit retention cleanup command and controller-managed retention worker for bounded job output, facts, metrics, and agent log storage.
 - Local file log tail with redaction, follow mode, max-duration guard, and journald shortcut skeleton.
-- Local policy drift check engine for service running, package present, and file SHA-256 checks with signed drift job dispatch.
-- Web Admin UI can select an agent, create a confirmed high-risk command job, and view polling-based job output.
+- Local policy drift check engine for service running, package present, and strict 64-character lowercase file SHA-256 checks with signed drift job dispatch.
+- Agent capability snapshot reporting, SQLite persistence, Agent API/Web Admin summary, and dispatch-time unsupported capability rejection.
+- Web Admin UI can inspect agents, reported capabilities, facts, metrics, logs, drift latest/history, jobs, target assignments, audit events, enrollment tokens, approvals, runbook jobs, direct policy assignment, and selector target previews for command/runbook job creation.
+- Audit export API and `sponzey audit export` CLI with category filtering, cursor paging, JSONL output, and SecretRef marker redaction.
 - npm package wrapper for Rust binary distribution.
-- Standalone release tarball packaging with `SHA256SUMS` and local verification script.
+- Standalone release tarball packaging with `SHA256SUMS`, checksum verification, and release checksum signature sign/verify scripts.
 - Linux systemd install/start/status/log/uninstall commands with dry-run rendering.
 - `sponzey upgrade --dry-run` policy inspection for external package/artifact upgrades.
 - `sponzey demo` local loopback demo through the npm wrapper.
@@ -32,21 +37,31 @@ This document captures the current post-MVP state and known limits.
 - Immediate dispatch and remote TLS loopback smoke scripts.
 - Hardening audit script.
 
-## Known Limits
+## Known Limits And Post-MVP Phase Mapping
 
 - Controller HTTP/WebSocket serving uses Axum.
 - HTTPS is supported through built-in TLS or reverse proxy deployment. HTTP remains allowed for tests only and emits warnings.
-- No admin token CLI profile storage yet.
+- CLI login/profile storage exists at `.sponzey/cli-profile.json` with owner-only permission checks. OIDC/SSO, API token lifecycle, project/team RBAC, and full multi-admin sessions are Phase 6 work.
 - Agent command execution streams output chunks before process completion; Web Admin UI uses polling/storage.
 - Web Admin UI covers agent inventory, command job creation, output, facts, metrics, drift, jobs, and audit.
-- No Ansible compatibility layer.
-- `sponzey apply` validates only. Package/service/file primitive execution requires controller-signed runbook dispatch, high-risk confirmation, and an enrolled agent.
+- No Ansible compatibility layer exists. The documented subset import/report path is Phase 13 work and must not execute during import.
+- `sponzey apply` validates only and does not resolve `secretRefs`. Package/service/file primitive execution requires controller-signed runbook dispatch, high-risk confirmation, and an enrolled agent. Plain-variable `file.template` parser/render/runner mapping, explicit SecretProvider-compatible resolver injection, TaskResult artifact metadata reporting with optional non-secret body persistence, SQLite rendered artifact metadata storage, a local `ArtifactStore` body contract, Controller artifact retrieval API, Web Admin artifact metadata/retrieval surface, typed `SecretRef`, application `SecretProvider` contract, typed startup `SecretProviderSettings`, controller bootstrap provider factory, and agent runbook resolver handoff exist. Product provider source configuration, external provider adapters, and S3-compatible storage remain Post-MVP work.
+- S3-compatible adapter decision is recorded: implementation is deferred until typed bootstrap artifact store settings, external secret reference credentials, feature-gated contract tests, and redaction tests exist.
 - Systemd install/start commands are implemented for Linux root environments; reboot verification remains manual.
-- Automatic self-upgrade, `.deb`, `.rpm`, Homebrew, Docker, Windows service packaging, and release signature verification are not implemented yet.
-- No background retention cleanup worker yet.
-- No production key rotation flow yet.
-- Approval request lifecycle APIs exist for approve/reject/expire. Dedicated Web Admin approval queue and RBAC/admin identity separation remain follow-up areas.
-- Assignment ack/start/reject protocol states are implemented; job cancel and command timeout now produce separate `canceled` and `expired` terminal states. Multi-agent fanout aggregation remains a follow-up area.
+- Automatic self-upgrade, one-line installer, `.deb`, `.rpm`, Homebrew, Docker, and Windows service packaging are Phase 9 and Phase 12 work.
+- Release checksum signature verification scripts exist for `SHA256SUMS.sig`; official release key publication and operational signing process are Phase 9 work.
+- Retention worker uses code-default MVP durations and has no runtime configuration endpoint or HA lease/leader election. Cleanup keeps audit events out of normal deletion and separates job output, facts, metrics, and agent log cutoffs. HA-safe lease coordination is Phase 10 work; runtime config patching remains prohibited.
+- No production controller signing key rotation, agent certificate rotation, or mTLS client-certificate lifecycle exists. These are Phase 5 work.
+- Capability reporting, persistence, and basic dispatch rejection gate exist with a 24-hour stale snapshot guard. Platform-specific privilege/package/service probing and manual platform smoke are Phase 12 and Phase 15 work.
+- Replay nonce protection is local and file-backed on each agent. Cross-controller/global replay correlation is not implemented; HA-safe coordination belongs to Phase 10.
+- Approval request lifecycle and Web Admin approval queue exist. Product-grade multi-admin identity, sessions, and external auth are Phase 6 work.
+- Assignment ack/start/reject protocol states are implemented; job cancel and command timeout now produce separate `canceled` and `expired` terminal states. Multi-agent fanout aggregation, capability-aware dispatch, queued-only dispatch claim, and send-failure release exist. Release does not requeue terminal assignments. Phase 15 must add long-running recovery smoke for reconnect, retry, timeout, and output replay cases before scale readiness is accepted.
+- Scheduled drift entries are stored, queried, and consumed by a controller worker that creates signed due drift-check jobs. The worker is single-controller safe only; multi-controller lease/leader election is Phase 10 work.
+- Policy-based remediation request domain/application proposal state machine, SQLite metadata persistence, persisted approval request creation, approved signed runbook job creation, result verification/drift resolution application path, Controller API surface, and thin CLI/Web Admin surface exist. Auto-remediation worker remains Phase 2 work. Phase 3 now has typed database backend settings, startup-only Postgres URL/SSL mode/connect timeout/pool parsing, a blocking Postgres client pool boundary, a minimum native TLS adapter for `sslmode=prefer/require`, a shared SQLite repository contract harness, a feature-gated Postgres migration skeleton with ignored integration gate, repository slices through RemediationRequest, `ControllerStore`/`ControllerStoreRef` boundaries, feature-gated Controller Postgres open/migration wiring, direct server runtime adapter dispatch, typed job+assignment transaction boundary, and queued-only dispatch claim/release contract. Custom CA/client certificate rotation, scheduled drift/retention lease, and HA claim semantics remain. Current drift-check jobs do not automatically remediate.
+- Audit events are append-only at the controller API/application boundary and are excluded from normal retention cleanup. The SQLite MVP store is not a tamper-proof WORM audit store; tamper-evident hash chain, signed export manifest, and compliance report are Phase 11 work.
+- Slack/Teams notification, Prometheus/OpenTelemetry export, and Git runbook/policy sync are Phase 8 and Phase 7 work.
+- Plugin/external adapter execution is not available. Signed manifest, disabled-by-default policy, and approval/capability/audit boundaries are Phase 14 work.
+- 100-agent heartbeat and 1,000-output load gates are Phase 15 work.
 
 ## Demo Safety
 
@@ -73,6 +88,7 @@ npm run typecheck --workspace web-admin
 ./scripts/smoke_mvp.sh
 ./scripts/smoke_immediate_dispatch.sh
 ./scripts/smoke_remote_tls_loopback.sh
+./scripts/signature_verification_smoke.sh
 ./scripts/hardening_audit.sh
 ```
 

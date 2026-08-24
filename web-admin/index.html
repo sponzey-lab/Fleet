@@ -63,6 +63,31 @@
           <div id="enrollment-tokens-list" class="list empty">No enrollment tokens loaded.</div>
         </article>
 
+        <article id="signing-rotation-panel" class="panel signing-panel">
+          <div class="panel-heading">
+            <h2>Controller Signing</h2>
+            <div class="panel-actions">
+              <span class="muted">Rotation trust rollout</span>
+              <button id="refresh-signing-rotation" type="button">Refresh</button>
+            </div>
+          </div>
+          <div id="signing-rotation-status" class="signing-grid empty">No signing status loaded.</div>
+          <form id="staged-trust-bundle-form" class="signing-form">
+            <label for="staged-previous-public-key-path">Previous public key path</label>
+            <input id="staged-previous-public-key-path" name="previous-public-key-path" autocomplete="off" placeholder="/var/lib/sponzey-fleet/controller/controller_public.key.bak" />
+            <label for="staged-agent-ids">Agent IDs</label>
+            <textarea id="staged-agent-ids" name="agent-ids" rows="3" placeholder="agent-1, agent-2"></textarea>
+            <label for="staged-batch-size">Batch size</label>
+            <input id="staged-batch-size" name="batch-size" type="number" min="1" value="10" />
+            <label for="staged-max-failures">Max failures</label>
+            <input id="staged-max-failures" name="max-failures" type="number" min="0" value="1" />
+            <label for="staged-ack-timeout-seconds">Ack timeout seconds</label>
+            <input id="staged-ack-timeout-seconds" name="ack-timeout-seconds" type="number" min="1" value="30" />
+            <button type="submit">Run staged tick</button>
+          </form>
+          <div id="staged-trust-bundle-result" class="table-view empty">No staged rollout result.</div>
+        </article>
+
         <article class="panel">
           <div class="panel-heading">
             <h2>Facts</h2>
@@ -107,10 +132,20 @@
             <span class="muted">Signed high-risk command</span>
           </div>
           <form id="run-command-form" class="run-form">
-            <label for="command-program">Program</label>
-            <input id="command-program" name="program" autocomplete="off" value="uptime" />
-            <label for="command-args">Arguments</label>
-            <input id="command-args" name="args" autocomplete="off" placeholder="-a" />
+            <div class="form-field">
+              <label for="command-program">Program</label>
+              <input id="command-program" name="program" autocomplete="off" value="uptime" />
+            </div>
+            <div class="form-field">
+              <label for="command-args">Arguments</label>
+              <input id="command-args" name="args" autocomplete="off" placeholder="-a" />
+            </div>
+            <div class="form-field">
+              <label for="command-selector">Target selector</label>
+              <input id="command-selector" name="selector" autocomplete="off" placeholder="role=web" />
+            </div>
+            <button id="preview-command-targets" type="button">Preview targets</button>
+            <div id="command-target-preview" class="target-preview empty">No selector preview.</div>
             <label class="checkbox-row">
               <input name="confirm-risk" type="checkbox" />
               <span>Confirm high-risk execution</span>
@@ -118,6 +153,7 @@
             <button type="submit">Run</button>
           </form>
           <div id="job-targets" class="table-view empty">Run a command or select a job.</div>
+          <div id="job-artifacts" class="artifact-list empty">No rendered artifacts.</div>
           <pre id="job-output" class="snapshot output-viewer">Run a command or select a job to view output.</pre>
         </article>
 
@@ -130,6 +166,36 @@
             </div>
           </div>
           <div id="approvals-list" class="list empty">No approvals loaded.</div>
+        </article>
+
+        <article class="panel remediation-panel">
+          <div class="panel-heading">
+            <h2>Remediations</h2>
+            <div class="panel-actions">
+              <span class="muted">Policy drift fixes</span>
+              <button id="refresh-remediations" type="button">Refresh</button>
+            </div>
+          </div>
+          <div id="remediations-list" class="list compact-list empty">No remediations loaded.</div>
+          <form id="remediation-form" class="remediation-form">
+            <label for="remediation-id">Remediation ID</label>
+            <input id="remediation-id" name="remediation-id" autocomplete="off" />
+            <label for="remediation-approval-id">Approval ID</label>
+            <input id="remediation-approval-id" name="approval-id" autocomplete="off" />
+            <label for="remediation-job-id">Job ID</label>
+            <input id="remediation-job-id" name="job-id" autocomplete="off" />
+            <label for="remediation-runbook-document">Approved runbook YAML</label>
+            <textarea id="remediation-runbook-document" name="runbook-document" rows="6"></textarea>
+            <div class="button-row">
+              <button id="request-remediation-approval" type="button">Request approval</button>
+              <button id="approve-remediation" type="button">Approve job</button>
+              <button id="mark-remediation-running" type="button">Running</button>
+              <button id="record-remediation-success" type="button">Success</button>
+              <button id="record-remediation-failed" type="button">Failed</button>
+              <button id="verify-remediation" type="button">Verify</button>
+            </div>
+          </form>
+          <pre id="remediation-result" class="snapshot output-viewer">Select or enter a remediation request.</pre>
         </article>
 
         <article class="panel runbook-panel">
@@ -146,6 +212,10 @@ steps:
   - id: collect-facts
     facts.collect: {}
 </textarea>
+            <label for="runbook-selector">Target selector</label>
+            <input id="runbook-selector" name="selector" autocomplete="off" placeholder="role=web" />
+            <button id="preview-runbook-targets" type="button">Preview targets</button>
+            <div id="runbook-target-preview" class="target-preview empty">No selector preview.</div>
             <label class="checkbox-row">
               <input name="confirm-risk" type="checkbox" />
               <span>Confirm runbook execution</span>

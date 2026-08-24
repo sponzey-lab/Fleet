@@ -25,12 +25,14 @@ Controller 하나에 agent 여러 대가 붙습니다.
 
 헷갈리기 쉬운 단어:
 
-| 단어               | 뜻                                                             |
-| ---------------- | ------------------------------------------------------------- |
-| Data directory   | Sponzey가 key, DB, 로컬 설정을 저장하는 폴더입니다. 로컬 예시는 `.sponzey`를 씁니다.  |
-| Admin token      | `sponzey controller init`이 출력합니다. Web Admin UI와 보호 API에만 씁니다. |
-| Enrollment token | `sponzey enroll-token create`가 출력합니다. agent를 등록할 때 한 번 씁니다.   |
-| Controller URL   | agent가 controller에 접속할 주소입니다. URL이 로컬이든 HTTPS든 설정 순서는 같습니다.   |
+| 단어               | 뜻                                                                  |
+| ---------------- | ------------------------------------------------------------------ |
+| Data directory   | Sponzey가 key, DB, 로컬 설정을 저장하는 폴더입니다. 로컬 예시는 `.sponzey`를 씁니다.       |
+| Admin token      | `sponzey controller init`이 출력합니다. Web Admin UI와 보호 API에만 씁니다.      |
+| Enrollment token | `sponzey enroll-token create`가 출력합니다. agent를 등록할 때 한 번 씁니다.        |
+| Controller URL   | agent가 controller에 접속할 주소입니다. URL이 로컬이든 HTTPS든 설정 순서는 같습니다.        |
+| Runbook          | 한 번 실행할 YAML 운영 절차입니다. 선택한 agent에 순서가 있는 step을 signed job으로 실행합니다. |
+| Policy           | 원하는 상태를 저장한 문서입니다. Drift 확인과 remediation 요청 판단 기준으로 사용합니다.         |
 
 Facts와 Metrics는 서로 다른 데이터입니다.
 
@@ -90,15 +92,18 @@ sponzey-linux-arm64.tar.gz
 sponzey-linux-x64.tar.gz
 ```
 
-설치 전에 checksum을 확인합니다.
+설치 전에 checksum을 확인합니다. Release가 `SHA256SUMS.sig`를 게시한다면,
+archive를 신뢰하기 전에 고정된 release public key로 checksum manifest 서명도
+검증합니다.
 
 ```bash
 ./scripts/verify_standalone_artifacts.sh dist/release
+./scripts/verify_release_signature.sh dist/release ./release-public-key.pem
 ```
 
-release workflow는 archive와 함께 `SHA256SUMS`를 게시합니다. signature
-검증은 아직 구현하지 않았으므로, 현재 integrity 경계는 checksum 검증과
-release provenance 확인입니다.
+release workflow는 archive와 함께 `SHA256SUMS`를 게시합니다. Signature
+검증은 checksum manifest를 대상으로 하며, release public key는 다운로드한
+archive 내부가 아니라 프로젝트 release channel에서 얻어야 합니다.
 
 장시간 실행하는 Linux host에서는 resolved binary를 systemd service로
 등록합니다.
@@ -148,6 +153,24 @@ payload가 암호화되지 않으므로 로컬 또는 짧은 테스트 용도로
 합니다. 상세 API 계약, public/internal endpoint 경계, pagination 형태,
 deprecation policy는 [docs/api.md](docs/api.md)에 유지합니다. agent WebSocket
 protocol은 [docs/protocol.md](docs/protocol.md)에 별도로 문서화합니다.
+
+반복 CLI 작업에는 controller endpoint와 admin token을 local profile에 저장할 수
+있습니다.
+
+```bash
+sponzey login --controller-url https://fleet.example.com --admin-token <admin-token>
+sponzey agents remote-list
+sponzey selectors preview --selector role=web
+sponzey jobs list
+sponzey approvals list
+sponzey audit export --category security --limit 100 > audit-security.jsonl
+```
+
+기본 profile 경로는 `.sponzey/cli-profile.json`입니다. 이 파일은 secret으로
+취급해야 합니다. CLI는 owner-only permission으로 저장하고, 보호 remote command는
+group/world-readable profile 파일을 거부합니다. `--controller-url`,
+`--admin-token` 같은 command flag는 해당 process 호출에서만 profile 값을
+override합니다.
 
 현재 bootstrap admin token은 `bootstrap-admin` actor와 `owner` role로
 매핑됩니다. 최소 role/permission 경계는 [docs/security.md](docs/security.md)에
@@ -302,6 +325,126 @@ heartbeat는 생존 신호일 뿐이며 task dispatch 주기를 제어하지 않
 기준으로 전송됩니다. task assignment는 이 telemetry 주기와 별개로
 persistent session에서 push됩니다.
 
+## Runbook과 Policy
+
+Runbook과 Policy는 목적이 다릅니다.
+
+| 기능      | 언제 쓰나                                                                                 | 실제 동작                                                                                                    |
+| ------- | ------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| Runbook | facts 수집, port 확인, package 설치, service 시작, file 복사처럼 순서가 있는 운영 절차를 한 번 실행하고 싶을 때 씁니다. | Controller가 YAML을 검증하고 signed runbook job을 만들며, 필요하면 approval을 기다린 뒤 선택한 agent session으로 dispatch합니다.    |
+| Policy  | "web agent에서는 nginx가 실행 중이어야 한다"처럼 시간이 지나도 유지되어야 하는 기대 상태를 정의할 때 씁니다.                 | Controller가 policy source를 저장하고 agent에 배정할 수 있으며, drift schedule을 저장하고 drift check가 실제 상태와 기대 상태를 비교합니다. |
+
+### Runbook
+
+Runbook은 반복 가능한 운영 step을 위한 작은 Sponzey YAML 문서입니다. Ansible
+playbook이 아니며, Ansible 문법 호환을 목표로 하지 않습니다. 목표는 예측 가능한
+실행과 audit입니다. 모든 runbook 실행은 job이 되고, assignment 상태, output
+chunk, result status, approval event, audit event가 남습니다.
+
+가장 작은 runbook 예시:
+
+```yaml
+apiVersion: fleet.sponzey.dev/v1alpha1
+kind: Runbook
+name: quick-inventory
+matchLabels:
+  role: web
+steps:
+  - id: collect-facts
+    facts.collect: {}
+```
+
+자주 쓰는 step은 다음과 같습니다.
+
+- `facts.collect`, `metrics.snapshot`: 읽기 전용 snapshot 수집.
+- `port.check`, `process.check`: 읽기 전용 확인.
+- `package`, `service`, `file.copy`: 제한된 idempotent 변경 작업.
+
+중요한 동작 경계:
+
+- `sponzey apply <file>`은 runbook을 로컬에서 검증만 합니다. 원격 privileged
+
+  변경을 실행하지 않습니다.
+- `POST /api/jobs/runbook`과 Web Admin의 Runbooks panel이 실제 controller-signed
+
+  실행 job을 만듭니다.
+- Runbook job은 하나의 문서 안에 여러 변경 step을 담을 수 있으므로 high-risk로
+
+  취급합니다. Controller가 job을 `pending_approval`로 만들면 승인 전까지 agent로
+  dispatch하지 않습니다.
+- Runbook job request가 `target_agent_ids`, `selector`, `matchLabels`를 지정하면
+
+  request의 대상이 우선합니다. request에 대상이 없을 때만 runbook 문서 안의
+  selector를 사용합니다.
+- `dryRun: true`는 모든 primitive 실행을 건너뜁니다. `checkMode: true`는 읽기 전용
+
+  check는 허용하지만 변경 step은 건너뜁니다.
+
+Web Admin에서는 agent 하나를 선택하거나 Runbooks panel에 target selector를
+입력한 뒤 "Preview targets"로 대상 목록을 먼저 확인합니다. Preview는 controller
+selector API 응답을 그대로 보여주며 matched, dispatch 가능, disabled, offline
+수를 표시합니다. Runbook YAML을 붙여넣거나 수정하고 confirmation checkbox를
+체크한 뒤 runbook job을 만듭니다. Approval이 필요하면 Approvals panel에서
+승인합니다. Job output과 target assignment 상태는 Run과 Jobs 영역에서
+확인합니다.
+
+전체 schema, primitive 목록, idempotency 규칙, signed dispatch 세부 내용은
+[docs/runbooks.md](docs/runbooks.md)를 기준으로 합니다.
+
+### Policy
+
+Policy는 원하는 상태를 적은 문서입니다. "지금 이 step들을 실행하라"가 아니라
+"이 agent 또는 agent 그룹은 어떤 상태여야 하는가"를 표현합니다.
+
+가장 작은 policy 예시:
+
+```yaml
+apiVersion: fleet.sponzey.dev/v1alpha1
+kind: Policy
+metadata:
+  id: policy-nginx-running
+  name: nginx-running
+  version: 1
+spec:
+  selector:
+    matchLabels:
+      role: web
+  checks:
+    - id: nginx-service
+      service:
+        name: nginx
+        state: running
+  schedule:
+    intervalSeconds: 300
+  remediation:
+    runbookRef: runbooks/nginx-restart.yml
+    approvalRequired: true
+```
+
+현재 policy 동작:
+
+- Policy는 domain validation을 통과한 source document로 저장됩니다.
+- Web Admin은 policy 저장, policy 목록 확인, 선택한 policy를 선택한 agent에 직접
+
+  배정, policy-agent 쌍의 drift interval 저장을 지원합니다.
+- Agent inventory에는 배정된 policy id가 포함됩니다.
+- Drift report는 최신값과 cursor paging history로 조회할 수 있습니다.
+- Policy 자체는 host를 변경하지 않습니다. Remediation은 approval workflow와
+
+  runbook 방식의 실행 경로를 거쳐야 합니다.
+- Scheduled drift 항목은 저장하고 조회할 수 있습니다. Controller scheduled drift
+
+  worker가 due schedule을 읽어 signed drift-check job을 자동 생성합니다. 즉시
+  확인이 필요하면 명시적인 drift-check job을 만들어 확인합니다.
+
+Web Admin에서는 Policies panel에 policy를 붙여넣고 저장합니다. Agent를 선택하고
+policy를 선택한 뒤 "Assign selected policy"로 해당 agent에 배정합니다. "Drift
+interval seconds"를 입력하고 schedule drift를 누르면 controller가 의도한 확인
+주기를 저장합니다. Drift 영역에서는 최신 report와 history를 확인합니다.
+
+Policy API, drift report 필드, 현재 scheduling 경계는
+[docs/policy.md](docs/policy.md)와 [docs/api.md](docs/api.md)를 기준으로 합니다.
+
 ## Run은 어떻게 동작하나
 
 Controller는 agent로 직접 접속하지 않습니다. Enrollment가 끝난 agent가
@@ -354,6 +497,10 @@ reconnect 전까지 assignment가 queued 상태로 남습니다.
 Job이 생성되면 controller는 selector source와 target snapshot을 저장합니다.
 이후 agent label이나 status가 바뀌어도 이미 생성된 job의 원래 대상 집합은
 바뀌지 않습니다.
+
+Web Admin의 Run과 Runbooks panel은 command/runbook job 생성용 selector 입력과
+"Preview targets" 버튼을 제공합니다. UI는 controller preview 응답을 표시하고,
+응답의 dispatch 가능 대상 수가 0일 때만 selector 기반 제출을 중단합니다.
 
 Multi-agent job은 preview 결과를 확인한 뒤 생성합니다. Controller는 해당
 snapshot의 target마다 assignment를 하나씩 만듭니다. 선택적인 job `strategy`로

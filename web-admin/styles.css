@@ -158,11 +158,16 @@ button:disabled {
 
 .job-panel,
 .runbook-panel,
+.remediation-panel,
 .policy-panel {
   grid-column: span 2;
 }
 
 .token-panel {
+  grid-column: span 2;
+}
+
+.signing-panel {
   grid-column: span 2;
 }
 
@@ -508,17 +513,32 @@ button:disabled {
 
 .run-form {
   display: grid;
-  grid-template-columns: 0.7fr 1fr auto;
+  grid-template-columns: minmax(140px, 0.7fr) minmax(180px, 1fr) minmax(180px, 1fr) auto;
   gap: 8px;
   align-items: end;
   margin-bottom: 12px;
 }
 
 .runbook-form,
-.policy-form {
+.remediation-form,
+.policy-form,
+.signing-form {
   display: grid;
   gap: 8px;
   margin-bottom: 12px;
+}
+
+.signing-grid {
+  margin-bottom: 12px;
+}
+
+.signing-form {
+  grid-template-columns: minmax(220px, 1fr) minmax(180px, 0.7fr) minmax(140px, 0.5fr);
+  align-items: end;
+}
+
+.signing-form textarea {
+  min-height: 72px;
 }
 
 .token-form {
@@ -529,11 +549,24 @@ button:disabled {
   margin-bottom: 12px;
 }
 
-.run-form label:not(.checkbox-row),
-.token-form label,
+.form-field {
+  display: grid;
+  gap: 6px;
+}
+
+.form-field label,
 .runbook-form label:not(.checkbox-row),
+.remediation-form label,
 .policy-form label,
+.signing-form label,
 .policy-actions label {
+  align-self: start;
+  font-size: 12px;
+  font-weight: 700;
+  color: #4b5568;
+}
+
+.token-form label {
   grid-row: 1;
   align-self: start;
   font-size: 12px;
@@ -569,7 +602,6 @@ button:disabled {
 }
 
 .checkbox-row {
-  grid-row: 1 / span 2;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -577,12 +609,79 @@ button:disabled {
   color: #4b5568;
 }
 
-.run-form button {
-  grid-row: 2;
+.run-form .checkbox-row {
+  grid-column: 1 / span 3;
+}
+
+.target-preview {
+  grid-column: 1 / -1;
+  border: 1px solid #e3e8f0;
+  border-radius: 6px;
+  background: #f8fafc;
+  padding: 10px;
+  overflow: auto;
+}
+
+.target-preview.empty {
+  color: #687385;
+}
+
+.preview-counts {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(90px, 1fr));
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.preview-counts span {
+  display: grid;
+  gap: 2px;
+  border: 1px solid #e3e8f0;
+  border-radius: 6px;
+  background: #fff;
+  padding: 8px;
+}
+
+.preview-counts strong {
+  font-size: 16px;
+}
+
+.preview-counts small {
+  color: #687385;
+  font-size: 11px;
+  text-transform: uppercase;
+}
+
+.preview-warning {
+  border: 1px solid #f5c26b;
+  border-radius: 6px;
+  background: #fff7e6;
+  color: #7a4b00;
+  padding: 8px;
+  margin-bottom: 10px;
+  font-size: 12px;
+  font-weight: 700;
 }
 
 .output-viewer {
   min-height: 120px;
+}
+
+.artifact-list {
+  margin-top: 12px;
+}
+
+.artifact-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.artifact-row small,
+.artifact-row strong {
+  display: block;
+  overflow-wrap: anywhere;
 }
 
 .token-secret {
@@ -624,6 +723,12 @@ button:disabled {
 .token-row button:disabled {
   cursor: not-allowed;
   background: #8792a2;
+}
+
+.button-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 .status-pill.active {
@@ -694,6 +799,7 @@ code {
   .run-form,
   .runbook-form,
   .policy-form,
+  .signing-form,
   .policy-actions,
   .token-form,
   .token-row {
@@ -709,13 +815,15 @@ code {
   .audit-panel,
   .runbook-panel,
   .policy-panel,
-  .token-panel {
+  .token-panel,
+  .signing-panel {
     grid-column: auto;
     min-width: 0;
   }
 
   .run-form label:not(.checkbox-row),
   .run-form input:not([type="checkbox"]),
+  .form-field,
   .token-form label,
   .token-form input,
   .token-form button,
@@ -723,8 +831,13 @@ code {
   .policy-actions input,
   .policy-actions button,
   .checkbox-row,
-  .run-form button {
+  .run-form button,
+  .target-preview {
     grid-row: auto;
     grid-column: auto;
+  }
+
+  .preview-counts {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }

@@ -4,8 +4,10 @@ const state = {
   token: "",
   agents: [],
   policies: [],
+  remediations: [],
   selectedAgentId: "",
   selectedPolicyId: "",
+  selectedRemediationId: "",
   lastJobId: "",
   createdEnrollmentToken: null,
   metricsWindowMs: 5 * 60 * 1000,
@@ -119,6 +121,9 @@ export function renderAgentDetail(agent) {
   const policies = Array.isArray(agent.assigned_policy_ids)
     ? agent.assigned_policy_ids.join(", ")
     : "";
+  const capabilities = Array.isArray(agent.capabilities)
+    ? agent.capabilities.join(", ")
+    : "";
   const rows = [
     ["Status", status],
     ["Session", agent.connected ? "connected" : "disconnected"],
@@ -127,6 +132,8 @@ export function renderAgentDetail(agent) {
     ["Platform", [agent.os, agent.arch].filter(Boolean).join("/")],
     ["Last seen", typeof agent.last_seen_age_seconds === "number" ? `${agent.last_seen_age_seconds}s ago` : ""],
     ["Assigned policies", policies],
+    ["Capabilities", capabilities],
+    ["Capability reported", formatUnixMillis(agent.capability_reported_at_ms)],
   ];
   return `
     <div class="detail-grid">
@@ -621,6 +628,78 @@ export function renderJobTargetTable(job) {
   `;
 }
 
+export function renderJobArtifacts(job) {
+  const artifacts = Array.isArray(job?.rendered_artifacts) ? job.rendered_artifacts : [];
+  if (artifacts.length === 0) {
+    return '<div class="empty">No rendered artifacts.</div>';
+  }
+  return `
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Artifact</th>
+          <th>Class</th>
+          <th>Action</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${artifacts
+          .map((artifact) => {
+            const checksum = String(artifact?.checksum_sha256 || "");
+            return `
+              <tr class="artifact-row">
+                <td>
+                  <strong>${escapeHtml(artifact?.artifact_id || "artifact")}</strong>
+                  <small>${escapeHtml(`agent=${artifact?.agent_id || ""} task=${artifact?.task_id || ""}`)}</small>
+                  <small>${escapeHtml(`sha256=${checksum.slice(0, 12)} size=${artifact?.size_bytes ?? 0}`)}</small>
+                </td>
+                <td>${escapeHtml(artifact?.retention_class || "artifact")}</td>
+                <td>
+                  <button type="button" data-artifact-id="${escapeHtml(artifact?.artifact_id || "")}" data-artifact-job-id="${escapeHtml(job?.id || "")}">Open</button>
+                </td>
+              </tr>
+            `;
+          })
+          .join("")}
+      </tbody>
+    </table>
+  `;
+}
+
+export function renderArtifactBody(artifact) {
+  if (!artifact) {
+    return "Artifact body is missing or no longer available.";
+  }
+  const bytes = Array.isArray(artifact.content_bytes)
+    ? artifact.content_bytes.map((value) => Number(value)).filter((value) => Number.isInteger(value) && value >= 0 && value <= 255)
+    : [];
+  const checksum = String(artifact.checksum_sha256 || "");
+  const text = printableArtifactPreview(bytes);
+  const lines = [
+    `Artifact: ${artifact.artifact_id || ""}`,
+    `Job: ${artifact.job_id || ""}`,
+    `Agent: ${artifact.agent_id || ""}`,
+    `Task: ${artifact.task_id || ""}`,
+    `Class: ${artifact.retention_class || ""}`,
+    `Size: ${artifact.size_bytes ?? bytes.length} bytes`,
+    `SHA-256: ${checksum.slice(0, 12)}`,
+    "",
+    text ? `Preview:\n${text}` : "Preview unavailable for non-printable content.",
+  ];
+  return lines.join("\n");
+}
+
+function printableArtifactPreview(bytes) {
+  if (bytes.length === 0) {
+    return "";
+  }
+  const visible = bytes.every((value) => value === 9 || value === 10 || value === 13 || (value >= 32 && value <= 126));
+  if (!visible) {
+    return "";
+  }
+  return String.fromCharCode(...bytes).slice(0, 4096);
+}
+
 export function renderApprovals(approvals, jobs = []) {
   if (!Array.isArray(approvals) || approvals.length === 0) {
     return '<div class="empty">No pending approvals.</div>';
@@ -646,6 +725,30 @@ export function renderApprovals(approvals, jobs = []) {
           <button type="button" data-approve-approval-id="${escapeHtml(approval.id)}">Approve</button>
           <button type="button" data-reject-approval-id="${escapeHtml(approval.id)}">Reject</button>
         </div>
+      `;
+    })
+    .join("");
+}
+
+export function renderRemediations(remediations, selectedRemediationId = "") {
+  if (!Array.isArray(remediations) || remediations.length === 0) {
+    return '<div class="empty">No remediation requests.</div>';
+  }
+  return remediations
+    .map((remediation) => {
+      const selectedClass = remediation.id === selectedRemediationId ? " selected" : "";
+      const updated = formatUnixMillis(remediation.updated_at_ms) || "unknown time";
+      const job = remediation.job_id ? `job ${remediation.job_id}` : "no job";
+      return `
+        <button class="compact-row${selectedClass}" type="button" data-remediation-id="${escapeHtml(remediation.id)}">
+          <span class="status-pill ${escapeHtml(remediation.status || "unknown")}">${escapeHtml(remediation.status || "unknown")}</span>
+          <span>
+            <strong>${escapeHtml(remediation.policy_id || remediation.policy_name || "policy")}</strong>
+            <small>${escapeHtml(remediation.agent_id || "agent")} · ${escapeHtml(job)} · ${escapeHtml(updated)}</small>
+            <small>${escapeHtml(remediation.runbook_ref || "no runbook ref")}</small>
+            <small>${escapeHtml(remediation.risk_summary || "approval required")}</small>
+          </span>
+        </button>
       `;
     })
     .join("");
@@ -738,9 +841,10 @@ export function renderEnrollmentTokens(tokens) {
     .join("");
 }
 
-export function buildRunbookJobRequest({ agentId, document, confirmed }) {
-  if (!agentId) {
-    throw new Error("Select an agent from the Agents list before creating a runbook job.");
+export function buildRunbookJobRequest({ agentId, selector = "", document, confirmed }) {
+  const targetSelector = String(selector ?? "").trim();
+  if (!agentId && !targetSelector) {
+    throw new Error("Select an agent or enter a target selector before creating a runbook job.");
   }
   const runbookDocument = String(document ?? "").trim();
   if (!runbookDocument) {
@@ -750,9 +854,9 @@ export function buildRunbookJobRequest({ agentId, document, confirmed }) {
     throw new Error("Check Confirm runbook execution before creating the job.");
   }
   const jobId = `job-runbook-ui-${Date.now()}`;
-  return {
+  const request = {
     job_id: jobId,
-    target_agent_ids: [agentId],
+    target_agent_ids: targetSelector ? [] : [agentId],
     runbook_document: runbookDocument,
     timeout_seconds: 180,
     confirmed_high_risk: true,
@@ -760,6 +864,10 @@ export function buildRunbookJobRequest({ agentId, document, confirmed }) {
     expires_in_seconds: 300,
     nonce_prefix: jobId,
   };
+  if (targetSelector) {
+    request.selector = targetSelector;
+  }
+  return request;
 }
 
 export function buildPolicySaveRequest({ source }) {
@@ -825,6 +933,129 @@ export function buildEnrollmentTokenRequest({ labels, maxUses, expiresInSeconds 
   };
 }
 
+function parseIntegerControl(value, label, minimum) {
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isInteger(parsed) || parsed < minimum) {
+    throw new Error(`${label} must be at least ${minimum}.`);
+  }
+  return parsed;
+}
+
+function parseAgentIds(value) {
+  return String(value ?? "")
+    .split(/[,\s]+/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+}
+
+export function buildStagedTrustBundleRequest({
+  previousPublicKeyPath = "",
+  agentIds = "",
+  batchSize,
+  maxFailures,
+  ackTimeoutSeconds,
+}) {
+  const request = {
+    batch_size: parseIntegerControl(batchSize, "Batch size", 1),
+    max_failures: parseIntegerControl(maxFailures, "Max failures", 0),
+    ack_timeout_seconds: parseIntegerControl(ackTimeoutSeconds, "Ack timeout", 1),
+  };
+  const previous_public_key_path = String(previousPublicKeyPath ?? "").trim();
+  if (previous_public_key_path) {
+    request.previous_public_key_path = previous_public_key_path;
+  }
+  const parsedAgentIds = parseAgentIds(agentIds);
+  if (parsedAgentIds.length > 0) {
+    request.agent_ids = parsedAgentIds;
+  }
+  return request;
+}
+
+export function renderControllerSigningRotationStatus(status) {
+  if (!status || typeof status !== "object") {
+    return '<div class="empty">No signing status loaded.</div>';
+  }
+  const rows = [
+    ["Controller", status.controller_id],
+    ["Persisted", status.persisted_record_present ? "yes" : "no"],
+    ["State", status.persisted_state],
+    ["Readiness", status.readiness],
+    ["Bootstrap guard", status.bootstrap_guard],
+    ["Agent trust", status.agent_trust_rollout],
+    ["Active signing", status.active_signing_fingerprint_prefix],
+    ["Selected signing", status.selected_signing_fingerprint_prefix],
+    ["Old fingerprint", status.old_fingerprint_prefix],
+    ["New fingerprint", status.new_fingerprint_prefix],
+    ["Requested", formatUnixMillis(status.requested_at_ms)],
+    ["Validated", formatUnixMillis(status.validated_at_ms)],
+    ["Activated", formatUnixMillis(status.activated_at_ms)],
+    ["Old verifies until", formatUnixMillis(status.old_key_verifies_until_ms)],
+    ["Retired", formatUnixMillis(status.retired_at_ms)],
+    ["Failed", formatUnixMillis(status.failed_at_ms)],
+  ];
+  return `
+    <div class="detail-grid">
+      ${rows
+        .map(
+          ([label, value]) => `
+            <div>
+              <small>${escapeHtml(label)}</small>
+              <strong>${escapeHtml(formatOptional(value))}</strong>
+            </div>
+          `,
+        )
+        .join("")}
+    </div>
+  `;
+}
+
+export function renderStagedTrustBundleResult(result) {
+  if (!result || typeof result !== "object") {
+    return '<div class="empty">No staged rollout result.</div>';
+  }
+  const counts = [
+    ["Targets", result.target_count ?? 0],
+    ["Planned", result.planned_count ?? 0],
+    ["Attempted", result.attempted_count ?? 0],
+    ["Updated", result.updated_count ?? 0],
+    ["Skipped", result.skipped_count ?? 0],
+    ["Failed", result.failed_count ?? 0],
+    ["Current", result.already_current_count ?? 0],
+    ["Unavailable", result.unavailable_count ?? 0],
+    ["Pending", result.pending_count ?? 0],
+    ["Entries", result.entries_count ?? 0],
+  ];
+  const agentRows = Array.isArray(result.agent_results)
+    ? result.agent_results
+        .map(
+          (agent) => `
+            <tr>
+              <td>${escapeHtml(agent.agent_id || "")}</td>
+              <td>${escapeHtml(agent.status || "unknown")}</td>
+            </tr>
+          `,
+        )
+        .join("")
+    : "";
+  return `
+    <div class="detail-grid signing-grid">
+      <div><small>Controller</small><strong>${escapeHtml(formatOptional(result.controller_id))}</strong></div>
+      <div><small>Persisted state</small><strong>${escapeHtml(formatOptional(result.persisted_state))}</strong></div>
+      <div><small>Rollout state</small><strong>${escapeHtml(formatOptional(result.rollout_state))}</strong></div>
+      <div><small>Current fingerprint</small><strong>${escapeHtml(formatOptional(result.current_fingerprint_prefix))}</strong></div>
+      <div><small>Previous fingerprint</small><strong>${escapeHtml(formatOptional(result.previous_fingerprint_prefix))}</strong></div>
+    </div>
+    <div class="preview-counts">
+      ${counts.map(([label, value]) => `<span><strong>${escapeHtml(value)}</strong><small>${escapeHtml(label)}</small></span>`).join("")}
+    </div>
+    ${
+      agentRows
+        ? `<table class="data-table"><thead><tr><th>Agent</th><th>Status</th></tr></thead><tbody>${agentRows}</tbody></table>`
+        : '<div class="empty">No agent results returned.</div>'
+    }
+  `;
+}
+
 export function parseCommandArgs(value) {
   return String(value ?? "")
     .split(/\s+/)
@@ -832,9 +1063,10 @@ export function parseCommandArgs(value) {
     .filter(Boolean);
 }
 
-export function buildCommandJobRequest({ agentId, program, args, confirmed }) {
-  if (!agentId) {
-    throw new Error("Select an agent from the Agents list before running a command.");
+export function buildCommandJobRequest({ agentId, selector = "", program, args, confirmed }) {
+  const targetSelector = String(selector ?? "").trim();
+  if (!agentId && !targetSelector) {
+    throw new Error("Select an agent or enter a target selector before running a command.");
   }
   if (!program || !String(program).trim()) {
     throw new Error("Enter a program to run, for example uptime.");
@@ -843,9 +1075,9 @@ export function buildCommandJobRequest({ agentId, program, args, confirmed }) {
     throw new Error("Check Confirm high-risk execution before running the command.");
   }
   const jobId = `job-ui-${Date.now()}`;
-  return {
+  const request = {
     job_id: jobId,
-    target_agent_ids: [agentId],
+    target_agent_ids: targetSelector ? [] : [agentId],
     program: String(program).trim(),
     args: Array.isArray(args) ? args : parseCommandArgs(args),
     timeout_seconds: 30,
@@ -854,6 +1086,65 @@ export function buildCommandJobRequest({ agentId, program, args, confirmed }) {
     expires_in_seconds: COMMAND_JOB_EXPIRES_IN_SECONDS,
     nonce_prefix: jobId,
   };
+  if (targetSelector) {
+    request.selector = targetSelector;
+  }
+  return request;
+}
+
+export function buildSelectorPreviewRequest({ selector }) {
+  const targetSelector = String(selector ?? "").trim();
+  if (!targetSelector) {
+    throw new Error("Enter a target selector before previewing targets.");
+  }
+  return { selector: targetSelector };
+}
+
+export function renderSelectorPreview(preview) {
+  if (!preview || typeof preview !== "object") {
+    return '<div class="empty">No selector preview.</div>';
+  }
+  const counts = [
+    ["Matched", preview.matched_count ?? 0],
+    ["Selected", preview.selected_count ?? 0],
+    ["Disabled", preview.disabled_count ?? 0],
+    ["Offline", preview.offline_count ?? 0],
+  ];
+  const warnings = Array.isArray(preview.warnings) ? preview.warnings : [];
+  const agents = Array.isArray(preview.agents) ? preview.agents : [];
+  const rows = agents
+    .map((agent) => {
+      const selected = Boolean(agent.selected_for_dispatch);
+      const labels = Array.isArray(agent.labels)
+        ? agent.labels.map((label) => `${label.key}=${label.value}`).join(", ")
+        : "";
+      return `
+        <tr>
+          <td>${escapeHtml(agent.name || agent.agent_id || "")}</td>
+          <td>${escapeHtml(agent.agent_id || "")}</td>
+          <td>${escapeHtml(labels || "none")}</td>
+          <td>${escapeHtml(agent.status || "unknown")}</td>
+          <td><span class="status-pill ${selected ? "active" : "revoked"}">${selected ? "selected" : "excluded"}</span></td>
+        </tr>
+      `;
+    })
+    .join("");
+  return `
+    <div class="preview-counts">
+      ${counts.map(([label, value]) => `<span><strong>${escapeHtml(value)}</strong><small>${escapeHtml(label)}</small></span>`).join("")}
+    </div>
+    ${warnings.map((warning) => `<div class="preview-warning">${escapeHtml(warning.message || warning.code || "preview warning")}</div>`).join("")}
+    ${
+      rows
+        ? `<table class="data-table"><thead><tr><th>Name</th><th>Agent</th><th>Labels</th><th>Status</th><th>Dispatch</th></tr></thead><tbody>${rows}</tbody></table>`
+        : '<div class="empty">No matching agents.</div>'
+    }
+  `;
+}
+
+export function selectorPreviewSelectedCount(preview) {
+  const selectedCount = Number(preview?.selected_count ?? 0);
+  return Number.isFinite(selectedCount) && selectedCount > 0 ? selectedCount : 0;
 }
 
 export function renderJobOutput(chunks, { jobId = "", job = null } = {}) {
@@ -1051,6 +1342,15 @@ async function loadAgents() {
   }
 }
 
+async function loadSigningRotationStatus() {
+  const status = await api.getControllerSigningRotationStatus();
+  const element = document.querySelector("#signing-rotation-status");
+  if (element) {
+    element.innerHTML = renderControllerSigningRotationStatus(status);
+  }
+  return status;
+}
+
 function handleAgentsListClick(event) {
   const button = event.target?.closest?.("[data-agent-id]");
   if (!button?.dataset?.agentId) {
@@ -1162,12 +1462,14 @@ async function refreshAll() {
   }
   setStatus("Loading controller data...");
   await loadAgents();
-  const [jobs, audit, enrollmentTokens, approvals, policies] = await Promise.all([
+  const [jobs, audit, enrollmentTokens, approvals, policies, remediations, signingStatus] = await Promise.all([
     api.listJobs(),
     api.listAudit(),
     api.listEnrollmentTokens(),
     api.listApprovals("pending"),
     api.listPolicies(),
+    api.listRemediations({ limit: DETAIL_PAGE_LIMIT }),
+    api.getControllerSigningRotationStatus(),
   ]);
   document.querySelector("#jobs-list").innerHTML = renderJobs(jobs);
   document.querySelectorAll("[data-job-id]").forEach((button) => {
@@ -1178,6 +1480,8 @@ async function refreshAll() {
   });
   document.querySelector("#approvals-list").innerHTML = renderApprovals(approvals, jobs);
   wireApprovalButtons();
+  state.remediations = Array.isArray(remediations) ? remediations : [];
+  renderRemediationList();
   state.policies = Array.isArray(policies) ? policies : [];
   if (state.selectedPolicyId && !state.policies.some((policy) => policy.id === state.selectedPolicyId)) {
     state.selectedPolicyId = "";
@@ -1193,6 +1497,8 @@ async function refreshAll() {
     });
   });
   document.querySelector("#audit-list").innerHTML = renderAudit(audit);
+  document.querySelector("#signing-rotation-status").innerHTML =
+    renderControllerSigningRotationStatus(signingStatus);
   setStatus("Loaded latest controller data.", "ok");
 }
 
@@ -1222,15 +1528,190 @@ function wireApprovalButtons() {
 }
 
 async function loadApprovalsJobsAndAudit() {
-  const [approvals, jobs, audit] = await Promise.all([
+  const [approvals, jobs, audit, remediations] = await Promise.all([
     api.listApprovals("pending"),
     api.listJobs(),
     api.listAudit(),
+    api.listRemediations({ limit: DETAIL_PAGE_LIMIT }),
   ]);
   document.querySelector("#approvals-list").innerHTML = renderApprovals(approvals, jobs);
   wireApprovalButtons();
   document.querySelector("#jobs-list").innerHTML = renderJobs(jobs);
+  state.remediations = Array.isArray(remediations) ? remediations : [];
+  renderRemediationList();
   document.querySelector("#audit-list").innerHTML = renderAudit(audit);
+}
+
+function renderRemediationList() {
+  const list = document.querySelector("#remediations-list");
+  if (!list) {
+    return;
+  }
+  list.innerHTML = renderRemediations(state.remediations, state.selectedRemediationId);
+}
+
+function selectedRemediation() {
+  return state.remediations.find((item) => item.id === state.selectedRemediationId) || null;
+}
+
+function syncRemediationForm(remediation) {
+  if (!remediation) {
+    return;
+  }
+  document.querySelector("#remediation-id").value = remediation.id || "";
+  if (remediation.job_id) {
+    document.querySelector("#remediation-job-id").value = remediation.job_id;
+  }
+  document.querySelector("#remediation-result").textContent = renderRemediationActionResult(remediation);
+}
+
+function readRemediationForm() {
+  return {
+    remediationId: document.querySelector("#remediation-id")?.value.trim() || "",
+    approvalId: document.querySelector("#remediation-approval-id")?.value.trim() || "",
+    jobId: document.querySelector("#remediation-job-id")?.value.trim() || "",
+    runbookDocument: document.querySelector("#remediation-runbook-document")?.value || "",
+  };
+}
+
+function optionalString(value) {
+  const text = String(value ?? "").trim();
+  return text ? text : undefined;
+}
+
+function requireRemediationId(form) {
+  if (!form.remediationId) {
+    throw new Error("Select or enter a remediation request first.");
+  }
+}
+
+function requireRemediationJobId(form) {
+  if (!form.jobId) {
+    throw new Error("Enter the remediation job id.");
+  }
+}
+
+export function renderRemediationActionResult(response) {
+  const remediation = response?.remediation || response || {};
+  const lines = [
+    `remediation_id=${remediation.id || ""}`,
+    `policy_id=${remediation.policy_id || ""}`,
+    `agent_id=${remediation.agent_id || ""}`,
+    `status=${remediation.status || ""}`,
+    `runbook_ref=${remediation.runbook_ref || ""}`,
+    `job_id=${remediation.job_id || response?.job_id || ""}`,
+  ];
+  if (response?.approval) {
+    lines.push(`approval_id=${response.approval.id || ""}`);
+    lines.push(`approval_status=${response.approval.status || ""}`);
+  }
+  if (response?.assignment_count !== undefined) {
+    lines.push(`assignment_count=${response.assignment_count}`);
+  }
+  return lines.join("\n");
+}
+
+async function loadRemediations() {
+  syncAdminTokenFromInput({ requireToken: true });
+  const remediations = await api.listRemediations({ limit: DETAIL_PAGE_LIMIT });
+  state.remediations = Array.isArray(remediations) ? remediations : [];
+  if (
+    state.selectedRemediationId &&
+    !state.remediations.some((remediation) => remediation.id === state.selectedRemediationId)
+  ) {
+    state.selectedRemediationId = "";
+  }
+  renderRemediationList();
+  if (state.selectedRemediationId) {
+    syncRemediationForm(selectedRemediation());
+  }
+}
+
+async function requestRemediationApproval() {
+  syncAdminTokenFromInput({ requireToken: true });
+  const form = readRemediationForm();
+  requireRemediationId(form);
+  const response = await api.createRemediationApprovalRequest(form.remediationId, {
+    approval_id: optionalString(form.approvalId),
+    job_id: optionalString(form.jobId),
+    reason: "requested from Web Admin",
+    expires_in_seconds: 300,
+  });
+  state.selectedRemediationId = response?.remediation?.id || form.remediationId;
+  document.querySelector("#remediation-result").textContent = renderRemediationActionResult(response);
+  setStatus(`Requested remediation approval for ${state.selectedRemediationId}.`, "ok");
+  await loadApprovalsJobsAndAudit();
+}
+
+async function approveRemediationJob() {
+  syncAdminTokenFromInput({ requireToken: true });
+  const form = readRemediationForm();
+  requireRemediationId(form);
+  requireRemediationJobId(form);
+  if (!form.approvalId) {
+    throw new Error("Enter the remediation approval id.");
+  }
+  if (!form.runbookDocument.trim()) {
+    throw new Error("Enter the approved remediation runbook YAML.");
+  }
+  const response = await api.approveRemediationJob(form.remediationId, {
+    approval_id: form.approvalId,
+    job_id: form.jobId,
+    runbook_document: form.runbookDocument,
+    timeout_seconds: 30,
+    expires_in_seconds: 300,
+    reason: "approved from Web Admin",
+  });
+  state.selectedRemediationId = response?.remediation?.id || form.remediationId;
+  state.lastJobId = response?.job_id || form.jobId;
+  document.querySelector("#remediation-result").textContent = renderRemediationActionResult(response);
+  setStatus(`Created remediation job ${state.lastJobId}.`, "ok");
+  await loadApprovalsJobsAndAudit();
+}
+
+async function markRemediationRunning() {
+  syncAdminTokenFromInput({ requireToken: true });
+  const form = readRemediationForm();
+  requireRemediationId(form);
+  requireRemediationJobId(form);
+  const response = await api.markRemediationRunning(form.remediationId, { job_id: form.jobId });
+  document.querySelector("#remediation-result").textContent = renderRemediationActionResult(response);
+  setStatus(`Marked remediation ${form.remediationId} running.`, "ok");
+  await loadRemediations();
+}
+
+async function recordRemediationResult(status) {
+  syncAdminTokenFromInput({ requireToken: true });
+  const form = readRemediationForm();
+  requireRemediationId(form);
+  requireRemediationJobId(form);
+  const response = await api.recordRemediationResult(form.remediationId, {
+    job_id: form.jobId,
+    status,
+  });
+  document.querySelector("#remediation-result").textContent = renderRemediationActionResult(response);
+  setStatus(`Recorded remediation ${status}.`, "ok");
+  await loadRemediations();
+}
+
+async function verifyRemediation() {
+  syncAdminTokenFromInput({ requireToken: true });
+  const form = readRemediationForm();
+  requireRemediationId(form);
+  requireRemediationJobId(form);
+  const remediation = selectedRemediation();
+  if (!remediation) {
+    throw new Error("Select a remediation row before verification.");
+  }
+  const response = await api.verifyRemediation(form.remediationId, {
+    agent_id: remediation.agent_id,
+    policy_id: remediation.policy_id,
+    policy_name: remediation.policy_name,
+    job_id: form.jobId,
+  });
+  document.querySelector("#remediation-result").textContent = renderRemediationActionResult(response);
+  setStatus(`Verified remediation ${form.remediationId}.`, "ok");
+  await Promise.all([loadRemediations(), refreshSelectedAgent().catch(() => null)]);
 }
 
 async function decideApproval(id, action) {
@@ -1382,11 +1863,70 @@ async function revokeSelectedAgentKey() {
   setStatus(`Revoked agent ${label}.`, "ok");
 }
 
+async function submitStagedTrustBundle(form) {
+  syncAdminTokenFromInput({ requireToken: true });
+  const data = new FormData(form);
+  const request = buildStagedTrustBundleRequest({
+    previousPublicKeyPath: data.get("previous-public-key-path"),
+    agentIds: data.get("agent-ids"),
+    batchSize: data.get("batch-size"),
+    maxFailures: data.get("max-failures"),
+    ackTimeoutSeconds: data.get("ack-timeout-seconds"),
+  });
+  const response = await api.stageControllerSigningTrustBundle(request);
+  const resultElement = document.querySelector("#staged-trust-bundle-result");
+  if (resultElement) {
+    resultElement.classList.remove("empty");
+    resultElement.innerHTML = renderStagedTrustBundleResult(response);
+  }
+  setStatus(
+    `Ran staged signing tick: ${response?.rollout_state || "unknown"} (${response?.attempted_count ?? 0} attempted).`,
+    "ok",
+  );
+  await Promise.all([loadSigningRotationStatus(), api.listAudit().then((audit) => {
+    document.querySelector("#audit-list").innerHTML = renderAudit(audit);
+  })]);
+}
+
+async function previewTargets(selector, targetSelector) {
+  syncAdminTokenFromInput({ requireToken: true });
+  const request = buildSelectorPreviewRequest({ selector });
+  const target = document.querySelector(targetSelector);
+  if (target) {
+    target.classList.remove("empty");
+    target.innerHTML = '<div class="empty">Loading selector preview...</div>';
+  }
+  try {
+    const preview = await api.previewSelector(request);
+    if (target) {
+      target.innerHTML = renderSelectorPreview(preview);
+    }
+    return preview;
+  } catch (error) {
+    if (target) {
+      target.innerHTML = `<div class="preview-warning">${escapeHtml(error.message || "Selector preview failed.")}</div>`;
+    }
+    throw error;
+  }
+}
+
+function requireDispatchablePreviewTargets(preview) {
+  if (selectorPreviewSelectedCount(preview) < 1) {
+    throw new Error("Selector preview returned no dispatchable targets.");
+  }
+}
+
 async function submitCommand(form) {
   syncAdminTokenFromInput({ requireToken: true });
   const data = new FormData(form);
+  const selector = data.get("selector");
+  const targetSelector = String(selector ?? "").trim();
+  if (targetSelector) {
+    requireDispatchablePreviewTargets(await previewTargets(targetSelector, "#command-target-preview"));
+  }
   const request = buildCommandJobRequest({
     agentId: state.selectedAgentId,
+    selector,
     program: data.get("program"),
     args: data.get("args"),
     confirmed: data.get("confirm-risk") === "on",
@@ -1417,8 +1957,14 @@ async function submitCommand(form) {
 async function submitRunbook(form) {
   syncAdminTokenFromInput({ requireToken: true });
   const data = new FormData(form);
+  const selector = data.get("selector");
+  const targetSelector = String(selector ?? "").trim();
+  if (targetSelector) {
+    requireDispatchablePreviewTargets(await previewTargets(targetSelector, "#runbook-target-preview"));
+  }
   const request = buildRunbookJobRequest({
     agentId: state.selectedAgentId,
+    selector,
     document: data.get("runbook-document"),
     confirmed: data.get("confirm-risk") === "on",
   });
@@ -1449,10 +1995,14 @@ async function submitRunbook(form) {
 async function pollJobOutput(jobId) {
   const outputElement = document.querySelector("#job-output");
   const targetElement = document.querySelector("#job-targets");
+  const artifactElement = document.querySelector("#job-artifacts");
   for (let attempt = 1; attempt <= JOB_OUTPUT_POLL_ATTEMPTS; attempt += 1) {
     const [job, chunks] = await Promise.all([api.getJob(jobId), api.getJobOutput(jobId)]);
     if (targetElement) {
       targetElement.innerHTML = renderJobTargetTable(job);
+    }
+    if (artifactElement) {
+      artifactElement.innerHTML = renderJobArtifacts(job);
     }
     if (Array.isArray(chunks) && chunks.length > 0) {
       outputElement.textContent = renderJobOutput(chunks, { jobId, job });
@@ -1476,6 +2026,9 @@ async function pollJobOutput(jobId) {
   const [job, chunks] = await Promise.all([api.getJob(jobId), api.getJobOutput(jobId)]);
   if (targetElement) {
     targetElement.innerHTML = renderJobTargetTable(job);
+  }
+  if (artifactElement) {
+    artifactElement.innerHTML = renderJobArtifacts(job);
   }
   outputElement.textContent =
     Array.isArray(chunks) && chunks.length > 0
@@ -1517,6 +2070,33 @@ export function renderJobOutputAfterPolling({ job = null, chunks = [], jobId = "
   });
 }
 
+async function handleJobArtifactClick(event) {
+  const button = event.target?.closest?.("[data-artifact-id]");
+  if (!button) {
+    return;
+  }
+  const artifactId = button.dataset.artifactId || "";
+  const jobId = button.dataset.artifactJobId || state.lastJobId || "";
+  if (!artifactId || !jobId) {
+    return;
+  }
+  const outputElement = document.querySelector("#job-output");
+  if (outputElement) {
+    outputElement.textContent = `Loading artifact ${artifactId}.`;
+  }
+  try {
+    const artifact = await api.getJobArtifact(jobId, artifactId);
+    if (outputElement) {
+      outputElement.textContent = renderArtifactBody(artifact);
+    }
+  } catch (error) {
+    if (outputElement) {
+      outputElement.textContent = `Could not load artifact ${artifactId}. ${error.message}`;
+    }
+    setStatus(error.message, "error");
+  }
+}
+
 function boot() {
   const form = document.querySelector("#admin-auth");
   if (!form) {
@@ -1526,6 +2106,9 @@ function boot() {
   if (warning && globalThis.location?.protocol === "http:") {
     warning.hidden = false;
   }
+  document.querySelector("#job-artifacts")?.addEventListener("click", (event) => {
+    handleJobArtifactClick(event).catch((error) => setStatus(error.message, "error"));
+  });
   form.addEventListener("submit", (event) => {
     event.preventDefault();
     state.token = readAdminTokenInput();
@@ -1537,12 +2120,34 @@ function boot() {
       event.preventDefault();
       submitCommand(runForm).catch((error) => setStatus(error.message, "error"));
     });
+    document.querySelector("#preview-command-targets")?.addEventListener("click", () => {
+      const data = new FormData(runForm);
+      previewTargets(data.get("selector"), "#command-target-preview")
+        .then((preview) => {
+          setStatus(
+            `Previewed ${selectorPreviewSelectedCount(preview)} dispatchable target(s) from ${preview?.matched_count ?? 0} match(es).`,
+            "ok",
+          );
+        })
+        .catch((error) => setStatus(error.message, "error"));
+    });
   }
   const runbookForm = document.querySelector("#runbook-form");
   if (runbookForm) {
     runbookForm.addEventListener("submit", (event) => {
       event.preventDefault();
       submitRunbook(runbookForm).catch((error) => setStatus(error.message, "error"));
+    });
+    document.querySelector("#preview-runbook-targets")?.addEventListener("click", () => {
+      const data = new FormData(runbookForm);
+      previewTargets(data.get("selector"), "#runbook-target-preview")
+        .then((preview) => {
+          setStatus(
+            `Previewed ${selectorPreviewSelectedCount(preview)} dispatchable target(s) from ${preview?.matched_count ?? 0} match(es).`,
+            "ok",
+          );
+        })
+        .catch((error) => setStatus(error.message, "error"));
     });
   }
   const policyForm = document.querySelector("#policy-form");
@@ -1570,8 +2175,57 @@ function boot() {
   document.querySelector("#revoke-agent-key")?.addEventListener("click", () => {
     revokeSelectedAgentKey().catch((error) => setStatus(error.message, "error"));
   });
+  document.querySelector("#refresh-signing-rotation")?.addEventListener("click", () => {
+    try {
+      syncAdminTokenFromInput({ requireToken: true });
+      loadSigningRotationStatus()
+        .then(() => setStatus("Refreshed controller signing status.", "ok"))
+        .catch((error) => setStatus(error.message, "error"));
+    } catch (error) {
+      setStatus(error.message, "error");
+    }
+  });
+  const stagedTrustBundleForm = document.querySelector("#staged-trust-bundle-form");
+  if (stagedTrustBundleForm) {
+    stagedTrustBundleForm.addEventListener("submit", (event) => {
+      event.preventDefault();
+      submitStagedTrustBundle(stagedTrustBundleForm).catch((error) => setStatus(error.message, "error"));
+    });
+  }
   document.querySelector("#expire-approvals")?.addEventListener("click", () => {
     expireDueApprovals().catch((error) => setStatus(error.message, "error"));
+  });
+  document.querySelector("#remediations-list")?.addEventListener("click", (event) => {
+    const button = event.target?.closest?.("[data-remediation-id]");
+    if (!button?.dataset?.remediationId) {
+      return;
+    }
+    state.selectedRemediationId = button.dataset.remediationId;
+    renderRemediationList();
+    syncRemediationForm(selectedRemediation());
+  });
+  document.querySelector("#refresh-remediations")?.addEventListener("click", () => {
+    loadRemediations()
+      .then(() => setStatus("Refreshed remediation requests.", "ok"))
+      .catch((error) => setStatus(error.message, "error"));
+  });
+  document.querySelector("#request-remediation-approval")?.addEventListener("click", () => {
+    requestRemediationApproval().catch((error) => setStatus(error.message, "error"));
+  });
+  document.querySelector("#approve-remediation")?.addEventListener("click", () => {
+    approveRemediationJob().catch((error) => setStatus(error.message, "error"));
+  });
+  document.querySelector("#mark-remediation-running")?.addEventListener("click", () => {
+    markRemediationRunning().catch((error) => setStatus(error.message, "error"));
+  });
+  document.querySelector("#record-remediation-success")?.addEventListener("click", () => {
+    recordRemediationResult("succeeded").catch((error) => setStatus(error.message, "error"));
+  });
+  document.querySelector("#record-remediation-failed")?.addEventListener("click", () => {
+    recordRemediationResult("failed").catch((error) => setStatus(error.message, "error"));
+  });
+  document.querySelector("#verify-remediation")?.addEventListener("click", () => {
+    verifyRemediation().catch((error) => setStatus(error.message, "error"));
   });
   document.querySelector("#assign-policy")?.addEventListener("click", () => {
     assignSelectedPolicy().catch((error) => setStatus(error.message, "error"));

@@ -1,6 +1,11 @@
 use clap::{Args, Parser, Subcommand};
+use fleet_application::{
+    DisabledSecretProvider, ResolvedSecret, RetentionPolicy, RunRetentionCleanup,
+    RunRetentionCleanupInput, SecretProvider, SecretProviderError,
+};
 use fleet_core::{
-    LogProfile, format_error_message, format_warning_message, init_logging, redact_secret,
+    DatabaseSettings, LogProfile, format_error_message, format_warning_message, init_logging,
+    redact_secret,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -31,6 +36,11 @@ const LOG_TAIL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const REMOTE_RUN_EXPIRES_IN_SECONDS: u64 = 300;
 const AGENT_SESSION_OUTBOUND_QUEUE_CAPACITY: usize = 64;
 const AGENT_SESSION_READ_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const DEFAULT_CLI_PROFILE_PATH: &str = ".sponzey/cli-profile.json";
+const CONTROLLER_SIGNING_STAGED_TRUST_BUNDLE_PATH: &str =
+    "/api/controller/signing-rotation/rollout-trust-bundle/staged";
+const AGENT_CERTIFICATE_LIFECYCLE_RUNTIME_NOT_IMPLEMENTED: &str =
+    "certificate_lifecycle_runtime_not_implemented";
 
 #[derive(Debug, Parser)]
 #[command(name = "sponzey")]
@@ -63,9 +73,15 @@ impl From<LogProfileArg> for LogProfile {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    Login(LoginCommand),
     Controller(ControllerCommand),
     Agent(AgentCommand),
     Agents(AgentsCommand),
+    Jobs(JobsCommand),
+    Approvals(ApprovalsCommand),
+    Remediations(RemediationsCommand),
+    Selectors(SelectorsCommand),
+    Audit(AuditCommand),
     EnrollToken(EnrollTokenCommand),
     Run(RunCommand),
     Facts(FactsCommand),
@@ -84,6 +100,26 @@ pub struct DemoCommand {
     keep_temp: bool,
     #[arg(long)]
     port: Option<u16>,
+}
+
+#[derive(Debug, Args)]
+pub struct LoginCommand {
+    #[arg(long)]
+    controller_url: String,
+    #[arg(long)]
+    admin_token: String,
+    #[arg(long, default_value = DEFAULT_CLI_PROFILE_PATH)]
+    profile_path: PathBuf,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct ProtectedApiArgs {
+    #[arg(long)]
+    pub controller_url: Option<String>,
+    #[arg(long)]
+    pub admin_token: Option<String>,
+    #[arg(long, default_value = DEFAULT_CLI_PROFILE_PATH)]
+    pub profile_path: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -115,13 +151,18 @@ pub enum ControllerSubcommand {
         external_url: Option<String>,
         #[arg(
             long,
-            help = "SQLite database URL, for example sqlite:///var/lib/sponzey-fleet/controller/fleet.db"
+            help = "Controller database URL; sqlite:// works today, postgresql:// is recognized but not implemented yet"
         )]
         db: Option<String>,
         #[arg(long, help = "PEM certificate chain for built-in HTTPS listener")]
         tls_cert: Option<PathBuf>,
         #[arg(long, help = "PEM private key for built-in HTTPS listener")]
         tls_key: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "PEM CA certificate for future agent client-certificate mTLS; currently rejected until enforcement is implemented"
+        )]
+        agent_client_ca_cert: Option<PathBuf>,
         #[arg(long, default_value = ".sponzey")]
         data_dir: PathBuf,
     },
@@ -141,9 +182,25 @@ pub enum ControllerSubcommand {
         #[arg(long)]
         dry_run: bool,
     },
+    RestartService {
+        #[arg(long)]
+        dry_run: bool,
+    },
     StatusService {
         #[arg(long)]
         dry_run: bool,
+    },
+    #[command(about = "Show controller signing rotation readiness status")]
+    SigningRotationStatus {
+        #[command(flatten)]
+        api: ProtectedApiArgs,
+        #[arg(long, help = "Print the secret-free JSON response")]
+        json: bool,
+    },
+    #[command(about = "Mutate controller signing rotation state")]
+    SigningRotation {
+        #[command(subcommand)]
+        command: ControllerSigningRotationSubcommand,
     },
     LogsService {
         #[arg(long, default_value_t = 50)]
@@ -184,6 +241,114 @@ pub enum ControllerSubcommand {
             help = "Allow replacing an existing non-empty controller data directory"
         )]
         force: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ControllerSigningRotationSubcommand {
+    RestartPlan {
+        #[command(flatten)]
+        api: ProtectedApiArgs,
+        #[arg(long, help = "Print the secret-free JSON response")]
+        json: bool,
+    },
+    RestartAction {
+        #[command(flatten)]
+        api: ProtectedApiArgs,
+        #[arg(long)]
+        confirm_external_restart: bool,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long, help = "Print the secret-free JSON response")]
+        json: bool,
+    },
+    Request {
+        #[command(flatten)]
+        api: ProtectedApiArgs,
+        #[arg(long)]
+        new_fingerprint: String,
+        #[arg(long)]
+        old_key_verifies_for_seconds: Option<u64>,
+        #[arg(long)]
+        old_key_verifies_until_ms: Option<u64>,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long, help = "Print the secret-free JSON response")]
+        json: bool,
+    },
+    Validate {
+        #[command(flatten)]
+        api: ProtectedApiArgs,
+        #[arg(long)]
+        candidate_public_key_path: PathBuf,
+        #[arg(long)]
+        candidate_private_key_path: PathBuf,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long, help = "Print the secret-free JSON response")]
+        json: bool,
+    },
+    Activate {
+        #[command(flatten)]
+        api: ProtectedApiArgs,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long, help = "Print the secret-free JSON response")]
+        json: bool,
+    },
+    Retire {
+        #[command(flatten)]
+        api: ProtectedApiArgs,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long, help = "Print the secret-free JSON response")]
+        json: bool,
+    },
+    Fail {
+        #[command(flatten)]
+        api: ProtectedApiArgs,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long, help = "Print the secret-free JSON response")]
+        json: bool,
+    },
+    RolloutTrustBundle {
+        #[command(flatten)]
+        api: ProtectedApiArgs,
+        #[arg(long)]
+        previous_public_key_path: Option<PathBuf>,
+        #[arg(long = "agent-id")]
+        agent_ids: Vec<String>,
+        #[arg(long, help = "Print the secret-free JSON response")]
+        json: bool,
+    },
+    RetryTrustBundle {
+        #[command(flatten)]
+        api: ProtectedApiArgs,
+        #[arg(long)]
+        previous_public_key_path: Option<PathBuf>,
+        #[arg(long = "agent-id")]
+        agent_ids: Vec<String>,
+        #[arg(long)]
+        max_agent_count: Option<usize>,
+        #[arg(long, help = "Print the secret-free JSON response")]
+        json: bool,
+    },
+    StagedTrustBundle {
+        #[command(flatten)]
+        api: ProtectedApiArgs,
+        #[arg(long)]
+        previous_public_key_path: Option<PathBuf>,
+        #[arg(long = "agent-id")]
+        agent_ids: Vec<String>,
+        #[arg(long)]
+        batch_size: usize,
+        #[arg(long)]
+        max_failures: usize,
+        #[arg(long)]
+        ack_timeout_seconds: u64,
+        #[arg(long, help = "Print the secret-free JSON response")]
+        json: bool,
     },
 }
 
@@ -329,6 +494,208 @@ pub enum AgentsSubcommand {
         #[arg(long, default_value = ".sponzey")]
         data_dir: PathBuf,
     },
+    RemoteList {
+        #[command(flatten)]
+        api: ProtectedApiArgs,
+    },
+    RemoteGet {
+        agent_id: String,
+        #[command(flatten)]
+        api: ProtectedApiArgs,
+    },
+    RequestCertificateIssuance {
+        agent_id: String,
+        #[command(flatten)]
+        api: ProtectedApiArgs,
+        #[arg(long)]
+        json: bool,
+    },
+    CertificateStatus {
+        agent_id: String,
+        #[command(flatten)]
+        api: ProtectedApiArgs,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Args)]
+pub struct JobsCommand {
+    #[command(subcommand)]
+    pub command: JobsSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum JobsSubcommand {
+    List {
+        #[command(flatten)]
+        api: ProtectedApiArgs,
+    },
+    Get {
+        job_id: String,
+        #[command(flatten)]
+        api: ProtectedApiArgs,
+    },
+    Output {
+        job_id: String,
+        #[command(flatten)]
+        api: ProtectedApiArgs,
+    },
+    Cancel {
+        job_id: String,
+        #[command(flatten)]
+        api: ProtectedApiArgs,
+    },
+}
+
+#[derive(Debug, Args)]
+pub struct ApprovalsCommand {
+    #[command(subcommand)]
+    pub command: ApprovalsSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ApprovalsSubcommand {
+    List {
+        #[command(flatten)]
+        api: ProtectedApiArgs,
+    },
+    Approve {
+        approval_id: String,
+        #[arg(long, default_value = "approved from CLI")]
+        reason: String,
+        #[command(flatten)]
+        api: ProtectedApiArgs,
+    },
+    Reject {
+        approval_id: String,
+        #[arg(long, default_value = "rejected from CLI")]
+        reason: String,
+        #[command(flatten)]
+        api: ProtectedApiArgs,
+    },
+}
+
+#[derive(Debug, Args)]
+pub struct RemediationsCommand {
+    #[command(subcommand)]
+    pub command: RemediationsSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RemediationsSubcommand {
+    List {
+        #[arg(long)]
+        agent_id: Option<String>,
+        #[arg(long)]
+        policy_id: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        #[command(flatten)]
+        api: ProtectedApiArgs,
+    },
+    Get {
+        remediation_id: String,
+        #[command(flatten)]
+        api: ProtectedApiArgs,
+    },
+    RequestApproval {
+        remediation_id: String,
+        #[arg(long)]
+        approval_id: Option<String>,
+        #[arg(long)]
+        job_id: Option<String>,
+        #[arg(long, default_value = "remediation requires approval")]
+        reason: String,
+        #[arg(long, default_value_t = REMOTE_RUN_EXPIRES_IN_SECONDS)]
+        expires_in_seconds: u64,
+        #[command(flatten)]
+        api: ProtectedApiArgs,
+    },
+    Approve {
+        remediation_id: String,
+        #[arg(long)]
+        approval_id: String,
+        #[arg(long)]
+        job_id: String,
+        #[arg(long)]
+        runbook: PathBuf,
+        #[arg(long, default_value_t = 30)]
+        timeout_seconds: u64,
+        #[arg(long, default_value_t = REMOTE_RUN_EXPIRES_IN_SECONDS)]
+        expires_in_seconds: u64,
+        #[arg(long)]
+        nonce_prefix: Option<String>,
+        #[arg(long, default_value = "approved remediation")]
+        reason: String,
+        #[command(flatten)]
+        api: ProtectedApiArgs,
+    },
+    Running {
+        remediation_id: String,
+        #[arg(long)]
+        job_id: String,
+        #[command(flatten)]
+        api: ProtectedApiArgs,
+    },
+    Result {
+        remediation_id: String,
+        #[arg(long)]
+        job_id: String,
+        #[arg(long)]
+        status: String,
+        #[command(flatten)]
+        api: ProtectedApiArgs,
+    },
+    Verify {
+        remediation_id: String,
+        #[arg(long)]
+        agent_id: String,
+        #[arg(long)]
+        policy_id: String,
+        #[arg(long)]
+        policy_name: String,
+        #[arg(long)]
+        job_id: String,
+        #[command(flatten)]
+        api: ProtectedApiArgs,
+    },
+}
+
+#[derive(Debug, Args)]
+pub struct SelectorsCommand {
+    #[command(subcommand)]
+    pub command: SelectorsSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SelectorsSubcommand {
+    Preview {
+        #[arg(long)]
+        selector: String,
+        #[command(flatten)]
+        api: ProtectedApiArgs,
+    },
+}
+
+#[derive(Debug, Args)]
+pub struct AuditCommand {
+    #[command(subcommand)]
+    pub command: AuditSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AuditSubcommand {
+    Export {
+        #[arg(long)]
+        category: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        #[arg(long)]
+        before: Option<String>,
+        #[command(flatten)]
+        api: ProtectedApiArgs,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -379,6 +746,12 @@ pub struct RunCommand {
 
     #[arg(long)]
     pub admin_token: Option<String>,
+
+    #[arg(long, default_value = DEFAULT_CLI_PROFILE_PATH)]
+    pub profile_path: PathBuf,
+
+    #[arg(long)]
+    pub remote: bool,
 
     #[arg(long)]
     pub job_id: Option<String>,
@@ -600,9 +973,15 @@ pub fn main_entry() -> ExitCode {
 
 pub fn execute(cli: Cli) -> Result<(), CliError> {
     match cli.command {
+        Command::Login(command) => execute_login(command),
         Command::Controller(command) => execute_controller(command),
         Command::Agent(command) => execute_agent(command),
         Command::Agents(command) => execute_agents(command),
+        Command::Jobs(command) => execute_jobs(command),
+        Command::Approvals(command) => execute_approvals(command),
+        Command::Remediations(command) => execute_remediations(command),
+        Command::Selectors(command) => execute_selectors(command),
+        Command::Audit(command) => execute_audit(command),
         Command::EnrollToken(command) => execute_enroll_token(command),
         Command::Run(command) => execute_run(command),
         Command::Facts(command) => execute_facts(command),
@@ -614,6 +993,456 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
         Command::Upgrade(command) => execute_upgrade(command),
         Command::Demo(command) => execute_demo(command),
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct CliProfile {
+    controller_url: String,
+    admin_token: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProtectedApiClient {
+    controller_url: String,
+    admin_token: String,
+}
+
+fn execute_login(command: LoginCommand) -> Result<(), CliError> {
+    let profile = CliProfile {
+        controller_url: command.controller_url,
+        admin_token: command.admin_token,
+    };
+    save_cli_profile(&command.profile_path, &profile)?;
+    println!("profile_path={}", command.profile_path.display());
+    println!("controller_url={}", profile.controller_url);
+    println!("status=created");
+    Ok(())
+}
+
+fn save_cli_profile(path: &Path, profile: &CliProfile) -> Result<(), CliError> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
+    let body =
+        serde_json::to_string_pretty(profile).map_err(|error| CliError::Http(error.to_string()))?;
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(body.as_bytes())?;
+    #[cfg(unix)]
+    {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+fn read_cli_profile(path: &Path) -> Result<CliProfile, CliError> {
+    ensure_secure_profile_permissions(path)?;
+    let body = fs::read_to_string(path)?;
+    serde_json::from_str(&body).map_err(|error| CliError::Http(error.to_string()))
+}
+
+fn ensure_secure_profile_permissions(path: &Path) -> Result<(), CliError> {
+    let metadata = fs::metadata(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            CliError::Http(format!(
+                "CLI profile not found: {}; run `sponzey login --controller-url <url> --admin-token <token>` or pass --controller-url and --admin-token",
+                path.display()
+            ))
+        } else {
+            CliError::Io(error)
+        }
+    })?;
+    #[cfg(unix)]
+    {
+        let mode = metadata.permissions().mode();
+        if mode & 0o077 != 0 {
+            return Err(CliError::Http(format!(
+                "CLI profile has insecure permissions: {}; expected mode 600",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn resolve_protected_api(args: &ProtectedApiArgs) -> Result<ProtectedApiClient, CliError> {
+    let profile_needed = args.controller_url.is_none() || args.admin_token.is_none();
+    let profile = if profile_needed {
+        Some(read_cli_profile(&args.profile_path)?)
+    } else {
+        None
+    };
+    let controller_url = args
+        .controller_url
+        .clone()
+        .or_else(|| {
+            profile
+                .as_ref()
+                .map(|profile| profile.controller_url.clone())
+        })
+        .ok_or_else(|| CliError::Http("--controller-url is required".to_owned()))?;
+    let admin_token = args
+        .admin_token
+        .clone()
+        .or_else(|| profile.as_ref().map(|profile| profile.admin_token.clone()))
+        .ok_or_else(|| CliError::Http("--admin-token is required".to_owned()))?;
+    Ok(ProtectedApiClient {
+        controller_url,
+        admin_token,
+    })
+}
+
+fn run_command_api_args(command: &RunCommand) -> ProtectedApiArgs {
+    ProtectedApiArgs {
+        controller_url: command.controller_url.clone(),
+        admin_token: command.admin_token.clone(),
+        profile_path: command.profile_path.clone(),
+    }
+}
+
+impl ProtectedApiClient {
+    fn request(&self, method: &str, path: &str, body: Option<&str>) -> Result<String, CliError> {
+        let response = http_request_url(
+            &self.controller_url,
+            method,
+            path,
+            Some(&self.admin_token),
+            body,
+        )?;
+        protected_response_body(&response, &[200, 201])
+    }
+
+    fn get(&self, path: &str) -> Result<String, CliError> {
+        self.request("GET", path, None)
+    }
+
+    fn post(&self, path: &str, body: Option<&str>) -> Result<String, CliError> {
+        self.request("POST", path, body)
+    }
+}
+
+fn protected_response_body(response: &str, success_codes: &[u16]) -> Result<String, CliError> {
+    let status = http_response_status_code(response).unwrap_or(0);
+    if success_codes.contains(&status) {
+        return Ok(http_response_body(response).to_owned());
+    }
+    Err(CliError::Http(render_http_status_error(status)))
+}
+
+fn http_response_status_code(response: &str) -> Option<u16> {
+    response
+        .lines()
+        .next()?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
+fn http_response_body(response: &str) -> &str {
+    response.split("\r\n\r\n").nth(1).unwrap_or_default()
+}
+
+fn render_http_status_error(status: u16) -> String {
+    match status {
+        401 => "unauthorized: admin token is missing or invalid".to_owned(),
+        403 => "forbidden: admin token lacks required permission".to_owned(),
+        404 => "not found: requested resource does not exist".to_owned(),
+        409 => "conflict: request conflicts with current state".to_owned(),
+        0 => "request failed: malformed HTTP response".to_owned(),
+        _ => format!("request failed: HTTP {status}"),
+    }
+}
+
+fn print_json_response(body: &str) -> Result<(), CliError> {
+    let json: serde_json::Value =
+        serde_json::from_str(body).map_err(|error| CliError::Http(error.to_string()))?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json).map_err(|error| CliError::Http(error.to_string()))?
+    );
+    Ok(())
+}
+
+fn render_agent_certificate_issuance_request_for_cli(body: &str) -> Result<Vec<String>, CliError> {
+    let json: serde_json::Value =
+        serde_json::from_str(body).map_err(|error| CliError::Http(error.to_string()))?;
+    Ok(vec![
+        format!(
+            "agent_id={}\taction={}\tstate={}",
+            json_field(&json, "agent_id"),
+            json_field(&json, "action"),
+            json_field(&json, "lifecycle_state")
+        ),
+        format!(
+            "dispatch_status={}\taudit_event_action={}",
+            json_field(&json, "dispatch_status"),
+            json_field(&json, "audit_event_action")
+        ),
+        format!(
+            "current_fingerprint_prefix={}\tnext_fingerprint_prefix={}",
+            json_optional_field(&json, "current_fingerprint_prefix")
+                .unwrap_or_else(|| "none".to_owned()),
+            json_optional_field(&json, "next_fingerprint_prefix")
+                .unwrap_or_else(|| "none".to_owned())
+        ),
+    ])
+}
+
+fn render_agent_certificate_lifecycle_status_for_cli(body: &str) -> Result<Vec<String>, CliError> {
+    let json: serde_json::Value =
+        serde_json::from_str(body).map_err(|error| CliError::Http(error.to_string()))?;
+    Ok(vec![
+        format!(
+            "agent_id={}\tstate={}\trecord_present={}",
+            json_field(&json, "agent_id"),
+            json_field(&json, "lifecycle_state"),
+            json_field(&json, "record_present")
+        ),
+        format!(
+            "current_fingerprint_prefix={}\tnext_fingerprint_prefix={}",
+            json_optional_field(&json, "current_fingerprint_prefix")
+                .unwrap_or_else(|| "none".to_owned()),
+            json_optional_field(&json, "next_fingerprint_prefix")
+                .unwrap_or_else(|| "none".to_owned())
+        ),
+        format!(
+            "grace_until_ms={}\trevocation_reason={}\tupdated_at_ms={}",
+            json_optional_number(&json, "grace_until_ms")
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_owned()),
+            json_optional_field(&json, "revocation_reason").unwrap_or_else(|| "none".to_owned()),
+            json_optional_number(&json, "updated_at_ms")
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_owned())
+        ),
+    ])
+}
+
+fn render_controller_signing_rotation_status_for_cli(body: &str) -> Result<Vec<String>, CliError> {
+    let json: serde_json::Value =
+        serde_json::from_str(body).map_err(|error| CliError::Http(error.to_string()))?;
+    let mut lines = vec![
+        format!(
+            "controller_id={}\tstate={}\treadiness={}",
+            json_field(&json, "controller_id"),
+            json_field(&json, "persisted_state"),
+            json_field(&json, "readiness")
+        ),
+        format!(
+            "active_signing_fingerprint_prefix={}\tselected_signing_fingerprint_prefix={}",
+            json_field(&json, "active_signing_fingerprint_prefix"),
+            json_field(&json, "selected_signing_fingerprint_prefix")
+        ),
+        format!(
+            "old_fingerprint_prefix={}\tnew_fingerprint_prefix={}",
+            json_field(&json, "old_fingerprint_prefix"),
+            json_optional_field(&json, "new_fingerprint_prefix")
+                .unwrap_or_else(|| "none".to_owned())
+        ),
+        format!(
+            "bootstrap_guard={}\tagent_trust_rollout={}",
+            json_field(&json, "bootstrap_guard"),
+            json_field(&json, "agent_trust_rollout")
+        ),
+    ];
+    if let Some(window) = json_optional_number(&json, "old_key_verifies_until_ms") {
+        lines.push(format!("old_key_verifies_until_ms={window}"));
+    }
+    Ok(lines)
+}
+
+fn render_controller_signing_rotation_restart_plan_for_cli(
+    body: &str,
+) -> Result<Vec<String>, CliError> {
+    let json: serde_json::Value =
+        serde_json::from_str(body).map_err(|error| CliError::Http(error.to_string()))?;
+    let mut lines = vec![
+        format!(
+            "controller_id={}\trestart_required={}\treload_supported={}",
+            json_field(&json, "controller_id"),
+            json_field(&json, "restart_required"),
+            json_field(&json, "reload_supported")
+        ),
+        format!(
+            "recommended_action={}\treadiness={}",
+            json_field(&json, "recommended_action"),
+            json_field(&json, "readiness")
+        ),
+        format!(
+            "bootstrap_guard={}\tagent_trust_rollout={}",
+            json_field(&json, "bootstrap_guard"),
+            json_field(&json, "agent_trust_rollout")
+        ),
+        format!(
+            "active_signing_fingerprint_prefix={}\tselected_signing_fingerprint_prefix={}",
+            json_field(&json, "active_signing_fingerprint_prefix"),
+            json_field(&json, "selected_signing_fingerprint_prefix")
+        ),
+    ];
+    if let Some(reason) = json_optional_field(&json, "blocked_reason") {
+        lines.push(format!("blocked_reason={reason}"));
+    }
+    append_json_string_array_lines(
+        &mut lines,
+        &json,
+        "verification_commands",
+        "verification_command",
+    );
+    append_json_string_array_lines(&mut lines, &json, "safety_notes", "safety_note");
+    Ok(lines)
+}
+
+fn render_controller_signing_rotation_restart_action_for_cli(
+    body: &str,
+) -> Result<Vec<String>, CliError> {
+    let json: serde_json::Value =
+        serde_json::from_str(body).map_err(|error| CliError::Http(error.to_string()))?;
+    let mut lines = vec![
+        format!(
+            "controller_id={}\taction={}",
+            json_field(&json, "controller_id"),
+            json_field(&json, "action")
+        ),
+        format!(
+            "action_status={}\trestart_required={}\treload_supported={}",
+            json_field(&json, "action_status"),
+            json_field(&json, "restart_required"),
+            json_field(&json, "reload_supported")
+        ),
+        format!(
+            "readiness={}\tbootstrap_guard={}",
+            json_field(&json, "readiness"),
+            json_field(&json, "bootstrap_guard")
+        ),
+        format!(
+            "active_signing_fingerprint_prefix={}\tselected_signing_fingerprint_prefix={}",
+            json_field(&json, "active_signing_fingerprint_prefix"),
+            json_field(&json, "selected_signing_fingerprint_prefix")
+        ),
+        format!("service_command={}", json_field(&json, "service_command")),
+    ];
+    append_json_string_array_lines(
+        &mut lines,
+        &json,
+        "verification_commands",
+        "verification_command",
+    );
+    append_json_string_array_lines(&mut lines, &json, "safety_notes", "safety_note");
+    Ok(lines)
+}
+
+fn render_controller_signing_trust_bundle_rollout_for_cli(
+    body: &str,
+) -> Result<Vec<String>, CliError> {
+    let json: serde_json::Value =
+        serde_json::from_str(body).map_err(|error| CliError::Http(error.to_string()))?;
+    let mut lines = vec![
+        format!(
+            "controller_id={}\tstate={}",
+            json_field(&json, "controller_id"),
+            json_field(&json, "persisted_state")
+        ),
+        format!(
+            "attempted_count={}\tupdated_count={}\tskipped_count={}\tfailed_count={}",
+            json_field(&json, "attempted_count"),
+            json_field(&json, "updated_count"),
+            json_field(&json, "skipped_count"),
+            json_field(&json, "failed_count")
+        ),
+        format!(
+            "entries_count={}\tcurrent_fingerprint_prefix={}\tprevious_fingerprint_prefix={}",
+            json_field(&json, "entries_count"),
+            json_field(&json, "current_fingerprint_prefix"),
+            json_optional_field(&json, "previous_fingerprint_prefix")
+                .unwrap_or_else(|| "none".to_owned())
+        ),
+    ];
+    if let Some(results) = json.get("agent_results").and_then(|value| value.as_array()) {
+        for result in results {
+            lines.push(format!(
+                "agent_id={}\tstatus={}",
+                json_field(result, "agent_id"),
+                json_field(result, "status")
+            ));
+        }
+    }
+    Ok(lines)
+}
+
+fn render_controller_signing_trust_bundle_staged_rollout_for_cli(
+    body: &str,
+) -> Result<Vec<String>, CliError> {
+    let json: serde_json::Value =
+        serde_json::from_str(body).map_err(|error| CliError::Http(error.to_string()))?;
+    let mut lines = vec![
+        format!(
+            "controller_id={}\tstate={}\trollout_state={}",
+            json_field(&json, "controller_id"),
+            json_field(&json, "persisted_state"),
+            json_field(&json, "rollout_state")
+        ),
+        format!(
+            "target_count={}\tplanned_count={}\tattempted_count={}\tupdated_count={}",
+            json_field(&json, "target_count"),
+            json_field(&json, "planned_count"),
+            json_field(&json, "attempted_count"),
+            json_field(&json, "updated_count")
+        ),
+        format!(
+            "skipped_count={}\tfailed_count={}\talready_current_count={}\tunavailable_count={}\tpending_count={}",
+            json_field(&json, "skipped_count"),
+            json_field(&json, "failed_count"),
+            json_field(&json, "already_current_count"),
+            json_field(&json, "unavailable_count"),
+            json_field(&json, "pending_count")
+        ),
+        format!(
+            "entries_count={}\tcurrent_fingerprint_prefix={}\tprevious_fingerprint_prefix={}",
+            json_field(&json, "entries_count"),
+            json_field(&json, "current_fingerprint_prefix"),
+            json_optional_field(&json, "previous_fingerprint_prefix")
+                .unwrap_or_else(|| "none".to_owned())
+        ),
+    ];
+    if let Some(results) = json.get("agent_results").and_then(|value| value.as_array()) {
+        for result in results {
+            lines.push(format!(
+                "agent_id={}\tstatus={}",
+                json_field(result, "agent_id"),
+                json_field(result, "status")
+            ));
+        }
+    }
+    Ok(lines)
+}
+
+fn append_json_string_array_lines(
+    lines: &mut Vec<String>,
+    json: &serde_json::Value,
+    field: &str,
+    label: &str,
+) {
+    let Some(values) = json.get(field).and_then(|value| value.as_array()) else {
+        return;
+    };
+    for value in values.iter().filter_map(|value| value.as_str()) {
+        lines.push(format!("{label}={value}"));
+    }
+}
+
+fn json_optional_number(json: &serde_json::Value, key: &str) -> Option<String> {
+    json.get(key).and_then(|value| match value {
+        serde_json::Value::Number(number) => Some(number.to_string()),
+        _ => None,
+    })
 }
 
 fn execute_controller(command: ControllerCommand) -> Result<(), CliError> {
@@ -639,9 +1468,10 @@ fn execute_controller(command: ControllerCommand) -> Result<(), CliError> {
             db,
             tls_cert,
             tls_key,
+            agent_client_ca_cert,
             data_dir,
         } => {
-            let database_path = db.as_deref().map(parse_sqlite_database_url).transpose()?;
+            let database = parse_controller_database_settings(db.as_deref(), &data_dir)?;
             ensure_controller_initialized_for_start(&data_dir)?;
             fleet_controller::start_controller_server(fleet_controller::ControllerServerConfig {
                 host,
@@ -649,8 +1479,10 @@ fn execute_controller(command: ControllerCommand) -> Result<(), CliError> {
                 external_url,
                 tls_cert_path: tls_cert,
                 tls_key_path: tls_key,
+                agent_client_ca_cert_path: agent_client_ca_cert,
                 data_dir,
-                database_path,
+                database: Some(database),
+                secret_provider: None,
             })?;
             Ok(())
         }
@@ -678,8 +1510,25 @@ fn execute_controller(command: ControllerCommand) -> Result<(), CliError> {
         ControllerSubcommand::StartService { dry_run } => {
             start_systemd_service(ServiceRole::Controller, dry_run)
         }
+        ControllerSubcommand::RestartService { dry_run } => {
+            restart_systemd_service(ServiceRole::Controller, dry_run)
+        }
         ControllerSubcommand::StatusService { dry_run } => {
             status_systemd_service(ServiceRole::Controller, dry_run)
+        }
+        ControllerSubcommand::SigningRotationStatus { api, json } => {
+            let client = resolve_protected_api(&api)?;
+            let body = client.get("/api/controller/signing-rotation/status")?;
+            if json {
+                return print_json_response(&body);
+            }
+            for line in render_controller_signing_rotation_status_for_cli(&body)? {
+                println!("{line}");
+            }
+            Ok(())
+        }
+        ControllerSubcommand::SigningRotation { command } => {
+            execute_controller_signing_rotation(command)
         }
         ControllerSubcommand::LogsService { lines, dry_run } => {
             logs_systemd_service(ServiceRole::Controller, lines, dry_run)
@@ -697,6 +1546,191 @@ fn execute_controller(command: ControllerCommand) -> Result<(), CliError> {
             force,
         } => execute_controller_restore(&data_dir, &input, dry_run, force),
     }
+}
+
+fn execute_controller_signing_rotation(
+    command: ControllerSigningRotationSubcommand,
+) -> Result<(), CliError> {
+    let (api, path, body, json) = match command {
+        ControllerSigningRotationSubcommand::RestartPlan { api, json } => {
+            let client = resolve_protected_api(&api)?;
+            let response = client.get("/api/controller/signing-rotation/restart-plan")?;
+            if json {
+                return print_json_response(&response);
+            }
+            for line in render_controller_signing_rotation_restart_plan_for_cli(&response)? {
+                println!("{line}");
+            }
+            return Ok(());
+        }
+        ControllerSigningRotationSubcommand::RestartAction {
+            api,
+            confirm_external_restart,
+            reason,
+            json,
+        } => (
+            api,
+            "/api/controller/signing-rotation/restart-action",
+            serde_json::json!({
+                "confirm_external_restart": confirm_external_restart,
+                "reason": reason
+            })
+            .to_string(),
+            json,
+        ),
+        ControllerSigningRotationSubcommand::Request {
+            api,
+            new_fingerprint,
+            old_key_verifies_for_seconds,
+            old_key_verifies_until_ms,
+            reason,
+            json,
+        } => (
+            api,
+            "/api/controller/signing-rotation/request",
+            serde_json::json!({
+                "new_fingerprint": new_fingerprint,
+                "old_key_verifies_for_seconds": old_key_verifies_for_seconds,
+                "old_key_verifies_until_ms": old_key_verifies_until_ms,
+                "reason": reason,
+            })
+            .to_string(),
+            json,
+        ),
+        ControllerSigningRotationSubcommand::Validate {
+            api,
+            candidate_public_key_path,
+            candidate_private_key_path,
+            reason,
+            json,
+        } => (
+            api,
+            "/api/controller/signing-rotation/validate",
+            serde_json::json!({
+                "candidate_public_key_path": candidate_public_key_path,
+                "candidate_private_key_path": candidate_private_key_path,
+                "reason": reason,
+            })
+            .to_string(),
+            json,
+        ),
+        ControllerSigningRotationSubcommand::Activate { api, reason, json } => (
+            api,
+            "/api/controller/signing-rotation/activate",
+            serde_json::json!({ "reason": reason }).to_string(),
+            json,
+        ),
+        ControllerSigningRotationSubcommand::Retire { api, reason, json } => (
+            api,
+            "/api/controller/signing-rotation/retire",
+            serde_json::json!({ "reason": reason }).to_string(),
+            json,
+        ),
+        ControllerSigningRotationSubcommand::Fail { api, reason, json } => (
+            api,
+            "/api/controller/signing-rotation/fail",
+            serde_json::json!({ "reason": reason }).to_string(),
+            json,
+        ),
+        ControllerSigningRotationSubcommand::RolloutTrustBundle {
+            api,
+            previous_public_key_path,
+            agent_ids,
+            json,
+        } => (
+            api,
+            "/api/controller/signing-rotation/rollout-trust-bundle",
+            serde_json::json!({
+                "previous_public_key_path": previous_public_key_path,
+                "agent_ids": agent_ids
+            })
+            .to_string(),
+            json,
+        ),
+        ControllerSigningRotationSubcommand::RetryTrustBundle {
+            api,
+            previous_public_key_path,
+            agent_ids,
+            max_agent_count,
+            json,
+        } => (
+            api,
+            "/api/controller/signing-rotation/rollout-trust-bundle/retry",
+            serde_json::json!({
+                "previous_public_key_path": previous_public_key_path,
+                "agent_ids": agent_ids,
+                "max_agent_count": max_agent_count
+            })
+            .to_string(),
+            json,
+        ),
+        ControllerSigningRotationSubcommand::StagedTrustBundle {
+            api,
+            previous_public_key_path,
+            agent_ids,
+            batch_size,
+            max_failures,
+            ack_timeout_seconds,
+            json,
+        } => (
+            api,
+            CONTROLLER_SIGNING_STAGED_TRUST_BUNDLE_PATH,
+            controller_signing_staged_trust_bundle_request_body(
+                previous_public_key_path,
+                agent_ids,
+                batch_size,
+                max_failures,
+                ack_timeout_seconds,
+            ),
+            json,
+        ),
+    };
+    let client = resolve_protected_api(&api)?;
+    let response = client.post(path, Some(&body))?;
+    if json {
+        return print_json_response(&response);
+    }
+    if path == "/api/controller/signing-rotation/restart-action" {
+        for line in render_controller_signing_rotation_restart_action_for_cli(&response)? {
+            println!("{line}");
+        }
+        return Ok(());
+    }
+    if path == "/api/controller/signing-rotation/rollout-trust-bundle"
+        || path == "/api/controller/signing-rotation/rollout-trust-bundle/retry"
+    {
+        for line in render_controller_signing_trust_bundle_rollout_for_cli(&response)? {
+            println!("{line}");
+        }
+        return Ok(());
+    }
+    if path == CONTROLLER_SIGNING_STAGED_TRUST_BUNDLE_PATH {
+        for line in render_controller_signing_trust_bundle_staged_rollout_for_cli(&response)? {
+            println!("{line}");
+        }
+        return Ok(());
+    }
+    for line in render_controller_signing_rotation_status_for_cli(&response)? {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+fn controller_signing_staged_trust_bundle_request_body(
+    previous_public_key_path: Option<PathBuf>,
+    agent_ids: Vec<String>,
+    batch_size: usize,
+    max_failures: usize,
+    ack_timeout_seconds: u64,
+) -> String {
+    serde_json::json!({
+        "previous_public_key_path": previous_public_key_path,
+        "agent_ids": agent_ids,
+        "batch_size": batch_size,
+        "max_failures": max_failures,
+        "ack_timeout_seconds": ack_timeout_seconds
+    })
+    .to_string()
 }
 
 const CONTROLLER_BACKUP_FORMAT: &str = "sponzey-controller-backup";
@@ -1395,6 +2429,290 @@ fn execute_agents(command: AgentsCommand) -> Result<(), CliError> {
             print!("{body}");
             Ok(())
         }
+        AgentsSubcommand::RemoteList { api } => {
+            let client = resolve_protected_api(&api)?;
+            let body = client.get("/api/agents")?;
+            print_json_response(&body)
+        }
+        AgentsSubcommand::RemoteGet { agent_id, api } => {
+            let client = resolve_protected_api(&api)?;
+            let body = client.get(&format!("/api/agents/{agent_id}"))?;
+            print_json_response(&body)
+        }
+        AgentsSubcommand::RequestCertificateIssuance {
+            agent_id,
+            api,
+            json,
+        } => {
+            let client = resolve_protected_api(&api)?;
+            let response = client.post(
+                &format!("/api/agents/{agent_id}/certificate-lifecycle/request-issuance"),
+                Some("{}"),
+            )?;
+            if json {
+                return print_json_response(&response);
+            }
+            for line in render_agent_certificate_issuance_request_for_cli(&response)? {
+                println!("{line}");
+            }
+            Ok(())
+        }
+        AgentsSubcommand::CertificateStatus {
+            agent_id,
+            api,
+            json,
+        } => {
+            let client = resolve_protected_api(&api)?;
+            let response = client.get(&format!(
+                "/api/agents/{agent_id}/certificate-lifecycle/status"
+            ))?;
+            if json {
+                return print_json_response(&response);
+            }
+            for line in render_agent_certificate_lifecycle_status_for_cli(&response)? {
+                println!("{line}");
+            }
+            Ok(())
+        }
+    }
+}
+
+fn execute_jobs(command: JobsCommand) -> Result<(), CliError> {
+    match command.command {
+        JobsSubcommand::List { api } => {
+            let client = resolve_protected_api(&api)?;
+            let body = client.get("/api/jobs")?;
+            print_json_response(&body)
+        }
+        JobsSubcommand::Get { job_id, api } => {
+            let client = resolve_protected_api(&api)?;
+            let body = client.get(&format!("/api/jobs/{job_id}"))?;
+            print_json_response(&body)
+        }
+        JobsSubcommand::Output { job_id, api } => {
+            let client = resolve_protected_api(&api)?;
+            let body = client.get(&format!("/api/jobs/{job_id}/output"))?;
+            for line in render_job_output_api_for_cli(&body)? {
+                println!("{line}");
+            }
+            Ok(())
+        }
+        JobsSubcommand::Cancel { job_id, api } => {
+            let client = resolve_protected_api(&api)?;
+            let body = serde_json::json!({ "reason": "canceled from CLI" }).to_string();
+            let response = client.post(&format!("/api/jobs/{job_id}/cancel"), Some(&body))?;
+            print_json_response(&response)
+        }
+    }
+}
+
+fn execute_approvals(command: ApprovalsCommand) -> Result<(), CliError> {
+    match command.command {
+        ApprovalsSubcommand::List { api } => {
+            let client = resolve_protected_api(&api)?;
+            let body = client.get("/api/approvals?status=pending")?;
+            print_json_response(&body)
+        }
+        ApprovalsSubcommand::Approve {
+            approval_id,
+            reason,
+            api,
+        } => {
+            let client = resolve_protected_api(&api)?;
+            let body = serde_json::json!({ "reason": reason }).to_string();
+            let response = client.post(
+                &format!("/api/approvals/{approval_id}/approve"),
+                Some(&body),
+            )?;
+            print_json_response(&response)
+        }
+        ApprovalsSubcommand::Reject {
+            approval_id,
+            reason,
+            api,
+        } => {
+            let client = resolve_protected_api(&api)?;
+            let body = serde_json::json!({ "reason": reason }).to_string();
+            let response =
+                client.post(&format!("/api/approvals/{approval_id}/reject"), Some(&body))?;
+            print_json_response(&response)
+        }
+    }
+}
+
+fn execute_remediations(command: RemediationsCommand) -> Result<(), CliError> {
+    match command.command {
+        RemediationsSubcommand::List {
+            agent_id,
+            policy_id,
+            limit,
+            api,
+        } => {
+            let client = resolve_protected_api(&api)?;
+            let body = client.get(&remediations_list_path(
+                agent_id.as_deref(),
+                policy_id.as_deref(),
+                limit,
+            ))?;
+            print_remediation_response(&body)
+        }
+        RemediationsSubcommand::Get {
+            remediation_id,
+            api,
+        } => {
+            let client = resolve_protected_api(&api)?;
+            let body = client.get(&format!(
+                "/api/remediations/{}",
+                query_encode(&remediation_id)
+            ))?;
+            print_remediation_response(&body)
+        }
+        RemediationsSubcommand::RequestApproval {
+            remediation_id,
+            approval_id,
+            job_id,
+            reason,
+            expires_in_seconds,
+            api,
+        } => {
+            let client = resolve_protected_api(&api)?;
+            let body = serde_json::json!({
+                "approval_id": approval_id,
+                "job_id": job_id,
+                "reason": reason,
+                "expires_in_seconds": expires_in_seconds
+            })
+            .to_string();
+            let response = client.post(
+                &format!(
+                    "/api/remediations/{}/approval-request",
+                    query_encode(&remediation_id)
+                ),
+                Some(&body),
+            )?;
+            print_remediation_response(&response)
+        }
+        RemediationsSubcommand::Approve {
+            remediation_id,
+            approval_id,
+            job_id,
+            runbook,
+            timeout_seconds,
+            expires_in_seconds,
+            nonce_prefix,
+            reason,
+            api,
+        } => {
+            let client = resolve_protected_api(&api)?;
+            let runbook_document = fs::read_to_string(&runbook)?;
+            let body = build_remediation_approve_body(
+                &approval_id,
+                &job_id,
+                &runbook_document,
+                timeout_seconds,
+                expires_in_seconds,
+                nonce_prefix.as_deref(),
+                &reason,
+            );
+            let response = client.post(
+                &format!(
+                    "/api/remediations/{}/approve",
+                    query_encode(&remediation_id)
+                ),
+                Some(&body),
+            )?;
+            print_remediation_response(&response)
+        }
+        RemediationsSubcommand::Running {
+            remediation_id,
+            job_id,
+            api,
+        } => {
+            let client = resolve_protected_api(&api)?;
+            let body = serde_json::json!({ "job_id": job_id }).to_string();
+            let response = client.post(
+                &format!(
+                    "/api/remediations/{}/running",
+                    query_encode(&remediation_id)
+                ),
+                Some(&body),
+            )?;
+            print_remediation_response(&response)
+        }
+        RemediationsSubcommand::Result {
+            remediation_id,
+            job_id,
+            status,
+            api,
+        } => {
+            let client = resolve_protected_api(&api)?;
+            let body = serde_json::json!({ "job_id": job_id, "status": status }).to_string();
+            let response = client.post(
+                &format!("/api/remediations/{}/result", query_encode(&remediation_id)),
+                Some(&body),
+            )?;
+            print_remediation_response(&response)
+        }
+        RemediationsSubcommand::Verify {
+            remediation_id,
+            agent_id,
+            policy_id,
+            policy_name,
+            job_id,
+            api,
+        } => {
+            let client = resolve_protected_api(&api)?;
+            let body = serde_json::json!({
+                "agent_id": agent_id,
+                "policy_id": policy_id,
+                "policy_name": policy_name,
+                "job_id": job_id
+            })
+            .to_string();
+            let response = client.post(
+                &format!("/api/remediations/{}/verify", query_encode(&remediation_id)),
+                Some(&body),
+            )?;
+            print_remediation_response(&response)
+        }
+    }
+}
+
+fn execute_selectors(command: SelectorsCommand) -> Result<(), CliError> {
+    match command.command {
+        SelectorsSubcommand::Preview { selector, api } => {
+            let client = resolve_protected_api(&api)?;
+            let body = serde_json::json!({ "selector": selector }).to_string();
+            let response = client.post("/api/selectors/preview", Some(&body))?;
+            for line in render_selector_preview_for_cli(&response)? {
+                println!("{line}");
+            }
+            Ok(())
+        }
+    }
+}
+
+fn execute_audit(command: AuditCommand) -> Result<(), CliError> {
+    match command.command {
+        AuditSubcommand::Export {
+            category,
+            limit,
+            before,
+            api,
+        } => {
+            if limit == 0 {
+                return Err(CliError::Http(
+                    "audit export limit must be greater than zero".to_owned(),
+                ));
+            }
+            let client = resolve_protected_api(&api)?;
+            let path = audit_export_path(category.as_deref(), limit, before.as_deref());
+            let body = client.get(&path)?;
+            for line in render_audit_export_jsonl(&body)? {
+                println!("{line}");
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1405,7 +2723,7 @@ fn execute_run(command: RunCommand) -> Result<(), CliError> {
     let Some((program, args)) = command.command.split_first() else {
         return Err(CliError::EmptyCommand);
     };
-    if command.controller_url.is_some() || command.admin_token.is_some() {
+    if command.remote || command.controller_url.is_some() || command.admin_token.is_some() {
         return execute_remote_run(&command, program, args);
     }
     let output = fleet_runner::run_command(program, args)?;
@@ -1425,14 +2743,7 @@ fn execute_remote_run(
     program: &str,
     args: &[String],
 ) -> Result<(), CliError> {
-    let controller_url = command
-        .controller_url
-        .as_deref()
-        .ok_or_else(|| CliError::Http("--controller-url is required for remote run".to_owned()))?;
-    let admin_token = command
-        .admin_token
-        .as_deref()
-        .ok_or_else(|| CliError::Http("--admin-token is required for remote run".to_owned()))?;
+    let client = resolve_protected_api(&run_command_api_args(command))?;
     if command.selector.is_none() {
         return Err(CliError::Http(
             "remote run requires --selector in MVP".to_owned(),
@@ -1440,25 +2751,9 @@ fn execute_remote_run(
     }
     let job_id = command.job_id.clone().unwrap_or(prefixed_ulid("job-cli")?);
     let body = remote_run_request_body(command, &job_id, program, args)?;
-    let response = http_request_url(
-        controller_url,
-        "POST",
-        "/api/jobs/command",
-        Some(admin_token),
-        Some(&body),
-    )?;
-    if !response.starts_with("HTTP/1.1 201") {
-        return Err(CliError::Http(
-            response
-                .lines()
-                .next()
-                .unwrap_or("request failed")
-                .to_owned(),
-        ));
-    }
-    let response_body = response.split("\r\n\r\n").nth(1).unwrap_or_default();
+    let response_body = client.post("/api/jobs/command", Some(&body))?;
     let response_json: serde_json::Value =
-        serde_json::from_str(response_body).map_err(|error| CliError::Http(error.to_string()))?;
+        serde_json::from_str(&response_body).map_err(|error| CliError::Http(error.to_string()))?;
     println!(
         "job_id={}",
         response_json
@@ -1484,7 +2779,7 @@ fn execute_remote_run(
     }
 
     let output_path = format!("/api/jobs/{job_id}/output");
-    let output = http_get_url(controller_url, &output_path, Some(admin_token))?;
+    let output = client.get(&output_path)?;
     for line in render_job_output_api_for_cli(&output)? {
         println!("{line}");
     }
@@ -1572,6 +2867,220 @@ fn render_job_output_api_for_cli(body: &str) -> Result<Vec<String>, CliError> {
         .collect())
 }
 
+fn render_selector_preview_for_cli(body: &str) -> Result<Vec<String>, CliError> {
+    let preview: serde_json::Value =
+        serde_json::from_str(body).map_err(|error| CliError::Http(error.to_string()))?;
+    let mut lines = vec![
+        format!(
+            "matched_count={}",
+            preview
+                .get("matched_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        ),
+        format!(
+            "selected_count={}",
+            preview
+                .get("selected_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        ),
+        format!(
+            "disabled_count={}",
+            preview
+                .get("disabled_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        ),
+        format!(
+            "offline_count={}",
+            preview
+                .get("offline_count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        ),
+    ];
+    if let Some(warnings) = preview
+        .get("warnings")
+        .and_then(serde_json::Value::as_array)
+    {
+        for warning in warnings {
+            let code = warning
+                .get("code")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("warning");
+            let message = warning
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            lines.push(format!("warning={code}:{message}"));
+        }
+    }
+    if let Some(agents) = preview.get("agents").and_then(serde_json::Value::as_array) {
+        for agent in agents {
+            let agent_id = agent
+                .get("agent_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let name = agent
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let status = agent
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let selected = agent
+                .get("selected_for_dispatch")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            lines.push(format!(
+                "agent={agent_id}\tname={name}\tstatus={status}\tselected={selected}"
+            ));
+        }
+    }
+    Ok(lines)
+}
+
+fn audit_export_path(category: Option<&str>, limit: usize, before: Option<&str>) -> String {
+    let mut query = Vec::new();
+    if let Some(category) = category.filter(|value| !value.is_empty()) {
+        query.push(format!("category={}", query_encode(category)));
+    }
+    query.push(format!("limit={limit}"));
+    if let Some(before) = before.filter(|value| !value.is_empty()) {
+        query.push(format!("before={}", query_encode(before)));
+    }
+    format!("/api/audit/export?{}", query.join("&"))
+}
+
+fn remediations_list_path(agent_id: Option<&str>, policy_id: Option<&str>, limit: usize) -> String {
+    let mut query = Vec::new();
+    if let Some(agent_id) = agent_id.filter(|value| !value.is_empty()) {
+        query.push(format!("agent_id={}", query_encode(agent_id)));
+    }
+    if let Some(policy_id) = policy_id.filter(|value| !value.is_empty()) {
+        query.push(format!("policy_id={}", query_encode(policy_id)));
+    }
+    query.push(format!("limit={}", limit.max(1)));
+    format!("/api/remediations?{}", query.join("&"))
+}
+
+fn build_remediation_approve_body(
+    approval_id: &str,
+    job_id: &str,
+    runbook_document: &str,
+    timeout_seconds: u64,
+    expires_in_seconds: u64,
+    nonce_prefix: Option<&str>,
+    reason: &str,
+) -> String {
+    serde_json::json!({
+        "approval_id": approval_id,
+        "job_id": job_id,
+        "runbook_document": runbook_document,
+        "timeout_seconds": timeout_seconds,
+        "expires_in_seconds": expires_in_seconds,
+        "nonce_prefix": nonce_prefix,
+        "reason": reason
+    })
+    .to_string()
+}
+
+fn render_audit_export_jsonl(body: &str) -> Result<Vec<String>, CliError> {
+    let page: serde_json::Value =
+        serde_json::from_str(body).map_err(|error| CliError::Http(error.to_string()))?;
+    let Some(items) = page.get("items").and_then(serde_json::Value::as_array) else {
+        return Err(CliError::Http(
+            "audit export response must contain an items array".to_owned(),
+        ));
+    };
+    items
+        .iter()
+        .map(|item| serde_json::to_string(item).map_err(|error| CliError::Http(error.to_string())))
+        .collect()
+}
+
+fn print_remediation_response(body: &str) -> Result<(), CliError> {
+    for line in render_remediation_api_for_cli(body)? {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+fn render_remediation_api_for_cli(body: &str) -> Result<Vec<String>, CliError> {
+    let json: serde_json::Value =
+        serde_json::from_str(body).map_err(|error| CliError::Http(error.to_string()))?;
+    if let Some(items) = json.as_array() {
+        return Ok(items.iter().map(remediation_summary_line).collect());
+    }
+    if let Some(remediation) = json.get("remediation") {
+        let mut lines = vec![remediation_summary_line(remediation)];
+        if let Some(approval) = json.get("approval") {
+            lines.push(format!(
+                "approval_id={}\tapproval_status={}\tapproval_job_id={}",
+                json_field(approval, "id"),
+                json_field(approval, "status"),
+                json_field(approval, "job_id")
+            ));
+        }
+        if json.get("assignment_count").is_some() || json.get("status").is_some() {
+            lines.push(format!(
+                "job_id={}\tassignment_count={}\tstatus={}",
+                json_field(&json, "job_id"),
+                json_field(&json, "assignment_count"),
+                json_field(&json, "status")
+            ));
+        }
+        return Ok(lines);
+    }
+    Ok(vec![remediation_summary_line(&json)])
+}
+
+fn remediation_summary_line(value: &serde_json::Value) -> String {
+    format!(
+        "remediation_id={}\tpolicy_id={}\tagent_id={}\tstatus={}\trunbook_ref={}\tjob_id={}",
+        json_field(value, "id"),
+        json_field(value, "policy_id"),
+        json_field(value, "agent_id"),
+        json_field(value, "status"),
+        json_field(value, "runbook_ref"),
+        json_field(value, "job_id")
+    )
+}
+
+fn json_field(value: &serde_json::Value, key: &str) -> String {
+    match value.get(key) {
+        Some(serde_json::Value::String(value)) => value.clone(),
+        Some(serde_json::Value::Number(value)) => value.to_string(),
+        Some(serde_json::Value::Bool(value)) => value.to_string(),
+        Some(serde_json::Value::Null) | None => "".to_owned(),
+        Some(other) => other.to_string(),
+    }
+}
+
+fn json_optional_field(value: &serde_json::Value, key: &str) -> Option<String> {
+    match value.get(key)? {
+        serde_json::Value::String(value) => Some(value.clone()),
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        serde_json::Value::Bool(value) => Some(value.to_string()),
+        serde_json::Value::Null => None,
+        other => Some(other.to_string()),
+    }
+}
+
+fn query_encode(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                (byte as char).to_string()
+            }
+            _ => format!("%{byte:02X}"),
+        })
+        .collect()
+}
+
 fn execute_facts(command: FactsCommand) -> Result<(), CliError> {
     let mut facts = collect_local_facts();
     if let Some(object) = facts.as_object_mut() {
@@ -1628,27 +3137,25 @@ fn execute_retention(command: RetentionCommand) -> Result<(), CliError> {
             dry_run,
         } => {
             let store = fleet_store::SqliteStore::open(controller_db_path(&data_dir))?;
-            let cutoff = SystemTime::now()
-                .checked_sub(Duration::from_secs(older_than_days.saturating_mul(86_400)))
-                .unwrap_or(SystemTime::UNIX_EPOCH);
-            let summary = store.cleanup_retention(cutoff, dry_run)?;
-            if !dry_run {
-                store.write_audit_event(fleet_domain::AuditEvent {
-                    category: fleet_domain::AuditCategory::Security,
-                    action: "retention_cleanup".to_owned(),
-                    actor: fleet_domain::AuditActor::new("cli"),
-                    target: fleet_domain::AuditTarget::new("controller-store"),
-                    value: fleet_domain::AuditValue::Plain(format!(
-                        "job_output_chunks={},facts_snapshots={},metrics_snapshots={},agent_log_chunks={},total={}",
-                        summary.job_output_chunks,
-                        summary.facts_snapshots,
-                        summary.metrics_snapshots,
-                        summary.agent_log_chunks,
-                        summary.total()
-                    )),
-                    occurred_at: SystemTime::now(),
-                })?;
-            }
+            let now = SystemTime::now();
+            let policy = RetentionPolicy::uniform(Duration::from_secs(
+                older_than_days.saturating_mul(86_400),
+            ));
+            let mut repo = &store;
+            let mut audit = &store;
+            let output = RunRetentionCleanup::execute(
+                &mut repo,
+                &mut audit,
+                RunRetentionCleanupInput {
+                    now,
+                    policy,
+                    dry_run,
+                    actor: "cli".to_owned(),
+                    target: "controller-store".to_owned(),
+                },
+            )
+            .map_err(map_cli_retention_cleanup_error)?;
+            let summary = output.summary;
             println!("job_output_chunks={}", summary.job_output_chunks);
             println!("facts_snapshots={}", summary.facts_snapshots);
             println!("metrics_snapshots={}", summary.metrics_snapshots);
@@ -1657,6 +3164,19 @@ fn execute_retention(command: RetentionCommand) -> Result<(), CliError> {
             println!("dry_run={dry_run}");
             Ok(())
         }
+    }
+}
+
+fn map_cli_retention_cleanup_error(
+    error: fleet_application::RunRetentionCleanupError<
+        fleet_store::StoreError,
+        fleet_store::StoreError,
+    >,
+) -> CliError {
+    match error {
+        fleet_application::RunRetentionCleanupError::Domain(error) => CliError::Http(error),
+        fleet_application::RunRetentionCleanupError::Repository(error)
+        | fleet_application::RunRetentionCleanupError::Audit(error) => CliError::Store(error),
     }
 }
 
@@ -1820,24 +3340,27 @@ fn execute_upgrade(command: UpgradeCommand) -> Result<(), CliError> {
     if !command.dry_run {
         return Err(CliError::UpgradeRequiresDryRun);
     }
-    let target_version = command.version.as_deref().unwrap_or("latest");
-    println!("upgrade_dry_run=true");
-    println!("current_version={}", env!("CARGO_PKG_VERSION"));
-    println!("channel={}", command.channel.as_str());
-    println!("target_version={target_version}");
-    println!("backup_required=true");
-    println!(
-        "recommended_backup_command=sponzey controller backup --data-dir <controller-data-dir> --output ./sponzey-controller-before-upgrade.backup.json"
-    );
-    println!("artifact_integrity_required=true");
-    println!("artifact_integrity_command=./scripts/verify_standalone_artifacts.sh dist/release");
-    println!(
-        "recovery_policy=restore the previous sponzey binary; if controller data was migrated or changed, restore the controller backup before restarting services"
-    );
-    println!(
-        "service_policy=stop services before binary replacement, then restart and verify with status-service"
-    );
+    for line in upgrade_dry_run_lines(&command) {
+        println!("{line}");
+    }
     Ok(())
+}
+
+fn upgrade_dry_run_lines(command: &UpgradeCommand) -> Vec<String> {
+    let target_version = command.version.as_deref().unwrap_or("latest");
+    vec![
+        "upgrade_dry_run=true".to_owned(),
+        format!("current_version={}", env!("CARGO_PKG_VERSION")),
+        format!("channel={}", command.channel.as_str()),
+        format!("target_version={target_version}"),
+        "backup_required=true".to_owned(),
+        "recommended_backup_command=sponzey controller backup --data-dir <controller-data-dir> --output ./sponzey-controller-before-upgrade.backup.json".to_owned(),
+        "artifact_integrity_required=true".to_owned(),
+        "artifact_integrity_command=./scripts/verify_standalone_artifacts.sh dist/release".to_owned(),
+        "artifact_signature_command=./scripts/verify_release_signature.sh dist/release <release-public-key.pem>".to_owned(),
+        "recovery_policy=restore the previous sponzey binary; if controller data was migrated or changed, restore the controller backup before restarting services".to_owned(),
+        "service_policy=stop services before binary replacement, then restart and verify with status-service".to_owned(),
+    ]
 }
 
 fn drift_status_to_cli(status: &fleet_domain::DriftStatus) -> &'static str {
@@ -1885,8 +3408,10 @@ fn execute_demo(command: DemoCommand) -> Result<(), CliError> {
                 external_url: Some(format!("http://127.0.0.1:{port}")),
                 tls_cert_path: None,
                 tls_key_path: None,
+                agent_client_ca_cert_path: None,
                 data_dir: server_data_dir,
-                database_path: None,
+                database: None,
+                secret_provider: None,
             },
             move || thread_shutdown.load(Ordering::SeqCst),
         )
@@ -2005,20 +3530,6 @@ fn wait_for_controller_health(port: u16) -> Result<(), CliError> {
 
 fn http_get(port: u16, path: &str, bearer_token: Option<&str>) -> Result<String, CliError> {
     let response = http_request(port, "GET", path, bearer_token, None)?;
-    if !response.starts_with("HTTP/1.1 200") {
-        return Err(CliError::Http(
-            response.lines().next().unwrap_or("").to_owned(),
-        ));
-    }
-    Ok(response
-        .split("\r\n\r\n")
-        .nth(1)
-        .unwrap_or_default()
-        .to_owned())
-}
-
-fn http_get_url(url: &str, path: &str, bearer_token: Option<&str>) -> Result<String, CliError> {
-    let response = http_request_url(url, "GET", path, bearer_token, None)?;
     if !response.starts_with("HTTP/1.1 200") {
         return Err(CliError::Http(
             response.lines().next().unwrap_or("").to_owned(),
@@ -2160,18 +3671,12 @@ fn ensure_controller_initialized_for_start(data_dir: &Path) -> Result<(), CliErr
     Ok(())
 }
 
-fn parse_sqlite_database_url(value: &str) -> Result<PathBuf, CliError> {
-    let Some(path) = value.strip_prefix("sqlite://") else {
-        return Err(CliError::Http(
-            "controller --db currently supports sqlite:// paths only".to_owned(),
-        ));
-    };
-    if path.trim().is_empty() {
-        return Err(CliError::Http(
-            "controller --db sqlite path cannot be empty".to_owned(),
-        ));
-    }
-    Ok(PathBuf::from(path))
+fn parse_controller_database_settings(
+    value: Option<&str>,
+    data_dir: &Path,
+) -> Result<DatabaseSettings, CliError> {
+    DatabaseSettings::parse_optional(value, controller_db_path(data_dir))
+        .map_err(|error| CliError::Http(error.to_string()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2269,6 +3774,15 @@ fn start_systemd_service(role: ServiceRole, dry_run: bool) -> Result<(), CliErro
     }
     ensure_systemd_operation_allowed()?;
     run_systemctl(&["start", service_unit_name(role)])
+}
+
+fn restart_systemd_service(role: ServiceRole, dry_run: bool) -> Result<(), CliError> {
+    if dry_run {
+        println!("{}", render_systemctl_command("restart", role));
+        return Ok(());
+    }
+    ensure_systemd_operation_allowed()?;
+    run_systemctl(&["restart", service_unit_name(role)])
 }
 
 fn status_systemd_service(role: ServiceRole, dry_run: bool) -> Result<(), CliError> {
@@ -2484,6 +3998,12 @@ fn write_secure_file(path: &Path, body: &str) -> Result<(), std::io::Error> {
     {
         fs::write(path, body)
     }
+}
+
+fn write_secure_file_atomic(path: &Path, body: &str) -> Result<(), std::io::Error> {
+    let tmp_path = path.with_extension("tmp");
+    write_secure_file(&tmp_path, body)?;
+    fs::rename(tmp_path, path)
 }
 
 fn validate_secure_file_permissions(path: &Path) -> Result<(), CliError> {
@@ -2860,6 +4380,14 @@ struct LocalAgentConfig {
     fingerprint: String,
     private_key: String,
     controller_fingerprint: String,
+    replay_store_path: PathBuf,
+    controller_trust_bundle_path: PathBuf,
+    controller_trust_bundle: Option<fleet_domain::ControllerSigningTrustBundle>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct AgentControllerTrustBundleSidecar {
+    entries: Vec<fleet_protocol::ControllerSigningTrustEntryWire>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2898,6 +4426,9 @@ fn read_agent_config(path: &Path) -> Result<LocalAgentConfig, CliError> {
         .join("agent_private.key");
     validate_secure_file_permissions(&private_key_path)?;
     let private_key = fs::read_to_string(private_key_path)?.trim().to_owned();
+    let controller_trust_bundle_path = agent_controller_trust_bundle_path(path);
+    let controller_trust_bundle =
+        read_agent_controller_trust_bundle_sidecar(&controller_trust_bundle_path)?;
     Ok(LocalAgentConfig {
         url: value("url")?,
         tls_ca_cert: optional_value("tls_ca_cert"),
@@ -2905,7 +4436,129 @@ fn read_agent_config(path: &Path) -> Result<LocalAgentConfig, CliError> {
         fingerprint: value("fingerprint")?,
         private_key,
         controller_fingerprint: value("controller_fingerprint")?,
+        replay_store_path: agent_replay_store_path(path),
+        controller_trust_bundle_path,
+        controller_trust_bundle,
     })
+}
+
+fn agent_replay_store_path(config_path: &Path) -> PathBuf {
+    config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("task_nonces.log")
+}
+
+fn agent_controller_trust_bundle_path(config_path: &Path) -> PathBuf {
+    config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("controller_trust_bundle.json")
+}
+
+fn agent_nonce_replay_guard(
+    config: &LocalAgentConfig,
+) -> Result<fleet_runner::NonceReplayGuard, CliError> {
+    fleet_runner::NonceReplayGuard::file_backed(&config.replay_store_path)
+        .map_err(|error| CliError::Http(error.to_string()))
+}
+
+fn legacy_controller_signing_trust_bundle(
+    config: &LocalAgentConfig,
+    controller_public_key: &str,
+) -> Result<fleet_domain::ControllerSigningTrustBundle, CliError> {
+    let fingerprint =
+        fleet_domain::SigningKeyFingerprint::new(config.controller_fingerprint.clone())
+            .map_err(|error| CliError::Http(error.to_string()))?;
+    let public_key =
+        fleet_domain::ControllerSigningPublicKey::new(controller_public_key.to_owned())
+            .map_err(|error| CliError::Http(error.to_string()))?;
+    fleet_domain::ControllerSigningTrustBundle::from_legacy_pinned(fingerprint, public_key)
+        .map_err(|error| CliError::Http(error.to_string()))
+}
+
+fn controller_signing_trust_bundle_from_wire(
+    entries: &[fleet_protocol::ControllerSigningTrustEntryWire],
+) -> Result<fleet_domain::ControllerSigningTrustBundle, CliError> {
+    let mut domain_entries = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let role = match entry.role {
+            fleet_protocol::ControllerSigningTrustRoleWire::Current => {
+                fleet_domain::ControllerSigningTrustRole::Current
+            }
+            fleet_protocol::ControllerSigningTrustRoleWire::Previous => {
+                fleet_domain::ControllerSigningTrustRole::Previous
+            }
+        };
+        domain_entries.push(
+            fleet_domain::ControllerSigningTrustEntry::new(
+                role,
+                fleet_domain::SigningKeyFingerprint::new(entry.fingerprint.clone())
+                    .map_err(|error| CliError::Http(error.to_string()))?,
+                fleet_domain::ControllerSigningPublicKey::new(entry.public_key.clone())
+                    .map_err(|error| CliError::Http(error.to_string()))?,
+                millis_to_system_time(entry.valid_from_ms),
+                entry.valid_until_ms.map(millis_to_system_time),
+            )
+            .map_err(|error| CliError::Http(error.to_string()))?,
+        );
+    }
+    fleet_domain::ControllerSigningTrustBundle::new(domain_entries)
+        .map_err(|error| CliError::Http(error.to_string()))
+}
+
+fn controller_signing_trust_bundle_to_wire(
+    bundle: &fleet_domain::ControllerSigningTrustBundle,
+) -> Vec<fleet_protocol::ControllerSigningTrustEntryWire> {
+    bundle
+        .entries()
+        .iter()
+        .map(|entry| fleet_protocol::ControllerSigningTrustEntryWire {
+            fingerprint: entry.fingerprint().as_str().to_owned(),
+            public_key: entry.public_key().as_str().to_owned(),
+            role: match entry.role() {
+                fleet_domain::ControllerSigningTrustRole::Current => {
+                    fleet_protocol::ControllerSigningTrustRoleWire::Current
+                }
+                fleet_domain::ControllerSigningTrustRole::Previous => {
+                    fleet_protocol::ControllerSigningTrustRoleWire::Previous
+                }
+            },
+            valid_from_ms: system_time_to_millis(entry.valid_from()),
+            valid_until_ms: entry.valid_until().map(system_time_to_millis),
+        })
+        .collect()
+}
+
+fn read_agent_controller_trust_bundle_sidecar(
+    path: &Path,
+) -> Result<Option<fleet_domain::ControllerSigningTrustBundle>, CliError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    validate_secure_file_permissions(path)?;
+    let body = fs::read_to_string(path)?;
+    let sidecar: AgentControllerTrustBundleSidecar =
+        serde_json::from_str(&body).map_err(|error| {
+            CliError::Http(format!("invalid controller trust bundle sidecar: {error}"))
+        })?;
+    controller_signing_trust_bundle_from_wire(&sidecar.entries).map(Some)
+}
+
+fn write_agent_controller_trust_bundle_sidecar(
+    path: &Path,
+    bundle: &fleet_domain::ControllerSigningTrustBundle,
+) -> Result<(), CliError> {
+    let sidecar = AgentControllerTrustBundleSidecar {
+        entries: controller_signing_trust_bundle_to_wire(bundle),
+    };
+    let body = serde_json::to_string_pretty(&sidecar).map_err(|error| {
+        CliError::Http(format!(
+            "serialize controller trust bundle sidecar: {error}"
+        ))
+    })?;
+    write_secure_file_atomic(path, &format!("{body}\n"))?;
+    Ok(())
 }
 
 fn validate_pinned_controller_identity(
@@ -3160,6 +4813,10 @@ fn run_agent_heartbeat_once(
         ))
         .map_err(|error| CliError::Http(error.to_string()))?;
 
+    send_wire_message_to_socket(
+        &mut socket,
+        &agent_capability_snapshot_message(config, &correlation_id)?,
+    )?;
     send_facts_snapshot(&mut socket, config, &correlation_id)?;
     send_metrics_snapshot(&mut socket, config, &correlation_id)?;
     if upload_agent_log {
@@ -3195,6 +4852,13 @@ struct AgentTaskSessionState {
     busy: Arc<AtomicBool>,
     runtime: Arc<AgentTaskRuntimeState>,
     replay_guard: Arc<Mutex<fleet_runner::NonceReplayGuard>>,
+    controller_trust_bundle: Arc<Mutex<Option<fleet_domain::ControllerSigningTrustBundle>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentControllerSigningTrustBundleUpdateOutcome {
+    current_fingerprint: String,
+    entries_count: usize,
 }
 
 impl AgentTaskRuntimeState {
@@ -3241,6 +4905,91 @@ impl AgentTaskRuntimeState {
     }
 }
 
+fn apply_agent_controller_signing_trust_bundle_update(
+    task_state: &AgentTaskSessionState,
+    entries: &[fleet_protocol::ControllerSigningTrustEntryWire],
+    persistence_path: Option<&Path>,
+) -> Result<AgentControllerSigningTrustBundleUpdateOutcome, CliError> {
+    let bundle = controller_signing_trust_bundle_from_wire(entries)?;
+    let current_fingerprint = bundle
+        .entries()
+        .iter()
+        .find(|entry| entry.role() == fleet_domain::ControllerSigningTrustRole::Current)
+        .map(|entry| entry.fingerprint().as_str().to_owned())
+        .ok_or_else(|| {
+            CliError::Http("controller signing trust bundle is missing current entry".to_owned())
+        })?;
+    let entries_count = bundle.entries().len();
+    if let Some(path) = persistence_path {
+        write_agent_controller_trust_bundle_sidecar(path, &bundle)?;
+    }
+    let mut runtime_bundle = task_state
+        .controller_trust_bundle
+        .lock()
+        .map_err(|_| CliError::Http("agent controller trust bundle lock poisoned".to_owned()))?;
+    *runtime_bundle = Some(bundle);
+    Ok(AgentControllerSigningTrustBundleUpdateOutcome {
+        current_fingerprint,
+        entries_count,
+    })
+}
+
+fn agent_task_session_state(config: &LocalAgentConfig) -> Result<AgentTaskSessionState, CliError> {
+    Ok(AgentTaskSessionState {
+        busy: Arc::new(AtomicBool::new(false)),
+        runtime: Arc::new(AgentTaskRuntimeState::default()),
+        replay_guard: Arc::new(Mutex::new(agent_nonce_replay_guard(config)?)),
+        controller_trust_bundle: Arc::new(Mutex::new(config.controller_trust_bundle.clone())),
+    })
+}
+
+fn agent_controller_signing_trust_bundle(
+    task_state: &AgentTaskSessionState,
+    config: &LocalAgentConfig,
+    controller_public_key: &str,
+) -> Result<fleet_domain::ControllerSigningTrustBundle, CliError> {
+    let runtime_bundle = task_state
+        .controller_trust_bundle
+        .lock()
+        .map_err(|_| CliError::Http("agent controller trust bundle lock poisoned".to_owned()))?
+        .clone();
+    runtime_bundle
+        .map(Ok)
+        .unwrap_or_else(|| legacy_controller_signing_trust_bundle(config, controller_public_key))
+}
+
+fn verify_agent_task_envelope_once_with_session_trust(
+    envelope: &fleet_domain::TaskEnvelope,
+    config: &LocalAgentConfig,
+    controller_public_key: &str,
+    task_state: &AgentTaskSessionState,
+    now: SystemTime,
+) -> Result<
+    Result<fleet_domain::ControllerSigningTrustVerification, fleet_runner::RunnerError>,
+    CliError,
+> {
+    let trust_bundle =
+        agent_controller_signing_trust_bundle(task_state, config, controller_public_key)?;
+    let verifier = ControllerSignatureVerifier;
+    let agent_id = fleet_domain::AgentId::new(config.agent_id.clone())
+        .map_err(|error| CliError::Http(error.to_string()))?;
+    let mut replay_guard = task_state
+        .replay_guard
+        .lock()
+        .map_err(|_| CliError::Http("agent nonce replay guard lock poisoned".to_owned()))?;
+    Ok(
+        fleet_runner::verify_signed_envelope_once_with_controller_trust(
+            envelope,
+            &agent_id,
+            now,
+            &trust_bundle,
+            None,
+            &verifier,
+            &mut replay_guard,
+        ),
+    )
+}
+
 fn run_agent_session_once(
     config: &LocalAgentConfig,
     options: AgentHeartbeatOptions,
@@ -3258,11 +5007,7 @@ fn run_agent_session_once(
 
     let (outbound_sender, outbound_receiver) =
         mpsc::sync_channel(AGENT_SESSION_OUTBOUND_QUEUE_CAPACITY);
-    let task_state = AgentTaskSessionState {
-        busy: Arc::new(AtomicBool::new(false)),
-        runtime: Arc::new(AgentTaskRuntimeState::default()),
-        replay_guard: Arc::new(Mutex::new(fleet_runner::NonceReplayGuard::default())),
-    };
+    let task_state = agent_task_session_state(config)?;
     enqueue_initial_agent_session_messages(&outbound_sender, config, &correlation_id, options)?;
 
     let mut last_heartbeat = Instant::now();
@@ -3405,6 +5150,10 @@ fn enqueue_initial_agent_session_messages(
     )?;
     enqueue_wire_message(
         outbound_sender,
+        agent_capability_snapshot_message(config, correlation_id)?,
+    )?;
+    enqueue_wire_message(
+        outbound_sender,
         agent_facts_snapshot_message(config, correlation_id)?,
     )?;
     enqueue_wire_message(
@@ -3483,6 +5232,76 @@ fn handle_agent_session_message(
             let _ = job_id;
             let _ = reason;
             let _ = task_state.runtime.request_cancel(&task_id)?;
+            return Ok(());
+        }
+        fleet_protocol::WirePayload::ControllerSigningTrustBundleUpdate { entries } => {
+            match apply_agent_controller_signing_trust_bundle_update(
+                task_state,
+                &entries,
+                Some(&config.controller_trust_bundle_path),
+            ) {
+                Ok(outcome) => {
+                    enqueue_wire_message(
+                        outbound_sender,
+                        agent_controller_signing_trust_bundle_ack_message(
+                            config,
+                            correlation_id,
+                            true,
+                            Some(&outcome.current_fingerprint),
+                            outcome.entries_count,
+                            None,
+                        )?,
+                    )?;
+                    send_agent_security_event_queue(
+                        outbound_sender,
+                        config,
+                        correlation_id,
+                        "controller_signing_trust_bundle_update_accepted",
+                        "controller signing trust bundle update accepted",
+                    )?;
+                }
+                Err(error) => {
+                    enqueue_wire_message(
+                        outbound_sender,
+                        agent_controller_signing_trust_bundle_ack_message(
+                            config,
+                            correlation_id,
+                            false,
+                            None,
+                            entries.len(),
+                            Some("invalid_trust_bundle"),
+                        )?,
+                    )?;
+                    send_agent_security_event_queue(
+                        outbound_sender,
+                        config,
+                        correlation_id,
+                        "controller_signing_trust_bundle_update_rejected",
+                        &error.to_string(),
+                    )?;
+                }
+            }
+            return Ok(());
+        }
+        fleet_protocol::WirePayload::AgentCertificateLifecycleUpdate { state, .. } => {
+            enqueue_wire_message(
+                outbound_sender,
+                agent_certificate_lifecycle_ack_message(
+                    config,
+                    correlation_id,
+                    false,
+                    state,
+                    None,
+                    Some(AGENT_CERTIFICATE_LIFECYCLE_RUNTIME_NOT_IMPLEMENTED),
+                )?,
+            )?;
+            send_agent_security_event_queue(
+                outbound_sender,
+                config,
+                correlation_id,
+                "agent_certificate_lifecycle_update_rejected",
+                "agent certificate lifecycle runtime handling is not implemented",
+            )?;
             return Ok(());
         }
         _ => return Ok(()),
@@ -3605,6 +5424,81 @@ fn agent_heartbeat_message(
     ))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AgentCapabilityProbe {
+    privilege_level: fleet_protocol::CapabilityPrivilegeLevelWire,
+    package_manager: Option<fleet_protocol::PackageManagerWire>,
+    service_manager: Option<fleet_protocol::ServiceManagerWire>,
+}
+
+fn agent_capability_snapshot_message(
+    config: &LocalAgentConfig,
+    correlation_id: &str,
+) -> Result<fleet_protocol::WireMessage, CliError> {
+    let probe = collect_agent_capability_probe();
+    Ok(fleet_protocol::WireMessage::new(
+        prefixed_ulid("msg")?,
+        correlation_id.to_owned(),
+        Some(config.agent_id.clone()),
+        epoch_millis() as u64,
+        fleet_protocol::WirePayload::CapabilitySnapshot {
+            agent_id: config.agent_id.clone(),
+            privilege_level: probe.privilege_level,
+            package_manager: probe.package_manager,
+            service_manager: probe.service_manager,
+            capabilities: agent_capability_names(&probe),
+            reported_at_ms: epoch_millis() as u64,
+        },
+    ))
+}
+
+fn collect_agent_capability_probe() -> AgentCapabilityProbe {
+    AgentCapabilityProbe {
+        privilege_level: fleet_protocol::CapabilityPrivilegeLevelWire::Unprivileged,
+        package_manager: fleet_runner::detect_local_linux_package_manager()
+            .map(package_manager_to_wire),
+        service_manager: detect_local_service_manager(),
+    }
+}
+
+fn agent_capability_names(probe: &AgentCapabilityProbe) -> Vec<String> {
+    let mut capabilities = vec![
+        "persistent_session".to_owned(),
+        "command_execution".to_owned(),
+        "drift_check".to_owned(),
+        "runbook_execution".to_owned(),
+    ];
+    if probe.package_manager.is_some() {
+        capabilities.push("package_install".to_owned());
+    }
+    if probe.service_manager.is_some() {
+        capabilities.push("service_control".to_owned());
+    }
+    capabilities
+}
+
+fn package_manager_to_wire(
+    manager: fleet_runner::LinuxPackageManager,
+) -> fleet_protocol::PackageManagerWire {
+    match manager {
+        fleet_runner::LinuxPackageManager::Apt => fleet_protocol::PackageManagerWire::Apt,
+        fleet_runner::LinuxPackageManager::Dnf => fleet_protocol::PackageManagerWire::Dnf,
+        fleet_runner::LinuxPackageManager::Yum => fleet_protocol::PackageManagerWire::Yum,
+        fleet_runner::LinuxPackageManager::Apk => fleet_protocol::PackageManagerWire::Apk,
+    }
+}
+
+fn detect_local_service_manager() -> Option<fleet_protocol::ServiceManagerWire> {
+    if Path::new("/run/systemd/system").exists()
+        || Path::new("/usr/bin/systemctl").exists()
+        || Path::new("/bin/systemctl").exists()
+    {
+        Some(fleet_protocol::ServiceManagerWire::Systemd)
+    } else {
+        None
+    }
+}
+
 fn agent_facts_snapshot_message(
     config: &LocalAgentConfig,
     correlation_id: &str,
@@ -3650,6 +5544,52 @@ fn agent_log_chunk_message(
         fleet_protocol::WirePayload::LogChunk {
             agent_id: config.agent_id.clone(),
             line: redact_and_truncate_log_line(line),
+        },
+    ))
+}
+
+fn agent_controller_signing_trust_bundle_ack_message(
+    config: &LocalAgentConfig,
+    correlation_id: &str,
+    accepted: bool,
+    current_fingerprint: Option<&str>,
+    entries_count: usize,
+    reason_code: Option<&str>,
+) -> Result<fleet_protocol::WireMessage, CliError> {
+    Ok(fleet_protocol::WireMessage::new(
+        prefixed_ulid("msg")?,
+        correlation_id.to_owned(),
+        Some(config.agent_id.clone()),
+        epoch_millis() as u64,
+        fleet_protocol::WirePayload::ControllerSigningTrustBundleAck {
+            agent_id: config.agent_id.clone(),
+            accepted,
+            current_fingerprint: current_fingerprint.map(str::to_owned),
+            entries_count,
+            reason_code: reason_code.map(str::to_owned),
+        },
+    ))
+}
+
+fn agent_certificate_lifecycle_ack_message(
+    config: &LocalAgentConfig,
+    correlation_id: &str,
+    accepted: bool,
+    state: fleet_protocol::AgentCertificateLifecycleStateWire,
+    current_fingerprint: Option<&str>,
+    reason_code: Option<&str>,
+) -> Result<fleet_protocol::WireMessage, CliError> {
+    Ok(fleet_protocol::WireMessage::new(
+        prefixed_ulid("msg")?,
+        correlation_id.to_owned(),
+        Some(config.agent_id.clone()),
+        epoch_millis() as u64,
+        fleet_protocol::WirePayload::AgentCertificateLifecycleAck {
+            agent_id: config.agent_id.clone(),
+            accepted,
+            state,
+            current_fingerprint: current_fingerprint.map(str::to_owned),
+            reason_code: reason_code.map(str::to_owned),
         },
     ))
 }
@@ -4297,16 +6237,30 @@ fn read_and_handle_task_assignment(
         return Ok(());
     };
     let envelope = task_envelope_from_wire(envelope)?;
-    let verifier = ControllerSignatureVerifier {
-        controller_public_key,
-    };
+    let trust_bundle = legacy_controller_signing_trust_bundle(config, controller_public_key)?;
+    let verifier = ControllerSignatureVerifier;
     let agent_id = fleet_domain::AgentId::new(config.agent_id.clone())
         .map_err(|error| CliError::Http(error.to_string()))?;
-    let mut replay_guard = fleet_runner::NonceReplayGuard::default();
-    if let Err(error) = fleet_runner::verify_signed_envelope_once(
+    let mut replay_guard = match agent_nonce_replay_guard(config) {
+        Ok(replay_guard) => replay_guard,
+        Err(error) => {
+            send_agent_task_rejected(
+                socket,
+                config,
+                correlation_id,
+                &envelope,
+                fleet_protocol::TaskRejectionReasonCode::InternalError,
+                &error.to_string(),
+            )?;
+            return Ok(());
+        }
+    };
+    if let Err(error) = fleet_runner::verify_signed_envelope_once_with_controller_trust(
         &envelope,
         &agent_id,
         SystemTime::now(),
+        &trust_bundle,
+        None,
         &verifier,
         &mut replay_guard,
     ) {
@@ -4346,24 +6300,13 @@ fn handle_task_assignment_with_queue(
     task_state: &AgentTaskSessionState,
 ) -> Result<(), CliError> {
     let envelope = task_envelope_from_wire(envelope)?;
-    let verifier = ControllerSignatureVerifier {
+    let verification = verify_agent_task_envelope_once_with_session_trust(
+        &envelope,
+        config,
         controller_public_key,
-    };
-    let agent_id = fleet_domain::AgentId::new(config.agent_id.clone())
-        .map_err(|error| CliError::Http(error.to_string()))?;
-    let verification = {
-        let mut replay_guard = task_state
-            .replay_guard
-            .lock()
-            .map_err(|_| CliError::Http("agent nonce replay guard lock poisoned".to_owned()))?;
-        fleet_runner::verify_signed_envelope_once(
-            &envelope,
-            &agent_id,
-            SystemTime::now(),
-            &verifier,
-            &mut replay_guard,
-        )
-    };
+        task_state,
+        SystemTime::now(),
+    )?;
     if let Err(error) = verification {
         send_agent_task_rejected_queue(
             outbound_sender,
@@ -4649,7 +6592,12 @@ fn run_signed_runbook_task_queue(
             return Ok(());
         }
     };
-    let plan = match fleet_runner::build_runbook_execution_plan(&runbook, package_manager) {
+    let provider = DisabledSecretProvider;
+    let plan = match build_agent_runbook_execution_plan_with_provider(
+        &runbook,
+        package_manager,
+        &provider,
+    ) {
         Ok(plan) => plan,
         Err(error) => {
             send_agent_output_chunk_queue(
@@ -4717,7 +6665,19 @@ fn run_signed_runbook_task_queue(
         }
     };
     let mut sequence = 0;
+    let mut artifacts = Vec::new();
     for outcome in report.outcomes {
+        if let Some(artifact) = &outcome.artifact {
+            artifacts.push(fleet_protocol::TaskResultArtifactWire {
+                artifact_id: prefixed_ulid("artifact")?,
+                step_id: artifact.step_id.clone(),
+                destination: artifact.destination.clone(),
+                checksum_sha256: artifact.checksum_sha256.clone(),
+                size_bytes: artifact.size_bytes,
+                retention_class: artifact.retention_class.clone(),
+                content_bytes: artifact.content_bytes.clone(),
+            });
+        }
         send_agent_output_chunk_queue(
             outbound_sender,
             config,
@@ -4762,14 +6722,17 @@ fn run_signed_runbook_task_queue(
             sequence += 1;
         }
     }
-    send_agent_task_result_queue(
+    send_agent_task_result_queue_report(
         outbound_sender,
         config,
         correlation_id,
         envelope,
-        0,
-        fleet_protocol::TaskResultStatus::Succeeded,
-        "",
+        AgentTaskResultReport::with_artifacts(
+            0,
+            fleet_protocol::TaskResultStatus::Succeeded,
+            "",
+            artifacts,
+        ),
     )?;
     Ok(())
 }
@@ -4935,6 +6898,44 @@ fn collect_runbook_snapshot(
     })
 }
 
+fn build_agent_runbook_execution_plan_with_provider<P>(
+    runbook: &fleet_domain::Runbook,
+    package_manager: fleet_runner::LinuxPackageManager,
+    provider: &P,
+) -> Result<fleet_runner::RunbookExecutionPlan, fleet_runner::PrimitiveError>
+where
+    P: SecretProvider,
+{
+    fleet_runner::build_runbook_execution_plan_with_secret_resolver(
+        runbook,
+        package_manager,
+        |reference| resolve_secret_for_runner(provider, reference),
+    )
+}
+
+fn resolve_secret_for_runner<P>(
+    provider: &P,
+    reference: &fleet_domain::SecretRef,
+) -> Result<String, fleet_domain::TemplateSecretResolutionFailure>
+where
+    P: SecretProvider,
+{
+    provider
+        .resolve_secret(reference)
+        .map(|secret: ResolvedSecret| secret.expose_secret_for_rendering().to_owned())
+        .map_err(|error| match error {
+            SecretProviderError::NotFound { .. } => {
+                fleet_domain::TemplateSecretResolutionFailure::NotFound
+            }
+            SecretProviderError::Denied { .. } => {
+                fleet_domain::TemplateSecretResolutionFailure::Denied
+            }
+            SecretProviderError::Provider { .. } => {
+                fleet_domain::TemplateSecretResolutionFailure::Provider
+            }
+        })
+}
+
 fn run_signed_runbook_task(
     socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
     config: &LocalAgentConfig,
@@ -4994,7 +6995,12 @@ fn run_signed_runbook_task(
             return Ok(());
         }
     };
-    let plan = match fleet_runner::build_runbook_execution_plan(&runbook, package_manager) {
+    let provider = DisabledSecretProvider;
+    let plan = match build_agent_runbook_execution_plan_with_provider(
+        &runbook,
+        package_manager,
+        &provider,
+    ) {
         Ok(plan) => plan,
         Err(error) => {
             send_agent_output_chunk(
@@ -5062,7 +7068,19 @@ fn run_signed_runbook_task(
         }
     };
     let mut sequence = 0;
+    let mut artifacts = Vec::new();
     for outcome in report.outcomes {
+        if let Some(artifact) = &outcome.artifact {
+            artifacts.push(fleet_protocol::TaskResultArtifactWire {
+                artifact_id: prefixed_ulid("artifact")?,
+                step_id: artifact.step_id.clone(),
+                destination: artifact.destination.clone(),
+                checksum_sha256: artifact.checksum_sha256.clone(),
+                size_bytes: artifact.size_bytes,
+                retention_class: artifact.retention_class.clone(),
+                content_bytes: artifact.content_bytes.clone(),
+            });
+        }
         let summary = format!(
             "runbook_step={} changed={:?} exit_code={:?} {}",
             outcome.id, outcome.changed, outcome.exit_code, outcome.audit_metadata
@@ -5108,14 +7126,17 @@ fn run_signed_runbook_task(
             sequence += 1;
         }
     }
-    send_agent_task_result(
+    send_agent_task_result_report(
         socket,
         config,
         correlation_id,
         envelope,
-        0,
-        fleet_protocol::TaskResultStatus::Succeeded,
-        "",
+        AgentTaskResultReport::with_artifacts(
+            0,
+            fleet_protocol::TaskResultStatus::Succeeded,
+            "",
+            artifacts,
+        ),
     )?;
     Ok(())
 }
@@ -5271,6 +7292,8 @@ fn task_rejection_reason_from_runner_error(
 ) -> fleet_protocol::TaskRejectionReasonCode {
     match error {
         fleet_runner::RunnerError::InvalidSignature
+        | fleet_runner::RunnerError::UnknownControllerSigningKey
+        | fleet_runner::RunnerError::ExpiredControllerSigningTrust
         | fleet_runner::RunnerError::Job(fleet_domain::JobError::UnsignedTask) => {
             fleet_protocol::TaskRejectionReasonCode::InvalidSignature
         }
@@ -5289,11 +7312,39 @@ fn task_rejection_reason_from_runner_error(
         }
         fleet_runner::RunnerError::Job(_) => fleet_protocol::TaskRejectionReasonCode::InvalidTask,
         fleet_runner::RunnerError::Io(_)
+        | fleet_runner::RunnerError::ReplayStoreUnavailable(_)
         | fleet_runner::RunnerError::Timeout
         | fleet_runner::RunnerError::Canceled
         | fleet_runner::RunnerError::OutputLimitExceeded
         | fleet_runner::RunnerError::Stream(_) => {
             fleet_protocol::TaskRejectionReasonCode::InternalError
+        }
+    }
+}
+
+struct AgentTaskResultReport {
+    exit_code: i32,
+    status: fleet_protocol::TaskResultStatus,
+    reason: String,
+    artifacts: Vec<fleet_protocol::TaskResultArtifactWire>,
+}
+
+impl AgentTaskResultReport {
+    fn new(exit_code: i32, status: fleet_protocol::TaskResultStatus, reason: &str) -> Self {
+        Self::with_artifacts(exit_code, status, reason, Vec::new())
+    }
+
+    fn with_artifacts(
+        exit_code: i32,
+        status: fleet_protocol::TaskResultStatus,
+        reason: &str,
+        artifacts: Vec<fleet_protocol::TaskResultArtifactWire>,
+    ) -> Self {
+        Self {
+            exit_code,
+            status,
+            reason: reason.to_owned(),
+            artifacts,
         }
     }
 }
@@ -5307,6 +7358,22 @@ fn send_agent_task_result(
     status: fleet_protocol::TaskResultStatus,
     reason: &str,
 ) -> Result<(), CliError> {
+    send_agent_task_result_report(
+        socket,
+        config,
+        correlation_id,
+        envelope,
+        AgentTaskResultReport::new(exit_code, status, reason),
+    )
+}
+
+fn send_agent_task_result_report(
+    socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
+    config: &LocalAgentConfig,
+    correlation_id: &str,
+    envelope: &fleet_domain::TaskEnvelope,
+    report: AgentTaskResultReport,
+) -> Result<(), CliError> {
     let result = fleet_protocol::WireMessage::new(
         prefixed_ulid("msg")?,
         correlation_id.to_owned(),
@@ -5315,9 +7382,10 @@ fn send_agent_task_result(
         fleet_protocol::WirePayload::TaskResult {
             job_id: envelope.job_id.as_str().to_owned(),
             task_id: envelope.task_id.as_str().to_owned(),
-            exit_code,
-            status: Some(status),
-            reason: reason.to_owned(),
+            exit_code: report.exit_code,
+            status: Some(report.status),
+            reason: report.reason,
+            artifacts: report.artifacts,
         },
     );
     socket
@@ -5338,6 +7406,22 @@ fn send_agent_task_result_queue(
     status: fleet_protocol::TaskResultStatus,
     reason: &str,
 ) -> Result<(), CliError> {
+    send_agent_task_result_queue_report(
+        outbound_sender,
+        config,
+        correlation_id,
+        envelope,
+        AgentTaskResultReport::new(exit_code, status, reason),
+    )
+}
+
+fn send_agent_task_result_queue_report(
+    outbound_sender: &AgentOutboundSender,
+    config: &LocalAgentConfig,
+    correlation_id: &str,
+    envelope: &fleet_domain::TaskEnvelope,
+    report: AgentTaskResultReport,
+) -> Result<(), CliError> {
     enqueue_wire_message(
         outbound_sender,
         fleet_protocol::WireMessage::new(
@@ -5348,9 +7432,10 @@ fn send_agent_task_result_queue(
             fleet_protocol::WirePayload::TaskResult {
                 job_id: envelope.job_id.as_str().to_owned(),
                 task_id: envelope.task_id.as_str().to_owned(),
-                exit_code,
-                status: Some(status),
-                reason: reason.to_owned(),
+                exit_code: report.exit_code,
+                status: Some(report.status),
+                reason: report.reason,
+                artifacts: report.artifacts,
             },
         ),
     )
@@ -5409,7 +7494,6 @@ fn send_agent_output_chunk_queue(
     )
 }
 
-#[cfg(test)]
 fn send_agent_security_event_queue(
     outbound_sender: &AgentOutboundSender,
     config: &LocalAgentConfig,
@@ -5423,14 +7507,11 @@ fn send_agent_security_event_queue(
     )
 }
 
-struct ControllerSignatureVerifier<'a> {
-    controller_public_key: &'a str,
-}
+struct ControllerSignatureVerifier;
 
-impl fleet_runner::TaskSignatureVerifier for ControllerSignatureVerifier<'_> {
-    fn verify(&self, payload_hash: &str, signature: &str) -> bool {
-        fleet_core::verify_challenge_signature(self.controller_public_key, payload_hash, signature)
-            .unwrap_or(false)
+impl fleet_runner::ControllerSigningMaterialVerifier for ControllerSignatureVerifier {
+    fn verify(&self, public_key: &str, payload_hash: &str, signature: &str) -> bool {
+        fleet_core::verify_challenge_signature(public_key, payload_hash, signature).unwrap_or(false)
     }
 }
 
@@ -5490,6 +7571,15 @@ fn epoch_millis() -> u128 {
 
 fn millis_to_system_time(value: u64) -> SystemTime {
     UNIX_EPOCH + Duration::from_millis(value)
+}
+
+fn system_time_to_millis(value: SystemTime) -> u64 {
+    value
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
@@ -5575,10 +7665,172 @@ mod tests {
         };
 
         assert_eq!(db.as_deref(), Some("sqlite:///tmp/sponzey-fleet.db"));
+        let settings =
+            parse_controller_database_settings(db.as_deref(), Path::new("/ignored/data-dir"))
+                .unwrap();
+        assert_eq!(settings.backend_name(), "sqlite");
         assert_eq!(
-            parse_sqlite_database_url(db.as_deref().unwrap()).unwrap(),
-            PathBuf::from("/tmp/sponzey-fleet.db")
+            settings.sqlite_path(),
+            Some(Path::new("/tmp/sponzey-fleet.db"))
         );
+    }
+
+    #[test]
+    fn agent_runbook_secret_handoff_disabled_provider_rejects_without_ref_leak() {
+        let runbook = fleet_domain::parse_runbook_document(
+            r#"
+apiVersion: fleet.sponzey.dev/v1alpha1
+kind: Runbook
+name: secret-template
+selector: role=web
+steps:
+  - id: write-token
+    file.template:
+      dest: /tmp/sponzey-secret.conf
+      content: "token={{ api_token }}"
+      secretRefs: api_token=secret://app/disabled-token
+"#,
+        )
+        .unwrap();
+
+        let error = build_agent_runbook_execution_plan_with_provider(
+            &runbook,
+            fleet_runner::LinuxPackageManager::Apt,
+            &DisabledSecretProvider,
+        )
+        .expect_err("disabled provider should reject secret-backed template planning");
+
+        let message = error.to_string();
+        assert!(message.contains("template render error"));
+        assert!(!message.contains("disabled-token"));
+        assert!(!message.contains("secret://app"));
+    }
+
+    #[test]
+    fn agent_runbook_secret_handoff_static_provider_renders_without_artifact_body() {
+        let destination = unique_test_dir("agent-secret-handoff").join("secret.conf");
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        let runbook = fleet_domain::parse_runbook_document(&format!(
+            r#"
+apiVersion: fleet.sponzey.dev/v1alpha1
+kind: Runbook
+name: secret-template
+selector: role=web
+steps:
+  - id: write-token
+    file.template:
+      dest: {}
+      content: "token={{{{ api_token }}}}"
+      secretRefs: api_token=secret://app/api-token
+"#,
+            destination.display()
+        ))
+        .unwrap();
+        let reference = fleet_domain::SecretRef::parse("secret://app/api-token").unwrap();
+        let raw_secret = "agent-static-provider-secret";
+        let provider =
+            fleet_application::StaticSecretProvider::new().with_secret(reference, raw_secret);
+
+        let plan = build_agent_runbook_execution_plan_with_provider(
+            &runbook,
+            fleet_runner::LinuxPackageManager::Apt,
+            &provider,
+        )
+        .expect("static provider should plan secret-backed template");
+        let report = fleet_runner::execute_runbook_execution_plan_with_hooks(
+            &plan,
+            fleet_runner::RunbookExecutionOptions {
+                confirmed_high_risk: true,
+                ..fleet_runner::RunbookExecutionOptions::default()
+            },
+            runbook_command_runner,
+            fleet_runner::copy_file_atomic,
+            fleet_runner::check_tcp_port,
+            fleet_runner::check_local_process,
+            collect_runbook_snapshot,
+        )
+        .expect("secret-backed template should execute");
+
+        let artifact = report.outcomes[0]
+            .artifact
+            .as_ref()
+            .expect("template should report artifact metadata");
+        assert_eq!(
+            std::fs::read_to_string(&destination).unwrap(),
+            format!("token={raw_secret}")
+        );
+        assert_eq!(artifact.content_bytes, None);
+        assert!(!format!("{report:?}").contains(raw_secret));
+    }
+
+    #[test]
+    fn apply_validation_does_not_resolve_secret_backed_templates() {
+        let dir = unique_test_dir("apply-secret-validation");
+        std::fs::create_dir_all(&dir).unwrap();
+        let runbook_path = dir.join("secret-runbook.yml");
+        std::fs::write(
+            &runbook_path,
+            r#"
+apiVersion: fleet.sponzey.dev/v1alpha1
+kind: Runbook
+name: secret-template
+selector: role=web
+steps:
+  - id: write-token
+    file.template:
+      dest: /tmp/sponzey-secret.conf
+      content: "token={{ api_token }}"
+      secretRefs: api_token=secret://app/apply-token
+"#,
+        )
+        .unwrap();
+
+        let error = execute_apply(ApplyCommand { file: runbook_path })
+            .expect_err("apply validation must not resolve secret-backed templates");
+
+        let message = error.to_string();
+        assert!(message.contains("invalid runbook primitive"));
+        assert!(!message.contains("apply-token"));
+        assert!(!message.contains("secret://app"));
+    }
+
+    #[test]
+    fn parses_controller_start_postgres_db_url_as_typed_backend() {
+        let cli = Cli::try_parse_from([
+            "sponzey",
+            "controller",
+            "start",
+            "--db",
+            "postgresql://fleet:secret@db.example.com/fleet",
+        ])
+        .expect("valid command");
+
+        let Command::Controller(ControllerCommand {
+            command: ControllerSubcommand::Start { db, .. },
+        }) = cli.command
+        else {
+            panic!("expected controller start command");
+        };
+
+        let settings =
+            parse_controller_database_settings(db.as_deref(), Path::new("/ignored/data-dir"))
+                .unwrap();
+        assert_eq!(settings.backend_name(), "postgres");
+        assert_eq!(settings.sqlite_path(), None);
+    }
+
+    #[test]
+    fn rejects_unsupported_controller_db_url_scheme_without_leaking_secret() {
+        let error = parse_controller_database_settings(
+            Some("mysql://fleet:secret@db.example.com/fleet"),
+            Path::new("/ignored/data-dir"),
+        )
+        .expect_err("unsupported database scheme should fail");
+
+        let message = error.to_string();
+        assert!(message.contains("mysql"));
+        assert!(!message.contains("secret"));
+        assert!(!message.contains("db.example.com"));
     }
 
     #[test]
@@ -5695,6 +7947,36 @@ mod tests {
     }
 
     #[test]
+    fn parses_controller_start_agent_client_ca_cert() {
+        let cli = Cli::try_parse_from([
+            "sponzey",
+            "controller",
+            "start",
+            "--external-url",
+            "https://fleet.example.com",
+            "--agent-client-ca-cert",
+            "/etc/sponzey/agent-client-ca.pem",
+        ])
+        .expect("valid command");
+
+        let Command::Controller(ControllerCommand {
+            command:
+                ControllerSubcommand::Start {
+                    agent_client_ca_cert,
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("expected controller start command");
+        };
+
+        assert_eq!(
+            agent_client_ca_cert.as_deref(),
+            Some(Path::new("/etc/sponzey/agent-client-ca.pem"))
+        );
+    }
+
+    #[test]
     fn controller_start_preflight_explains_missing_init() {
         let data_dir = unique_demo_dir();
         let error = ensure_controller_initialized_for_start(&data_dir)
@@ -5798,9 +8080,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_sqlite_controller_db_url() {
+    fn rejects_unsupported_controller_db_url_scheme() {
         assert!(matches!(
-            parse_sqlite_database_url("postgres://localhost/fleet"),
+            parse_controller_database_settings(
+                Some("mysql://localhost/fleet"),
+                Path::new("/ignored/data-dir")
+            ),
             Err(CliError::Http(_))
         ));
     }
@@ -5885,6 +8170,18 @@ mod tests {
         assert_eq!(
             render_systemctl_command("start", ServiceRole::Agent),
             "systemctl start sponzey-fleet-agent.service"
+        );
+    }
+
+    #[test]
+    fn controller_restart_service_dry_run_renders_systemctl_command() {
+        let cli =
+            Cli::try_parse_from(["sponzey", "controller", "restart-service", "--dry-run"]).unwrap();
+
+        assert!(execute(cli).is_ok());
+        assert_eq!(
+            render_systemctl_command("restart", ServiceRole::Controller),
+            "systemctl restart sponzey-fleet-controller.service"
         );
     }
 
@@ -5976,6 +8273,30 @@ mod tests {
 
         let cli = Cli::try_parse_from(["sponzey", "upgrade"]).expect("valid upgrade command");
         assert!(matches!(execute(cli), Err(CliError::UpgradeRequiresDryRun)));
+
+        let lines = upgrade_dry_run_lines(&UpgradeCommand {
+            channel: UpgradeChannelArg::Beta,
+            version: Some("0.2.0-beta.1".to_owned()),
+            dry_run: true,
+        });
+        assert!(
+            lines.contains(
+                &"artifact_integrity_command=./scripts/verify_standalone_artifacts.sh dist/release"
+                    .to_owned()
+            )
+        );
+        assert!(lines.contains(&"artifact_signature_command=./scripts/verify_release_signature.sh dist/release <release-public-key.pem>".to_owned()));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("recommended_backup_command="))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("recovery_policy="))
+        );
+        assert!(lines.iter().any(|line| line.starts_with("service_policy=")));
     }
 
     #[test]
@@ -6037,12 +8358,1176 @@ mod tests {
     }
 
     #[test]
+    fn parses_login_and_remote_operator_commands() {
+        let login = Cli::try_parse_from([
+            "sponzey",
+            "login",
+            "--controller-url",
+            "https://fleet.example.com",
+            "--admin-token",
+            "admin-secret",
+        ])
+        .expect("valid login command");
+        let Command::Login(command) = login.command else {
+            panic!("expected login command");
+        };
+        assert_eq!(command.controller_url, "https://fleet.example.com");
+        assert_eq!(command.admin_token, "admin-secret");
+        assert_eq!(
+            command.profile_path,
+            PathBuf::from(DEFAULT_CLI_PROFILE_PATH)
+        );
+
+        let preview =
+            Cli::try_parse_from(["sponzey", "selectors", "preview", "--selector", "role=web"])
+                .expect("valid selector preview command");
+        let Command::Selectors(command) = preview.command else {
+            panic!("expected selectors command");
+        };
+        let SelectorsSubcommand::Preview { selector, api } = command.command;
+        assert_eq!(selector, "role=web");
+        assert_eq!(api.profile_path, PathBuf::from(DEFAULT_CLI_PROFILE_PATH));
+
+        let jobs = Cli::try_parse_from(["sponzey", "jobs", "output", "job-1"])
+            .expect("valid jobs command");
+        assert!(matches!(
+            jobs.command,
+            Command::Jobs(JobsCommand {
+                command: JobsSubcommand::Output { .. }
+            })
+        ));
+
+        let remediations = Cli::try_parse_from([
+            "sponzey",
+            "remediations",
+            "list",
+            "--agent-id",
+            "agent-1",
+            "--policy-id",
+            "nginx-running",
+            "--limit",
+            "10",
+        ])
+        .expect("valid remediations list command");
+        assert!(matches!(
+            remediations.command,
+            Command::Remediations(RemediationsCommand {
+                command: RemediationsSubcommand::List { .. }
+            })
+        ));
+
+        let remediation_approve = Cli::try_parse_from([
+            "sponzey",
+            "remediations",
+            "approve",
+            "rem-1",
+            "--approval-id",
+            "approval-1",
+            "--job-id",
+            "job-1",
+            "--runbook",
+            "runbooks/remediate.yml",
+        ])
+        .expect("valid remediations approve command");
+        assert!(matches!(
+            remediation_approve.command,
+            Command::Remediations(RemediationsCommand {
+                command: RemediationsSubcommand::Approve { .. }
+            })
+        ));
+
+        let audit = Cli::try_parse_from([
+            "sponzey",
+            "audit",
+            "export",
+            "--category",
+            "security",
+            "--limit",
+            "10",
+            "--before",
+            "3:1",
+        ])
+        .expect("valid audit export command");
+        let Command::Audit(command) = audit.command else {
+            panic!("expected audit command");
+        };
+        let AuditSubcommand::Export {
+            category,
+            limit,
+            before,
+            ..
+        } = command.command;
+        assert_eq!(category.as_deref(), Some("security"));
+        assert_eq!(limit, 10);
+        assert_eq!(before.as_deref(), Some("3:1"));
+    }
+
+    #[test]
+    fn parses_agent_certificate_issuance_request_command() {
+        let cli = Cli::try_parse_from([
+            "sponzey",
+            "agents",
+            "request-certificate-issuance",
+            "agent-1",
+            "--controller-url",
+            "https://fleet.example.com",
+            "--admin-token",
+            "admin-secret",
+            "--json",
+        ])
+        .expect("valid agent certificate issuance request command");
+
+        let Command::Agents(command) = cli.command else {
+            panic!("expected agents command");
+        };
+        let AgentsSubcommand::RequestCertificateIssuance {
+            agent_id,
+            api,
+            json,
+        } = command.command
+        else {
+            panic!("expected request certificate issuance command");
+        };
+
+        assert_eq!(agent_id, "agent-1");
+        assert_eq!(
+            api.controller_url.as_deref(),
+            Some("https://fleet.example.com")
+        );
+        assert_eq!(api.admin_token.as_deref(), Some("admin-secret"));
+        assert!(json);
+    }
+
+    #[test]
+    fn renders_agent_certificate_issuance_request_without_material() {
+        let body = serde_json::json!({
+            "agent_id": "agent-1",
+            "action": "request_issuance",
+            "lifecycle_state": "issuance_requested",
+            "dispatch_status": "sent",
+            "current_fingerprint_prefix": null,
+            "next_fingerprint_prefix": null,
+            "audit_event_action": "agent_certificate_issuance_requested",
+            "updated_at_ms": 1000
+        })
+        .to_string();
+
+        let rendered = render_agent_certificate_issuance_request_for_cli(&body)
+            .expect("issuance response should render")
+            .join("\n");
+
+        assert!(rendered.contains("agent_id=agent-1"));
+        assert!(rendered.contains("action=request_issuance"));
+        assert!(rendered.contains("state=issuance_requested"));
+        assert!(rendered.contains("dispatch_status=sent"));
+        assert!(rendered.contains("current_fingerprint_prefix=none"));
+        assert!(!rendered.contains("certificate_body"));
+        assert!(!rendered.contains("private_key"));
+        assert!(!rendered.contains("ca_path"));
+        assert!(!rendered.contains("admin-secret"));
+        assert!(!rendered.contains("runtime_env"));
+    }
+
+    #[test]
+    fn parses_agent_certificate_lifecycle_status_command() {
+        let cli = Cli::try_parse_from([
+            "sponzey",
+            "agents",
+            "certificate-status",
+            "agent-1",
+            "--controller-url",
+            "https://fleet.example.com",
+            "--admin-token",
+            "admin-secret",
+            "--json",
+        ])
+        .expect("valid agent certificate lifecycle status command");
+
+        let Command::Agents(command) = cli.command else {
+            panic!("expected agents command");
+        };
+        let AgentsSubcommand::CertificateStatus {
+            agent_id,
+            api,
+            json,
+        } = command.command
+        else {
+            panic!("expected certificate status command");
+        };
+
+        assert_eq!(agent_id, "agent-1");
+        assert_eq!(
+            api.controller_url.as_deref(),
+            Some("https://fleet.example.com")
+        );
+        assert_eq!(api.admin_token.as_deref(), Some("admin-secret"));
+        assert!(json);
+    }
+
+    #[test]
+    fn renders_agent_certificate_lifecycle_status_without_material() {
+        let body = serde_json::json!({
+            "agent_id": "agent-1",
+            "record_present": true,
+            "lifecycle_state": "dual_certificate_active",
+            "current_fingerprint_prefix": "0123456789ab",
+            "next_fingerprint_prefix": "fedcba987654",
+            "grace_until_ms": 2000,
+            "revocation_reason": null,
+            "updated_at_ms": 1000
+        })
+        .to_string();
+
+        let rendered = render_agent_certificate_lifecycle_status_for_cli(&body)
+            .expect("certificate lifecycle status should render")
+            .join("\n");
+
+        assert!(rendered.contains("agent_id=agent-1"));
+        assert!(rendered.contains("state=dual_certificate_active"));
+        assert!(rendered.contains("record_present=true"));
+        assert!(rendered.contains("current_fingerprint_prefix=0123456789ab"));
+        assert!(rendered.contains("next_fingerprint_prefix=fedcba987654"));
+        assert!(rendered.contains("grace_until_ms=2000"));
+        assert!(!rendered.contains("certificate_body"));
+        assert!(!rendered.contains("private_key"));
+        assert!(!rendered.contains("ca_path"));
+        assert!(!rendered.contains("admin-secret"));
+        assert!(!rendered.contains("runtime_env"));
+    }
+
+    #[test]
+    fn parses_controller_signing_rotation_status_command() {
+        let cli = Cli::try_parse_from([
+            "sponzey",
+            "controller",
+            "signing-rotation-status",
+            "--controller-url",
+            "https://fleet.example.com",
+            "--admin-token",
+            "admin-secret",
+            "--json",
+        ])
+        .expect("valid controller signing rotation status command");
+
+        let Command::Controller(command) = cli.command else {
+            panic!("expected controller command");
+        };
+        let ControllerSubcommand::SigningRotationStatus { api, json } = command.command else {
+            panic!("expected signing rotation status command");
+        };
+
+        assert_eq!(
+            api.controller_url.as_deref(),
+            Some("https://fleet.example.com")
+        );
+        assert_eq!(api.admin_token.as_deref(), Some("admin-secret"));
+        assert!(json);
+    }
+
+    #[test]
+    fn parses_controller_signing_rotation_mutation_commands() {
+        let request = Cli::try_parse_from([
+            "sponzey",
+            "controller",
+            "signing-rotation",
+            "request",
+            "--controller-url",
+            "https://fleet.example.com",
+            "--admin-token",
+            "admin-secret",
+            "--new-fingerprint",
+            "new-fingerprint",
+            "--old-key-verifies-for-seconds",
+            "3600",
+            "--json",
+        ])
+        .expect("valid signing rotation request command");
+        let Command::Controller(ControllerCommand {
+            command: ControllerSubcommand::SigningRotation { command },
+        }) = request.command
+        else {
+            panic!("expected signing rotation command");
+        };
+        let ControllerSigningRotationSubcommand::Request {
+            api,
+            new_fingerprint,
+            old_key_verifies_for_seconds,
+            json,
+            ..
+        } = command
+        else {
+            panic!("expected request command");
+        };
+        assert_eq!(
+            api.controller_url.as_deref(),
+            Some("https://fleet.example.com")
+        );
+        assert_eq!(api.admin_token.as_deref(), Some("admin-secret"));
+        assert_eq!(new_fingerprint, "new-fingerprint");
+        assert_eq!(old_key_verifies_for_seconds, Some(3600));
+        assert!(json);
+
+        let validate = Cli::try_parse_from([
+            "sponzey",
+            "controller",
+            "signing-rotation",
+            "validate",
+            "--controller-url",
+            "https://fleet.example.com",
+            "--admin-token",
+            "admin-secret",
+            "--candidate-public-key-path",
+            "/var/lib/sponzey-fleet/controller/candidate_public.key",
+            "--candidate-private-key-path",
+            "/var/lib/sponzey-fleet/controller/candidate_private.key",
+        ])
+        .expect("valid signing rotation validate command");
+        assert!(matches!(
+            validate.command,
+            Command::Controller(ControllerCommand {
+                command: ControllerSubcommand::SigningRotation {
+                    command: ControllerSigningRotationSubcommand::Validate { .. }
+                }
+            })
+        ));
+
+        for action in ["activate", "retire", "fail"] {
+            let parsed = Cli::try_parse_from([
+                "sponzey",
+                "controller",
+                "signing-rotation",
+                action,
+                "--controller-url",
+                "https://fleet.example.com",
+                "--admin-token",
+                "admin-secret",
+                "--reason",
+                "operator requested state change",
+            ])
+            .expect("valid signing rotation mutation command");
+            assert!(matches!(
+                parsed.command,
+                Command::Controller(ControllerCommand {
+                    command: ControllerSubcommand::SigningRotation { .. }
+                })
+            ));
+        }
+
+        let rollout = Cli::try_parse_from([
+            "sponzey",
+            "controller",
+            "signing-rotation",
+            "rollout-trust-bundle",
+            "--controller-url",
+            "https://fleet.example.com",
+            "--admin-token",
+            "admin-secret",
+            "--previous-public-key-path",
+            "/var/lib/sponzey-fleet/controller/controller_public.key.bak",
+            "--agent-id",
+            "agent-1",
+            "--json",
+        ])
+        .expect("valid signing rotation rollout command");
+        assert!(matches!(
+            rollout.command,
+            Command::Controller(ControllerCommand {
+                command: ControllerSubcommand::SigningRotation {
+                    command: ControllerSigningRotationSubcommand::RolloutTrustBundle { .. }
+                }
+            })
+        ));
+
+        let retry = Cli::try_parse_from([
+            "sponzey",
+            "controller",
+            "signing-rotation",
+            "retry-trust-bundle",
+            "--controller-url",
+            "https://fleet.example.com",
+            "--admin-token",
+            "admin-secret",
+            "--previous-public-key-path",
+            "/var/lib/sponzey-fleet/controller/controller_public.key.bak",
+            "--agent-id",
+            "agent-1",
+            "--max-agent-count",
+            "25",
+            "--json",
+        ])
+        .expect("valid signing rotation trust bundle retry command");
+        assert!(matches!(
+            retry.command,
+            Command::Controller(ControllerCommand {
+                command: ControllerSubcommand::SigningRotation {
+                    command: ControllerSigningRotationSubcommand::RetryTrustBundle { .. }
+                }
+            })
+        ));
+
+        let staged = Cli::try_parse_from([
+            "sponzey",
+            "controller",
+            "signing-rotation",
+            "staged-trust-bundle",
+            "--controller-url",
+            "https://fleet.example.com",
+            "--admin-token",
+            "admin-secret",
+            "--previous-public-key-path",
+            "/var/lib/sponzey-fleet/controller/controller_public.key.bak",
+            "--agent-id",
+            "agent-1",
+            "--batch-size",
+            "10",
+            "--max-failures",
+            "1",
+            "--ack-timeout-seconds",
+            "30",
+            "--json",
+        ])
+        .expect("valid signing rotation staged trust bundle command");
+        let Command::Controller(ControllerCommand {
+            command: ControllerSubcommand::SigningRotation { command },
+        }) = staged.command
+        else {
+            panic!("expected signing rotation command");
+        };
+        let ControllerSigningRotationSubcommand::StagedTrustBundle {
+            api,
+            previous_public_key_path,
+            agent_ids,
+            batch_size,
+            max_failures,
+            ack_timeout_seconds,
+            json,
+        } = command
+        else {
+            panic!("expected staged trust bundle command");
+        };
+        assert_eq!(
+            api.controller_url.as_deref(),
+            Some("https://fleet.example.com")
+        );
+        assert_eq!(api.admin_token.as_deref(), Some("admin-secret"));
+        assert_eq!(
+            previous_public_key_path.as_deref(),
+            Some(Path::new(
+                "/var/lib/sponzey-fleet/controller/controller_public.key.bak"
+            ))
+        );
+        assert_eq!(agent_ids, ["agent-1"]);
+        assert_eq!(batch_size, 10);
+        assert_eq!(max_failures, 1);
+        assert_eq!(ack_timeout_seconds, 30);
+        assert!(json);
+
+        let restart_action = Cli::try_parse_from([
+            "sponzey",
+            "controller",
+            "signing-rotation",
+            "restart-action",
+            "--controller-url",
+            "https://fleet.example.com",
+            "--admin-token",
+            "admin-secret",
+            "--confirm-external-restart",
+            "--reason",
+            "operator approved service restart",
+            "--json",
+        ])
+        .expect("valid signing rotation restart action command");
+        assert!(matches!(
+            restart_action.command,
+            Command::Controller(ControllerCommand {
+                command: ControllerSubcommand::SigningRotation {
+                    command: ControllerSigningRotationSubcommand::RestartAction { .. }
+                }
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_controller_signing_rotation_restart_plan_command() {
+        let parsed = Cli::try_parse_from([
+            "sponzey",
+            "controller",
+            "signing-rotation",
+            "restart-plan",
+            "--controller-url",
+            "https://fleet.example.com",
+            "--admin-token",
+            "admin-secret",
+            "--json",
+        ])
+        .expect("valid signing rotation restart-plan command");
+
+        let Command::Controller(ControllerCommand {
+            command: ControllerSubcommand::SigningRotation { command },
+        }) = parsed.command
+        else {
+            panic!("expected signing rotation command");
+        };
+        let ControllerSigningRotationSubcommand::RestartPlan { api, json } = command else {
+            panic!("expected restart-plan command");
+        };
+
+        assert_eq!(
+            api.controller_url.as_deref(),
+            Some("https://fleet.example.com")
+        );
+        assert_eq!(api.admin_token.as_deref(), Some("admin-secret"));
+        assert!(json);
+    }
+
+    #[test]
+    fn controller_signing_rotation_status_renderer_omits_key_material() {
+        let body = serde_json::json!({
+            "controller_id": "default-controller",
+            "persisted_record_present": true,
+            "persisted_state": "dual_trust_active",
+            "readiness": "dual_trust_active_agents_migrating",
+            "active_signing_fingerprint_prefix": "new-fp-12345678",
+            "selected_signing_fingerprint_prefix": "new-fp-12345678",
+            "old_fingerprint_prefix": "old-fp-12345678",
+            "new_fingerprint_prefix": "new-fp-12345678",
+            "requested_at_ms": 1710000000000_u64,
+            "validated_at_ms": 1710000001000_u64,
+            "activated_at_ms": 1710000002000_u64,
+            "old_key_verifies_until_ms": 1710003600000_u64,
+            "retired_at_ms": null,
+            "failed_at_ms": null,
+            "bootstrap_guard": "active_matches_selected",
+            "agent_trust_rollout": "agents_migrating",
+            "controller_private_key_path": "controller_private.key",
+            "controller_signing_public_key": "raw-public-key-body",
+            "candidate_private_key": "private-key-secret",
+            "tls_certificate_path": "tls/fullchain.pem",
+            "task_payload_body": "{\"program\":\"uptime\"}"
+        })
+        .to_string();
+
+        let lines = render_controller_signing_rotation_status_for_cli(&body)
+            .expect("status response should render");
+        let rendered = lines.join("\n");
+
+        assert!(rendered.contains("controller_id=default-controller"));
+        assert!(rendered.contains("state=dual_trust_active"));
+        assert!(rendered.contains("readiness=dual_trust_active_agents_migrating"));
+        assert!(rendered.contains("active_signing_fingerprint_prefix=new-fp-12345678"));
+        assert!(rendered.contains("old_key_verifies_until_ms=1710003600000"));
+        for forbidden in [
+            "controller_private.key",
+            "raw-public-key-body",
+            "private-key-secret",
+            "tls/fullchain.pem",
+            "task_payload_body",
+            "uptime",
+        ] {
+            assert!(
+                !rendered.contains(forbidden),
+                "renderer must not expose {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn controller_signing_rotation_restart_plan_renderer_omits_key_material() {
+        let body = serde_json::json!({
+            "controller_id": "default-controller",
+            "restart_required": true,
+            "reload_supported": false,
+            "recommended_action": "restart_controller_process",
+            "readiness": "dual_trust_active_agents_migrating",
+            "bootstrap_guard": "active_mismatch_selected",
+            "agent_trust_rollout": "agents_migrating",
+            "active_signing_fingerprint_prefix": "old-fp-12345678",
+            "selected_signing_fingerprint_prefix": "new-fp-12345678",
+            "blocked_reason": "active signer does not match selected signer",
+            "verification_commands": [
+                "sponzey controller signing-rotation-status --controller-url <controller-url>",
+                "sponzey controller signing-rotation restart-plan --controller-url <controller-url>"
+            ],
+            "safety_notes": [
+                "controller signing reload is not supported by this version",
+                "restart the controller process through the service manager and verify status afterwards"
+            ],
+            "controller_private_key_path": "controller_private.key",
+            "candidate_private_key": "private-key-secret",
+            "tls_certificate_path": "tls/fullchain.pem",
+            "admin_token": "admin-secret",
+            "task_payload_body": "{\"program\":\"uptime\"}"
+        })
+        .to_string();
+
+        let lines = render_controller_signing_rotation_restart_plan_for_cli(&body)
+            .expect("restart plan response should render");
+        let rendered = lines.join("\n");
+
+        assert!(rendered.contains("controller_id=default-controller"));
+        assert!(rendered.contains("restart_required=true"));
+        assert!(rendered.contains("reload_supported=false"));
+        assert!(rendered.contains("recommended_action=restart_controller_process"));
+        assert!(
+            rendered.contains("verification_command=sponzey controller signing-rotation-status")
+        );
+        for forbidden in [
+            "controller_private.key",
+            "private-key-secret",
+            "tls/fullchain.pem",
+            "admin-secret",
+            "task_payload_body",
+            "uptime",
+        ] {
+            assert!(
+                !rendered.contains(forbidden),
+                "renderer must not expose {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn controller_signing_rotation_restart_action_renderer_omits_key_material() {
+        let body = serde_json::json!({
+            "controller_id": "default-controller",
+            "action": "external_service_manager_restart",
+            "action_status": "audit_recorded_external_restart_required",
+            "restart_required": true,
+            "reload_supported": false,
+            "readiness": "dual_trust_active_agents_migrating",
+            "bootstrap_guard": "active_mismatch_selected",
+            "active_signing_fingerprint_prefix": "old-fp-12345678",
+            "selected_signing_fingerprint_prefix": "new-fp-12345678",
+            "service_command": "sponzey controller restart-service --dry-run",
+            "verification_commands": [
+                "sponzey controller signing-rotation restart-plan --controller-url <controller-url>"
+            ],
+            "safety_notes": [
+                "restart is executed outside the HTTP handler"
+            ],
+            "controller_private_key_path": "controller_private.key",
+            "candidate_private_key": "private-key-secret",
+            "tls_certificate_path": "tls/fullchain.pem",
+            "admin_token": "admin-secret",
+            "task_payload_body": "{\"program\":\"uptime\"}"
+        })
+        .to_string();
+
+        let lines = render_controller_signing_rotation_restart_action_for_cli(&body)
+            .expect("restart action response should render");
+        let rendered = lines.join("\n");
+
+        assert!(rendered.contains("controller_id=default-controller"));
+        assert!(rendered.contains("action=external_service_manager_restart"));
+        assert!(rendered.contains("action_status=audit_recorded_external_restart_required"));
+        assert!(rendered.contains("service_command=sponzey controller restart-service --dry-run"));
+        for forbidden in [
+            "controller_private.key",
+            "private-key-secret",
+            "tls/fullchain.pem",
+            "admin-secret",
+            "task_payload_body",
+            "uptime",
+        ] {
+            assert!(
+                !rendered.contains(forbidden),
+                "renderer must not expose {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn controller_signing_trust_bundle_rollout_renderer_omits_key_material() {
+        let body = serde_json::json!({
+            "controller_id": "default-controller",
+            "persisted_state": "dual_trust_active",
+            "attempted_count": 2,
+            "updated_count": 1,
+            "skipped_count": 1,
+            "failed_count": 0,
+            "entries_count": 2,
+            "current_fingerprint_prefix": "new-fp-12345678",
+            "previous_fingerprint_prefix": "old-fp-12345678",
+            "agent_results": [
+                {"agent_id":"agent-1","status":"sent"},
+                {"agent_id":"agent-2","status":"skipped_not_connected"}
+            ],
+            "previous_public_key_path": "old_controller_public.key",
+            "current_public_key": "new-public-key-body",
+            "previous_public_key": "old-public-key-body",
+            "private_key": "private-key-secret",
+            "admin_token": "admin-secret"
+        })
+        .to_string();
+
+        let lines = render_controller_signing_trust_bundle_rollout_for_cli(&body)
+            .expect("rollout response should render");
+        let rendered = lines.join("\n");
+
+        assert!(rendered.contains("controller_id=default-controller"));
+        assert!(rendered.contains("updated_count=1"));
+        assert!(rendered.contains("agent_id=agent-1\tstatus=sent"));
+        for forbidden in [
+            "old_controller_public.key",
+            "new-public-key-body",
+            "old-public-key-body",
+            "private-key-secret",
+            "admin-secret",
+        ] {
+            assert!(
+                !rendered.contains(forbidden),
+                "renderer must not expose {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn controller_signing_trust_bundle_staged_rollout_renderer_omits_key_material() {
+        let body = serde_json::json!({
+            "controller_id": "default-controller",
+            "persisted_state": "dual_trust_active",
+            "rollout_state": "waiting_for_ack",
+            "target_count": 3,
+            "planned_count": 1,
+            "attempted_count": 1,
+            "updated_count": 1,
+            "skipped_count": 1,
+            "failed_count": 0,
+            "already_current_count": 1,
+            "unavailable_count": 0,
+            "pending_count": 1,
+            "entries_count": 2,
+            "current_fingerprint_prefix": "new-fp-12345678",
+            "previous_fingerprint_prefix": "old-fp-12345678",
+            "agent_results": [
+                {"agent_id":"agent-2","status":"sent"}
+            ],
+            "previous_public_key_path": "old_controller_public.key",
+            "current_public_key": "new-public-key-body",
+            "previous_public_key": "old-public-key-body",
+            "private_key": "private-key-secret",
+            "admin_token": "admin-secret",
+            "task_payload_body": "{\"program\":\"uptime\"}"
+        })
+        .to_string();
+
+        let lines = render_controller_signing_trust_bundle_staged_rollout_for_cli(&body)
+            .expect("staged rollout response should render");
+        let rendered = lines.join("\n");
+
+        assert!(rendered.contains("controller_id=default-controller"));
+        assert!(rendered.contains("rollout_state=waiting_for_ack"));
+        assert!(rendered.contains("target_count=3"));
+        assert!(rendered.contains("planned_count=1"));
+        assert!(rendered.contains("already_current_count=1"));
+        assert!(rendered.contains("pending_count=1"));
+        assert!(rendered.contains("agent_id=agent-2\tstatus=sent"));
+        for forbidden in [
+            "old_controller_public.key",
+            "new-public-key-body",
+            "old-public-key-body",
+            "private-key-secret",
+            "admin-secret",
+            "task_payload_body",
+            "uptime",
+        ] {
+            assert!(
+                !rendered.contains(forbidden),
+                "renderer must not expose {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn controller_signing_staged_trust_bundle_request_uses_explicit_body() {
+        let body = controller_signing_staged_trust_bundle_request_body(
+            Some(PathBuf::from(
+                "/var/lib/sponzey-fleet/controller/controller_public.key.bak",
+            )),
+            vec!["agent-1".to_owned(), "agent-2".to_owned()],
+            10,
+            1,
+            30,
+        );
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(
+            CONTROLLER_SIGNING_STAGED_TRUST_BUNDLE_PATH,
+            "/api/controller/signing-rotation/rollout-trust-bundle/staged"
+        );
+        assert_eq!(
+            json["previous_public_key_path"],
+            "/var/lib/sponzey-fleet/controller/controller_public.key.bak"
+        );
+        assert_eq!(json["agent_ids"], serde_json::json!(["agent-1", "agent-2"]));
+        assert_eq!(json["batch_size"], 10);
+        assert_eq!(json["max_failures"], 1);
+        assert_eq!(json["ack_timeout_seconds"], 30);
+        assert!(json.get("private_key").is_none());
+        assert!(json.get("admin_token").is_none());
+    }
+
+    #[test]
+    fn parses_remediation_cli_commands() {
+        let remediations = Cli::try_parse_from([
+            "sponzey",
+            "remediations",
+            "list",
+            "--agent-id",
+            "agent-1",
+            "--policy-id",
+            "nginx-running",
+            "--limit",
+            "10",
+        ])
+        .expect("valid remediations list command");
+        let Command::Remediations(command) = remediations.command else {
+            panic!("expected remediations command");
+        };
+        let RemediationsSubcommand::List {
+            agent_id,
+            policy_id,
+            limit,
+            ..
+        } = command.command
+        else {
+            panic!("expected remediation list command");
+        };
+        assert_eq!(agent_id.as_deref(), Some("agent-1"));
+        assert_eq!(policy_id.as_deref(), Some("nginx-running"));
+        assert_eq!(limit, 10);
+
+        let remediation_approve = Cli::try_parse_from([
+            "sponzey",
+            "remediations",
+            "approve",
+            "rem-1",
+            "--approval-id",
+            "approval-1",
+            "--job-id",
+            "job-1",
+            "--runbook",
+            "runbooks/remediate.yml",
+        ])
+        .expect("valid remediations approve command");
+        assert!(matches!(
+            remediation_approve.command,
+            Command::Remediations(RemediationsCommand {
+                command: RemediationsSubcommand::Approve { .. }
+            })
+        ));
+    }
+
+    #[test]
+    fn cli_profile_save_read_roundtrip_uses_secure_permissions() {
+        let dir = unique_test_dir("cli-profile");
+        let path = dir.join("profile.json");
+        let profile = CliProfile {
+            controller_url: "https://fleet.example.com".to_owned(),
+            admin_token: "admin-secret".to_owned(),
+        };
+
+        save_cli_profile(&path, &profile).unwrap();
+        let loaded = read_cli_profile(&path).unwrap();
+
+        assert_eq!(loaded, profile);
+        #[cfg(unix)]
+        {
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cli_profile_rejects_insecure_permissions() {
+        let dir = unique_test_dir("cli-profile-insecure");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("profile.json");
+        fs::write(
+            &path,
+            r#"{"controller_url":"https://fleet.example.com","admin_token":"admin-secret"}"#,
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(matches!(read_cli_profile(&path), Err(CliError::Http(_))));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn protected_api_resolves_profile_and_allows_explicit_override() {
+        let dir = unique_test_dir("cli-profile-resolve");
+        let path = dir.join("profile.json");
+        save_cli_profile(
+            &path,
+            &CliProfile {
+                controller_url: "https://profile.example.com".to_owned(),
+                admin_token: "profile-token".to_owned(),
+            },
+        )
+        .unwrap();
+
+        let from_profile = resolve_protected_api(&ProtectedApiArgs {
+            controller_url: None,
+            admin_token: None,
+            profile_path: path.clone(),
+        })
+        .unwrap();
+        assert_eq!(from_profile.controller_url, "https://profile.example.com");
+        assert_eq!(from_profile.admin_token, "profile-token");
+
+        let explicit = resolve_protected_api(&ProtectedApiArgs {
+            controller_url: Some("https://explicit.example.com".to_owned()),
+            admin_token: Some("explicit-token".to_owned()),
+            profile_path: dir.join("missing.json"),
+        })
+        .unwrap();
+        assert_eq!(explicit.controller_url, "https://explicit.example.com");
+        assert_eq!(explicit.admin_token, "explicit-token");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn protected_api_client_sends_profile_bearer_token() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (sender, receiver) = mpsc::channel();
+        let (ready_sender, ready_receiver) = mpsc::channel();
+        let server = thread::spawn(move || {
+            ready_sender.send(()).unwrap();
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = String::new();
+                let mut buffer = [0_u8; 4096];
+                loop {
+                    let read = match stream.read(&mut buffer) {
+                        Ok(read) => read,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => break,
+                        Err(error) => panic!("mock server read failed: {error}"),
+                    };
+                    if read == 0 {
+                        break;
+                    }
+                    request.push_str(&String::from_utf8_lossy(&buffer[..read]));
+                    if request.contains("\r\n\r\n") {
+                        break;
+                    }
+                }
+                if request.contains("GET /api/agents HTTP/1.1") {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                        )
+                        .unwrap();
+                    sender.send(request).unwrap();
+                    return;
+                }
+            }
+            panic!("mock server did not receive protected API request");
+        });
+        let dir = unique_test_dir("cli-profile-http");
+        let path = dir.join("profile.json");
+        save_cli_profile(
+            &path,
+            &CliProfile {
+                controller_url: format!("http://127.0.0.1:{port}"),
+                admin_token: "profile-token".to_owned(),
+            },
+        )
+        .unwrap();
+        ready_receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let client = resolve_protected_api(&ProtectedApiArgs {
+            controller_url: None,
+            admin_token: None,
+            profile_path: path.clone(),
+        })
+        .unwrap();
+        let mut last_error = None;
+        let mut body = None;
+        for _ in 0..3 {
+            match client.get("/api/agents") {
+                Ok(response) => {
+                    body = Some(response);
+                    break;
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                    thread::sleep(Duration::from_millis(25));
+                }
+            }
+        }
+        let body = body.unwrap_or_else(|| panic!("protected API request failed: {last_error:?}"));
+        let request = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+        server.join().unwrap();
+
+        assert_eq!(body, "{}");
+        assert!(request.contains("GET /api/agents HTTP/1.1"));
+        assert!(request.contains("authorization: Bearer profile-token"));
+        assert!(!request.contains("admin-secret"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn api_error_rendering_distinguishes_common_statuses() {
+        assert_eq!(
+            render_http_status_error(401),
+            "unauthorized: admin token is missing or invalid"
+        );
+        assert_eq!(
+            render_http_status_error(403),
+            "forbidden: admin token lacks required permission"
+        );
+        assert_eq!(
+            render_http_status_error(404),
+            "not found: requested resource does not exist"
+        );
+        assert_eq!(
+            render_http_status_error(409),
+            "conflict: request conflicts with current state"
+        );
+    }
+
+    #[test]
+    fn selector_preview_renderer_uses_controller_counts() {
+        let body = serde_json::json!({
+            "matched_count": 2,
+            "selected_count": 1,
+            "disabled_count": 1,
+            "offline_count": 0,
+            "warnings": [
+                {"code": "disabled_agents_excluded", "message": "1 disabled agent excluded"}
+            ],
+            "agents": [
+                {
+                    "agent_id": "agent-1",
+                    "name": "web-01",
+                    "status": "online",
+                    "labels": [],
+                    "selected_for_dispatch": true
+                }
+            ]
+        })
+        .to_string();
+
+        let lines = render_selector_preview_for_cli(&body).unwrap();
+
+        assert!(lines.contains(&"matched_count=2".to_owned()));
+        assert!(lines.contains(&"selected_count=1".to_owned()));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("disabled_agents_excluded"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("agent=agent-1") && line.contains("selected=true"))
+        );
+    }
+
+    #[test]
+    fn audit_export_path_and_jsonl_renderer_use_controller_page() {
+        assert_eq!(
+            audit_export_path(Some("security"), 10, Some("3:1")),
+            "/api/audit/export?category=security&limit=10&before=3%3A1"
+        );
+        let body = serde_json::json!({
+            "items": [
+                {
+                    "category": "security",
+                    "action": "invalid_signature",
+                    "actor": "system",
+                    "target": "agent-1",
+                    "value_kind": "secret_ref",
+                    "value": "secret_ref",
+                    "occurred_at_ms": 3000,
+                    "cursor": "3:2"
+                }
+            ],
+            "next_cursor": null
+        })
+        .to_string();
+
+        let lines = render_audit_export_jsonl(&body).unwrap();
+
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("\"category\":\"security\""));
+        assert!(lines[0].contains("\"value\":\"secret_ref\""));
+        assert!(!lines[0].contains("raw-secret"));
+        assert!(serde_json::from_str::<serde_json::Value>(&lines[0]).is_ok());
+    }
+
+    #[test]
+    fn remediation_cli_paths_and_renderer_hide_payload_bodies() {
+        assert_eq!(
+            remediations_list_path(Some("agent/1"), Some("nginx running"), 10),
+            "/api/remediations?agent_id=agent%2F1&policy_id=nginx%20running&limit=10"
+        );
+        let body = serde_json::json!([
+            {
+                "id": "rem-1",
+                "policy_id": "nginx-running",
+                "policy_name": "nginx-running",
+                "agent_id": "agent-1",
+                "runbook_ref": "runbooks/remediate.yml",
+                "status": "proposed",
+                "job_id": null,
+                "runbook_document": "kind: Runbook\n# secret-value-should-not-leak",
+                "command_output": "secret-value-should-not-leak",
+                "rendered_body": "secret-value-should-not-leak"
+            }
+        ])
+        .to_string();
+
+        let lines = render_remediation_api_for_cli(&body).unwrap();
+
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("remediation_id=rem-1"));
+        assert!(lines[0].contains("policy_id=nginx-running"));
+        assert!(!lines.join("\n").contains("kind: Runbook"));
+        assert!(!lines.join("\n").contains("runbook_document"));
+        assert!(!lines.join("\n").contains("secret-value-should-not-leak"));
+    }
+
+    #[test]
+    fn remediation_approve_body_contains_runbook_only_in_request_payload() {
+        let body = build_remediation_approve_body(
+            "approval-1",
+            "job-1",
+            "kind: Runbook\n# secret-value-should-not-leak",
+            30,
+            300,
+            Some("nonce-1"),
+            "approved",
+        );
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(json["approval_id"], "approval-1");
+        assert_eq!(json["job_id"], "job-1");
+        assert_eq!(
+            json["runbook_document"],
+            "kind: Runbook\n# secret-value-should-not-leak"
+        );
+        assert_eq!(json["nonce_prefix"], "nonce-1");
+    }
+
+    #[test]
     fn remote_run_body_uses_selector_and_omits_admin_token() {
         let command = RunCommand {
             selector: Some("role=web".to_owned()),
             confirm_risk: true,
             controller_url: Some("http://127.0.0.1:7700".to_owned()),
             admin_token: Some("admin-secret".to_owned()),
+            profile_path: PathBuf::from(DEFAULT_CLI_PROFILE_PATH),
+            remote: true,
             job_id: Some("job-cli-1".to_owned()),
             timeout_seconds: 45,
             command: vec!["uptime".to_owned(), "-a".to_owned()],
@@ -6151,7 +9636,7 @@ mod tests {
             "--data-dir",
             data_dir.to_str().unwrap(),
             "--older-than-days",
-            "0",
+            "1",
         ])
         .expect("valid command");
 
@@ -7585,6 +11070,24 @@ steps:
     }
 
     #[test]
+    fn agent_capability_names_use_explicit_probe_input() {
+        let probe = AgentCapabilityProbe {
+            privilege_level: fleet_protocol::CapabilityPrivilegeLevelWire::SudoAvailable,
+            package_manager: Some(fleet_protocol::PackageManagerWire::Apt),
+            service_manager: Some(fleet_protocol::ServiceManagerWire::Systemd),
+        };
+
+        let capabilities = agent_capability_names(&probe);
+
+        assert!(capabilities.contains(&"persistent_session".to_owned()));
+        assert!(capabilities.contains(&"command_execution".to_owned()));
+        assert!(capabilities.contains(&"drift_check".to_owned()));
+        assert!(capabilities.contains(&"runbook_execution".to_owned()));
+        assert!(capabilities.contains(&"package_install".to_owned()));
+        assert!(capabilities.contains(&"service_control".to_owned()));
+    }
+
+    #[test]
     fn agent_session_busy_task_rejects_new_assignment() {
         let (sender, receiver) = mpsc::sync_channel(4);
         let config = test_agent_config();
@@ -7592,6 +11095,7 @@ steps:
             busy: Arc::new(AtomicBool::new(true)),
             runtime: Arc::new(AgentTaskRuntimeState::default()),
             replay_guard: Arc::new(Mutex::new(fleet_runner::NonceReplayGuard::default())),
+            controller_trust_bundle: Arc::new(Mutex::new(None)),
         };
 
         handle_agent_session_message(
@@ -7667,6 +11171,7 @@ steps:
             busy: Arc::new(AtomicBool::new(true)),
             runtime: Arc::new(AgentTaskRuntimeState::default()),
             replay_guard: Arc::new(Mutex::new(fleet_runner::NonceReplayGuard::default())),
+            controller_trust_bundle: Arc::new(Mutex::new(None)),
         };
 
         handle_agent_session_message(
@@ -7763,6 +11268,622 @@ steps:
     }
 
     #[test]
+    fn trust_bundle_update_wire_maps_to_domain_current_previous_bundle() {
+        let entries = vec![
+            fleet_protocol::ControllerSigningTrustEntryWire {
+                fingerprint: "controller-fp-new".to_owned(),
+                public_key: "controller-public-new".to_owned(),
+                role: fleet_protocol::ControllerSigningTrustRoleWire::Current,
+                valid_from_ms: 10_000,
+                valid_until_ms: None,
+            },
+            fleet_protocol::ControllerSigningTrustEntryWire {
+                fingerprint: "controller-fp-old".to_owned(),
+                public_key: "controller-public-old".to_owned(),
+                role: fleet_protocol::ControllerSigningTrustRoleWire::Previous,
+                valid_from_ms: 10_000,
+                valid_until_ms: Some(20_000),
+            },
+        ];
+
+        let bundle = controller_signing_trust_bundle_from_wire(&entries).unwrap();
+
+        assert_eq!(bundle.entries().len(), 2);
+        assert_eq!(
+            bundle.entries()[0].role(),
+            fleet_domain::ControllerSigningTrustRole::Current
+        );
+        assert_eq!(
+            bundle.entries()[1].role(),
+            fleet_domain::ControllerSigningTrustRole::Previous
+        );
+    }
+
+    #[test]
+    fn trust_bundle_update_rejects_duplicate_fingerprint_without_key_leak() {
+        let entries = vec![
+            fleet_protocol::ControllerSigningTrustEntryWire {
+                fingerprint: "controller-fp-duplicate".to_owned(),
+                public_key: "private-material-like-public-a".to_owned(),
+                role: fleet_protocol::ControllerSigningTrustRoleWire::Current,
+                valid_from_ms: 10_000,
+                valid_until_ms: None,
+            },
+            fleet_protocol::ControllerSigningTrustEntryWire {
+                fingerprint: "controller-fp-duplicate".to_owned(),
+                public_key: "private-material-like-public-b".to_owned(),
+                role: fleet_protocol::ControllerSigningTrustRoleWire::Previous,
+                valid_from_ms: 10_000,
+                valid_until_ms: Some(20_000),
+            },
+        ];
+
+        let error = controller_signing_trust_bundle_from_wire(&entries)
+            .expect_err("duplicate fingerprint should fail")
+            .to_string();
+
+        assert!(error.contains("duplicate"));
+        assert!(!error.contains("private-material-like-public"));
+    }
+
+    #[test]
+    fn trust_bundle_update_rejects_invalid_previous_window_without_key_leak() {
+        let entries = vec![
+            fleet_protocol::ControllerSigningTrustEntryWire {
+                fingerprint: "controller-fp-new".to_owned(),
+                public_key: "controller-public-new".to_owned(),
+                role: fleet_protocol::ControllerSigningTrustRoleWire::Current,
+                valid_from_ms: 10_000,
+                valid_until_ms: None,
+            },
+            fleet_protocol::ControllerSigningTrustEntryWire {
+                fingerprint: "controller-fp-old".to_owned(),
+                public_key: "private-material-like-public-old".to_owned(),
+                role: fleet_protocol::ControllerSigningTrustRoleWire::Previous,
+                valid_from_ms: 20_000,
+                valid_until_ms: Some(10_000),
+            },
+        ];
+
+        let error = controller_signing_trust_bundle_from_wire(&entries)
+            .expect_err("invalid previous trust window should fail")
+            .to_string();
+
+        assert!(error.contains("time window"));
+        assert!(!error.contains("private-material-like-public-old"));
+    }
+
+    #[test]
+    fn trust_bundle_update_rejects_previous_entry_without_expiry() {
+        let entries = vec![
+            fleet_protocol::ControllerSigningTrustEntryWire {
+                fingerprint: "controller-fp-new".to_owned(),
+                public_key: "controller-public-new".to_owned(),
+                role: fleet_protocol::ControllerSigningTrustRoleWire::Current,
+                valid_from_ms: 10_000,
+                valid_until_ms: None,
+            },
+            fleet_protocol::ControllerSigningTrustEntryWire {
+                fingerprint: "controller-fp-old".to_owned(),
+                public_key: "controller-public-old".to_owned(),
+                role: fleet_protocol::ControllerSigningTrustRoleWire::Previous,
+                valid_from_ms: 10_000,
+                valid_until_ms: None,
+            },
+        ];
+
+        let error = controller_signing_trust_bundle_from_wire(&entries)
+            .expect_err("previous trust entry without expiry should fail")
+            .to_string();
+
+        assert!(error.contains("previous controller signing trust entry requires an expiry"));
+    }
+
+    #[test]
+    fn agent_controller_signing_trust_bundle_update_applies_in_memory_without_env() {
+        let task_state = test_task_session_state();
+        let entries = vec![fleet_protocol::ControllerSigningTrustEntryWire {
+            fingerprint: "controller-fp-new".to_owned(),
+            public_key: "controller-public-new".to_owned(),
+            role: fleet_protocol::ControllerSigningTrustRoleWire::Current,
+            valid_from_ms: 10_000,
+            valid_until_ms: None,
+        }];
+
+        apply_agent_controller_signing_trust_bundle_update(&task_state, &entries, None).unwrap();
+        let bundle = agent_controller_signing_trust_bundle(
+            &task_state,
+            &test_agent_config(),
+            "legacy-controller-public",
+        )
+        .unwrap();
+
+        assert_eq!(bundle.entries().len(), 1);
+        assert_eq!(
+            bundle.entries()[0].fingerprint().as_str(),
+            "controller-fp-new"
+        );
+        assert_eq!(
+            bundle.entries()[0].public_key().as_str(),
+            "controller-public-new"
+        );
+    }
+
+    #[test]
+    fn agent_controller_signing_trust_bundle_update_emits_ack_without_material() {
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let config = test_agent_config();
+        fs::create_dir_all(config.controller_trust_bundle_path.parent().unwrap()).unwrap();
+        let task_state = test_task_session_state();
+        let entries = vec![fleet_protocol::ControllerSigningTrustEntryWire {
+            fingerprint: "controller-fp-new".to_owned(),
+            public_key: "controller-public-new".to_owned(),
+            role: fleet_protocol::ControllerSigningTrustRoleWire::Current,
+            valid_from_ms: 10_000,
+            valid_until_ms: None,
+        }];
+        let message = fleet_protocol::WireMessage::new(
+            "msg-trust-update",
+            "corr-trust-update",
+            Some(config.agent_id.clone()),
+            10_000,
+            fleet_protocol::WirePayload::ControllerSigningTrustBundleUpdate { entries },
+        );
+
+        handle_agent_session_message(
+            message,
+            &config,
+            "legacy-controller-public",
+            "corr-test",
+            &sender,
+            &task_state,
+        )
+        .unwrap();
+
+        let ack = receiver.try_recv().expect("ack should be enqueued first");
+        let event = receiver
+            .try_recv()
+            .expect("security event should remain enqueued");
+        let encoded_ack = fleet_protocol::encode_message(&ack).unwrap();
+        let fleet_protocol::WirePayload::ControllerSigningTrustBundleAck {
+            agent_id,
+            accepted,
+            current_fingerprint,
+            entries_count,
+            reason_code,
+        } = ack.payload
+        else {
+            panic!("expected trust bundle ack");
+        };
+
+        assert_eq!(agent_id, config.agent_id);
+        assert!(accepted);
+        assert_eq!(current_fingerprint.as_deref(), Some("controller-fp-new"));
+        assert_eq!(entries_count, 1);
+        assert!(reason_code.is_none());
+        assert!(matches!(
+            event.payload,
+            fleet_protocol::WirePayload::SecurityEvent { ref action, .. }
+                if action == "controller_signing_trust_bundle_update_accepted"
+        ));
+        assert!(!encoded_ack.contains("controller-public-new"));
+        assert!(!encoded_ack.contains("private_key"));
+        assert!(!encoded_ack.contains("key_path"));
+        assert!(!encoded_ack.contains("tls_certificate"));
+    }
+
+    #[test]
+    fn agent_controller_signing_trust_bundle_update_rejection_ack_is_bounded() {
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let config = test_agent_config();
+        fs::create_dir_all(config.controller_trust_bundle_path.parent().unwrap()).unwrap();
+        let task_state = test_task_session_state();
+        let entries = vec![
+            fleet_protocol::ControllerSigningTrustEntryWire {
+                fingerprint: "controller-fp-duplicate".to_owned(),
+                public_key: "public-material-a".to_owned(),
+                role: fleet_protocol::ControllerSigningTrustRoleWire::Current,
+                valid_from_ms: 10_000,
+                valid_until_ms: None,
+            },
+            fleet_protocol::ControllerSigningTrustEntryWire {
+                fingerprint: "controller-fp-duplicate".to_owned(),
+                public_key: "public-material-b".to_owned(),
+                role: fleet_protocol::ControllerSigningTrustRoleWire::Previous,
+                valid_from_ms: 10_000,
+                valid_until_ms: Some(20_000),
+            },
+        ];
+        let message = fleet_protocol::WireMessage::new(
+            "msg-trust-update",
+            "corr-trust-update",
+            Some(config.agent_id.clone()),
+            10_000,
+            fleet_protocol::WirePayload::ControllerSigningTrustBundleUpdate { entries },
+        );
+
+        handle_agent_session_message(
+            message,
+            &config,
+            "legacy-controller-public",
+            "corr-test",
+            &sender,
+            &task_state,
+        )
+        .unwrap();
+
+        let ack = receiver
+            .try_recv()
+            .expect("rejection ack should be enqueued");
+        let event = receiver
+            .try_recv()
+            .expect("rejection security event should remain enqueued");
+        let encoded_ack = fleet_protocol::encode_message(&ack).unwrap();
+        let fleet_protocol::WirePayload::ControllerSigningTrustBundleAck {
+            accepted,
+            current_fingerprint,
+            entries_count,
+            reason_code,
+            ..
+        } = ack.payload
+        else {
+            panic!("expected trust bundle ack");
+        };
+
+        assert!(!accepted);
+        assert!(current_fingerprint.is_none());
+        assert_eq!(entries_count, 2);
+        assert_eq!(reason_code.as_deref(), Some("invalid_trust_bundle"));
+        assert!(matches!(
+            event.payload,
+            fleet_protocol::WirePayload::SecurityEvent { ref action, .. }
+                if action == "controller_signing_trust_bundle_update_rejected"
+        ));
+        assert!(!encoded_ack.contains("public-material-a"));
+        assert!(!encoded_ack.contains("public-material-b"));
+        assert!(!encoded_ack.contains("private_key"));
+        assert!(!encoded_ack.contains("key_path"));
+        assert!(!encoded_ack.contains("tls_certificate"));
+    }
+
+    #[test]
+    fn agent_certificate_lifecycle_update_rejects_until_runtime_support_exists() {
+        let (sender, receiver) = mpsc::sync_channel(4);
+        let config = test_agent_config();
+        let task_state = test_task_session_state();
+        let message = fleet_protocol::WireMessage::new(
+            "msg-agent-cert-update",
+            "corr-agent-cert-update",
+            Some(config.agent_id.clone()),
+            10_000,
+            fleet_protocol::WirePayload::AgentCertificateLifecycleUpdate {
+                agent_id: config.agent_id.clone(),
+                action: fleet_protocol::AgentCertificateLifecycleActionWire::Issue,
+                state: fleet_protocol::AgentCertificateLifecycleStateWire::Issued,
+                current_certificate: Some(fleet_protocol::AgentCertificateMetadataWire {
+                    serial: "serial-1".to_owned(),
+                    fingerprint: "cert-fp-current".to_owned(),
+                    not_before_ms: 10_000,
+                    not_after_ms: 20_000,
+                }),
+                next_certificate: None,
+                grace_until_ms: None,
+                reason_code: None,
+            },
+        );
+
+        handle_agent_session_message(
+            message,
+            &config,
+            "legacy-controller-public",
+            "corr-test",
+            &sender,
+            &task_state,
+        )
+        .unwrap();
+
+        let ack = receiver
+            .try_recv()
+            .expect("certificate lifecycle rejection ack should be enqueued");
+        let event = receiver
+            .try_recv()
+            .expect("certificate lifecycle security event should remain enqueued");
+        let encoded_ack = fleet_protocol::encode_message(&ack).unwrap();
+        let fleet_protocol::WirePayload::AgentCertificateLifecycleAck {
+            agent_id,
+            accepted,
+            state,
+            current_fingerprint,
+            reason_code,
+        } = ack.payload
+        else {
+            panic!("expected agent certificate lifecycle ack");
+        };
+
+        assert_eq!(agent_id, config.agent_id);
+        assert!(!accepted);
+        assert_eq!(
+            state,
+            fleet_protocol::AgentCertificateLifecycleStateWire::Issued
+        );
+        assert!(current_fingerprint.is_none());
+        assert_eq!(
+            reason_code.as_deref(),
+            Some("certificate_lifecycle_runtime_not_implemented")
+        );
+        assert!(matches!(
+            event.payload,
+            fleet_protocol::WirePayload::SecurityEvent { ref action, .. }
+                if action == "agent_certificate_lifecycle_update_rejected"
+        ));
+        assert!(!encoded_ack.contains("serial-1"));
+        assert!(!encoded_ack.contains("private_key"));
+        assert!(!encoded_ack.contains("certificate_body"));
+        assert!(!encoded_ack.contains("ca_path"));
+        assert!(!encoded_ack.contains("runtime_env"));
+    }
+
+    #[test]
+    fn agent_task_verification_uses_updated_bundle_and_preserves_task_guards() {
+        let old_key = fleet_core::generate_agent_key_pair().unwrap();
+        let new_key = fleet_core::generate_agent_key_pair().unwrap();
+        let mut config = test_agent_config();
+        config.controller_fingerprint = old_key.fingerprint.clone();
+        let task_state = test_task_session_state();
+        let issued_at = UNIX_EPOCH + Duration::from_secs(20);
+        let now = UNIX_EPOCH + Duration::from_secs(30);
+        apply_agent_controller_signing_trust_bundle_update(
+            &task_state,
+            &[fleet_protocol::ControllerSigningTrustEntryWire {
+                fingerprint: new_key.fingerprint.clone(),
+                public_key: new_key.public_key_hex.clone(),
+                role: fleet_protocol::ControllerSigningTrustRoleWire::Current,
+                valid_from_ms: 10_000,
+                valid_until_ms: None,
+            }],
+            None,
+        )
+        .unwrap();
+        let envelope = signed_test_task_envelope(
+            &config.agent_id,
+            "nonce-updated-bundle",
+            "payload-hash-updated-bundle",
+            &new_key.private_key_hex,
+            issued_at,
+            UNIX_EPOCH + Duration::from_secs(60),
+        );
+
+        let result = verify_agent_task_envelope_once_with_session_trust(
+            &envelope,
+            &config,
+            &old_key.public_key_hex,
+            &task_state,
+            now,
+        )
+        .unwrap();
+
+        assert_eq!(
+            result,
+            Ok(fleet_domain::ControllerSigningTrustVerification::VerifiedCurrent)
+        );
+
+        let mismatched_target = signed_test_task_envelope(
+            "agent-other",
+            "nonce-target-mismatch",
+            "payload-hash-target-mismatch",
+            &new_key.private_key_hex,
+            issued_at,
+            UNIX_EPOCH + Duration::from_secs(60),
+        );
+        let mismatch = verify_agent_task_envelope_once_with_session_trust(
+            &mismatched_target,
+            &config,
+            &old_key.public_key_hex,
+            &task_state,
+            now,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            mismatch,
+            Err(fleet_runner::RunnerError::Job(
+                fleet_domain::JobError::TargetAgentMismatch
+            ))
+        ));
+    }
+
+    #[test]
+    fn absent_controller_trust_bundle_sidecar_keeps_legacy_pinned_bundle() {
+        let dir = unique_test_dir("agent-trust-sidecar-absent");
+        fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("agent.conf");
+        write_secure_file(
+            &config_path,
+            "url=http://127.0.0.1:7700\nagent_id=agent-web-01\nfingerprint=agent-fp-1\ncontroller_fingerprint=controller-fp-1\n",
+        )
+        .unwrap();
+        write_secure_file(&dir.join("agent_private.key"), "agent-private-key\n").unwrap();
+
+        let config = read_agent_config(&config_path).unwrap();
+        let task_state = agent_task_session_state(&config).unwrap();
+        let bundle =
+            agent_controller_signing_trust_bundle(&task_state, &config, "legacy-public-key")
+                .unwrap();
+
+        assert_eq!(
+            config.controller_trust_bundle_path,
+            dir.join("controller_trust_bundle.json")
+        );
+        assert!(config.controller_trust_bundle.is_none());
+        assert_eq!(bundle.entries().len(), 1);
+        assert_eq!(
+            bundle.entries()[0].fingerprint().as_str(),
+            "controller-fp-1"
+        );
+        assert_eq!(
+            bundle.entries()[0].public_key().as_str(),
+            "legacy-public-key"
+        );
+    }
+
+    #[test]
+    fn controller_trust_bundle_sidecar_roundtrips_public_fields_only() {
+        let dir = unique_test_dir("agent-trust-sidecar-public");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("controller_trust_bundle.json");
+        let bundle = controller_signing_trust_bundle_from_wire(&[
+            fleet_protocol::ControllerSigningTrustEntryWire {
+                fingerprint: "controller-fp-new".to_owned(),
+                public_key: "controller-public-new".to_owned(),
+                role: fleet_protocol::ControllerSigningTrustRoleWire::Current,
+                valid_from_ms: 10_000,
+                valid_until_ms: None,
+            },
+        ])
+        .unwrap();
+
+        write_agent_controller_trust_bundle_sidecar(&path, &bundle).unwrap();
+        let loaded = read_agent_controller_trust_bundle_sidecar(&path)
+            .unwrap()
+            .expect("sidecar should exist");
+        let body = fs::read_to_string(path).unwrap();
+
+        assert_eq!(loaded, bundle);
+        assert!(body.contains("controller-public-new"));
+        assert!(body.contains("controller-fp-new"));
+        assert!(!body.contains("private_key"));
+        assert!(!body.contains("key_path"));
+        assert!(!body.contains("tls_certificate"));
+    }
+
+    #[test]
+    fn accepted_controller_trust_bundle_update_persists_for_restart() {
+        let dir = unique_test_dir("agent-trust-sidecar-restart");
+        fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("agent.conf");
+        write_secure_file(
+            &config_path,
+            "url=http://127.0.0.1:7700\nagent_id=agent-web-01\nfingerprint=agent-fp-1\ncontroller_fingerprint=controller-fp-old\n",
+        )
+        .unwrap();
+        write_secure_file(&dir.join("agent_private.key"), "agent-private-key\n").unwrap();
+        let config = read_agent_config(&config_path).unwrap();
+        let task_state = agent_task_session_state(&config).unwrap();
+        let update = vec![fleet_protocol::ControllerSigningTrustEntryWire {
+            fingerprint: "controller-fp-new".to_owned(),
+            public_key: "controller-public-new".to_owned(),
+            role: fleet_protocol::ControllerSigningTrustRoleWire::Current,
+            valid_from_ms: 10_000,
+            valid_until_ms: None,
+        }];
+
+        apply_agent_controller_signing_trust_bundle_update(
+            &task_state,
+            &update,
+            Some(&config.controller_trust_bundle_path),
+        )
+        .unwrap();
+        let restarted_config = read_agent_config(&config_path).unwrap();
+
+        assert_eq!(
+            restarted_config
+                .controller_trust_bundle
+                .as_ref()
+                .unwrap()
+                .entries()[0]
+                .fingerprint()
+                .as_str(),
+            "controller-fp-new"
+        );
+    }
+
+    #[test]
+    fn corrupt_controller_trust_bundle_sidecar_rejects_without_material_leak() {
+        let dir = unique_test_dir("agent-trust-sidecar-corrupt");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("controller_trust_bundle.json");
+        write_secure_file(
+            &path,
+            r#"{
+              "entries": [{
+                "fingerprint": "controller-fp-new",
+                "public_key": "private-key-secret\nvalue",
+                "role": "current",
+                "valid_from_ms": 10000,
+                "valid_until_ms": null
+              }]
+            }"#,
+        )
+        .unwrap();
+
+        let error = read_agent_controller_trust_bundle_sidecar(&path)
+            .expect_err("invalid sidecar should fail")
+            .to_string();
+
+        assert!(error.contains("invalid controller signing public key"));
+        assert!(!error.contains("private-key-secret"));
+    }
+
+    #[test]
+    fn persisted_controller_trust_bundle_verifies_task_after_restart() {
+        let old_key = fleet_core::generate_agent_key_pair().unwrap();
+        let new_key = fleet_core::generate_agent_key_pair().unwrap();
+        let dir = unique_test_dir("agent-trust-sidecar-verify");
+        fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("agent.conf");
+        write_secure_file(
+            &config_path,
+            &format!(
+                "url=http://127.0.0.1:7700\nagent_id=agent-web-01\nfingerprint=agent-fp-1\ncontroller_fingerprint={}\n",
+                old_key.fingerprint
+            ),
+        )
+        .unwrap();
+        write_secure_file(&dir.join("agent_private.key"), "agent-private-key\n").unwrap();
+        let persisted_bundle = controller_signing_trust_bundle_from_wire(&[
+            fleet_protocol::ControllerSigningTrustEntryWire {
+                fingerprint: new_key.fingerprint.clone(),
+                public_key: new_key.public_key_hex.clone(),
+                role: fleet_protocol::ControllerSigningTrustRoleWire::Current,
+                valid_from_ms: 10_000,
+                valid_until_ms: None,
+            },
+        ])
+        .unwrap();
+        write_agent_controller_trust_bundle_sidecar(
+            &agent_controller_trust_bundle_path(&config_path),
+            &persisted_bundle,
+        )
+        .unwrap();
+        let restarted_config = read_agent_config(&config_path).unwrap();
+        let task_state = agent_task_session_state(&restarted_config).unwrap();
+        let issued_at = UNIX_EPOCH + Duration::from_secs(20);
+        let now = UNIX_EPOCH + Duration::from_secs(30);
+        let envelope = signed_test_task_envelope(
+            &restarted_config.agent_id,
+            "nonce-persisted-bundle",
+            "payload-hash-persisted-bundle",
+            &new_key.private_key_hex,
+            issued_at,
+            UNIX_EPOCH + Duration::from_secs(60),
+        );
+
+        let result = verify_agent_task_envelope_once_with_session_trust(
+            &envelope,
+            &restarted_config,
+            &old_key.public_key_hex,
+            &task_state,
+            now,
+        )
+        .unwrap();
+
+        assert_eq!(
+            result,
+            Ok(fleet_domain::ControllerSigningTrustVerification::VerifiedCurrent)
+        );
+    }
+
+    #[test]
     fn reads_secure_agent_config_with_private_key() {
         let dir = unique_test_dir("secure-agent-config");
         fs::create_dir_all(&dir).unwrap();
@@ -7779,6 +11900,7 @@ steps:
         assert!(config.tls_ca_cert.is_none());
         assert_eq!(config.private_key, "private-key-1");
         assert_eq!(config.controller_fingerprint, "controller-fp-1");
+        assert_eq!(config.replay_store_path, dir.join("task_nonces.log"));
     }
 
     #[test]
@@ -7797,6 +11919,61 @@ steps:
         assert_eq!(
             config.tls_ca_cert.as_deref(),
             Some(Path::new("/tmp/sponzey-ca.pem"))
+        );
+    }
+
+    #[test]
+    fn agent_nonce_replay_guard_uses_configured_file_backed_store() {
+        let dir = unique_test_dir("agent-replay-guard");
+        fs::create_dir_all(&dir).unwrap();
+        let mut config = test_agent_config();
+        config.replay_store_path = dir.join("task_nonces.log");
+        let mut first_guard = agent_nonce_replay_guard(&config).unwrap();
+
+        first_guard.accept_once("nonce-restart").unwrap();
+        let mut restarted_guard = agent_nonce_replay_guard(&config).unwrap();
+
+        assert_eq!(
+            restarted_guard.accept_once("nonce-restart"),
+            Err(fleet_runner::RunnerError::ReplayedNonce)
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn agent_config_builds_legacy_controller_signing_trust_bundle() {
+        let config = LocalAgentConfig {
+            url: "http://127.0.0.1:7700".to_owned(),
+            tls_ca_cert: None,
+            agent_id: "agent-web-01".to_owned(),
+            fingerprint: "agent-fp-1".to_owned(),
+            private_key: "private-key-1".to_owned(),
+            controller_fingerprint: "controller-fp-1".to_owned(),
+            replay_store_path: unique_test_dir("agent-replay-store").join("task_nonces.log"),
+            controller_trust_bundle_path: unique_test_dir("agent-trust-bundle")
+                .join("controller_trust_bundle.json"),
+            controller_trust_bundle: None,
+        };
+
+        let bundle =
+            legacy_controller_signing_trust_bundle(&config, "controller-signing-public-key-1")
+                .unwrap();
+        let entry = bundle
+            .entry_for_fingerprint(
+                &fleet_domain::SigningKeyFingerprint::new("controller-fp-1").unwrap(),
+                UNIX_EPOCH + Duration::from_secs(1),
+                UNIX_EPOCH + Duration::from_secs(30),
+            )
+            .unwrap();
+
+        assert_eq!(bundle.entries().len(), 1);
+        assert_eq!(
+            entry.role(),
+            fleet_domain::ControllerSigningTrustRole::Current
+        );
+        assert_eq!(
+            entry.public_key().as_str(),
+            "controller-signing-public-key-1"
         );
     }
 
@@ -7829,6 +12006,10 @@ steps:
             fingerprint: "agent-fp-1".to_owned(),
             private_key: "private-key-1".to_owned(),
             controller_fingerprint: "controller-fp-1".to_owned(),
+            replay_store_path: unique_test_dir("agent-replay-store").join("task_nonces.log"),
+            controller_trust_bundle_path: unique_test_dir("agent-trust-bundle")
+                .join("controller_trust_bundle.json"),
+            controller_trust_bundle: None,
         };
         let identity = fleet_controller::ControllerIdentityResponse {
             controller_public_key: "controller-public-key-2".to_owned(),
@@ -7911,6 +12092,10 @@ steps:
             fingerprint: "agent-fp-1".to_owned(),
             private_key: "private-key-1".to_owned(),
             controller_fingerprint: "controller-fp-1".to_owned(),
+            replay_store_path: unique_test_dir("agent-replay-store").join("task_nonces.log"),
+            controller_trust_bundle_path: unique_test_dir("agent-trust-bundle")
+                .join("controller_trust_bundle.json"),
+            controller_trust_bundle: None,
         }
     }
 
@@ -7924,6 +12109,40 @@ steps:
             nonce: fleet_domain::TaskNonce::new("nonce-queue").unwrap(),
             payload_hash: "hash-queue".to_owned(),
             signature: Some(fleet_domain::TaskSignature::new("signature-queue").unwrap()),
+        }
+    }
+
+    fn signed_test_task_envelope(
+        agent_id: &str,
+        nonce: &str,
+        payload_hash: &str,
+        controller_private_key: &str,
+        issued_at: SystemTime,
+        expires_at: SystemTime,
+    ) -> fleet_domain::TaskEnvelope {
+        fleet_domain::TaskEnvelope {
+            job_id: fleet_domain::JobId::new("job-signed").unwrap(),
+            task_id: fleet_domain::TaskId::new(nonce).unwrap(),
+            target_agent_id: fleet_domain::AgentId::new(agent_id).unwrap(),
+            issued_at,
+            expires_at: fleet_domain::TaskExpiry::new(expires_at),
+            nonce: fleet_domain::TaskNonce::new(nonce).unwrap(),
+            payload_hash: payload_hash.to_owned(),
+            signature: Some(
+                fleet_domain::TaskSignature::new(
+                    fleet_core::sign_challenge(controller_private_key, payload_hash).unwrap(),
+                )
+                .unwrap(),
+            ),
+        }
+    }
+
+    fn test_task_session_state() -> AgentTaskSessionState {
+        AgentTaskSessionState {
+            busy: Arc::new(AtomicBool::new(false)),
+            runtime: Arc::new(AgentTaskRuntimeState::default()),
+            replay_guard: Arc::new(Mutex::new(fleet_runner::NonceReplayGuard::default())),
+            controller_trust_bundle: Arc::new(Mutex::new(None)),
         }
     }
 

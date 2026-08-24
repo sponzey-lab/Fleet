@@ -54,6 +54,12 @@ pub struct AuditEvent {
     pub occurred_at: SystemTime,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditRecord {
+    pub id: u64,
+    pub event: AuditEvent,
+}
+
 impl AuditEvent {
     pub fn security(action: impl Into<String>, target: impl Into<String>) -> Self {
         Self {

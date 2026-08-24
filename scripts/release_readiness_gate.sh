@@ -6,20 +6,37 @@ REPO_ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)"
 INCLUDE_MANUAL=0
 INCLUDE_REGISTRY=0
 VERIFY_MANUAL_REBOOT=0
+RELEASE_PUBLIC_KEY="docs/release-signing-public.pem"
 
-for arg in "$@"; do
-  case "$arg" in
+usage() {
+  echo "usage: $0 [--include-manual] [--include-registry] [--verify-manual-reboot] [--release-public-key <path>]" >&2
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
     --include-manual)
       INCLUDE_MANUAL=1
+      shift
       ;;
     --include-registry)
       INCLUDE_REGISTRY=1
+      shift
       ;;
     --verify-manual-reboot)
       VERIFY_MANUAL_REBOOT=1
+      shift
+      ;;
+    --release-public-key)
+      shift
+      if [ "$#" -eq 0 ]; then
+        usage
+        exit 1
+      fi
+      RELEASE_PUBLIC_KEY="$1"
+      shift
       ;;
     *)
-      echo "usage: $0 [--include-manual] [--include-registry] [--verify-manual-reboot]" >&2
+      usage
       exit 1
       ;;
   esac
@@ -55,10 +72,22 @@ run ./scripts/npm_demo_smoke.sh
 run ./scripts/smoke_mvp.sh
 run ./scripts/smoke_immediate_dispatch.sh
 run ./scripts/smoke_remote_tls_loopback.sh
+run ./scripts/signature_verification_smoke.sh
+run sh ./scripts/storage_decision_gate.sh
 if [ -f dist/release/SHA256SUMS ]; then
   run ./scripts/verify_standalone_artifacts.sh dist/release
 else
   echo "standalone artifact verification skipped: dist/release/SHA256SUMS not found."
+fi
+if [ -f dist/release/SHA256SUMS.sig ]; then
+  if [ ! -f "$RELEASE_PUBLIC_KEY" ]; then
+    echo "release signature found but public key not found: $RELEASE_PUBLIC_KEY" >&2
+    echo "Pass --release-public-key <path> with the pinned release public key." >&2
+    exit 1
+  fi
+  run ./scripts/verify_release_signature.sh dist/release "$RELEASE_PUBLIC_KEY"
+else
+  echo "release signature verification skipped: dist/release/SHA256SUMS.sig not found."
 fi
 if [ -f target/release/sponzey ]; then
   run ./scripts/check_linux_glibc_baseline.sh target/release/sponzey

@@ -70,6 +70,25 @@ pub fn verify_challenge_signature(
     Ok(verifying_key.verify(nonce.as_bytes(), &signature).is_ok())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SigningMaterialValidation {
+    pub public_key_fingerprint: String,
+}
+
+pub fn validate_signing_material_pair(
+    public_key_hex: &str,
+    private_key_hex: &str,
+    challenge: &str,
+) -> Result<SigningMaterialValidation, IdentityError> {
+    let signature = sign_challenge(private_key_hex, challenge)?;
+    if !verify_challenge_signature(public_key_hex, challenge, &signature)? {
+        return Err(IdentityError::InvalidSignature);
+    }
+    Ok(SigningMaterialValidation {
+        public_key_fingerprint: fingerprint_public_key(public_key_hex)?,
+    })
+}
+
 fn hex_encode(bytes: &[u8]) -> String {
     bytes
         .iter()
@@ -146,5 +165,45 @@ mod tests {
             verify_challenge_signature("not-hex", "nonce-1", "sig"),
             Err(IdentityError::InvalidHex)
         ));
+    }
+
+    #[test]
+    fn valid_signing_material_pair_returns_public_fingerprint() {
+        let key_pair = generate_agent_key_pair().unwrap();
+
+        let validation = validate_signing_material_pair(
+            &key_pair.public_key_hex,
+            &key_pair.private_key_hex,
+            "controller-signing-rotation-validation",
+        )
+        .unwrap();
+
+        assert_eq!(validation.public_key_fingerprint, key_pair.fingerprint);
+    }
+
+    #[test]
+    fn mismatched_signing_material_pair_is_rejected() {
+        let public_pair = generate_agent_key_pair().unwrap();
+        let private_pair = generate_agent_key_pair().unwrap();
+
+        assert!(matches!(
+            validate_signing_material_pair(
+                &public_pair.public_key_hex,
+                &private_pair.private_key_hex,
+                "controller-signing-rotation-validation"
+            ),
+            Err(IdentityError::InvalidSignature)
+        ));
+    }
+
+    #[test]
+    fn invalid_signing_material_error_does_not_echo_key_material() {
+        let error =
+            validate_signing_material_pair("not-hex-public-key", "PRIVATE KEY BODY", "challenge")
+                .unwrap_err();
+
+        let error_text = format!("{error}");
+        assert!(!error_text.contains("PRIVATE KEY BODY"));
+        assert!(!error_text.contains("not-hex-public-key"));
     }
 }

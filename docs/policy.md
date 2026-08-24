@@ -12,14 +12,16 @@
 - Scheduled drift check 대상과 다음 실행 시각을 저장한다.
 - Drift report는 latest와 history API로 구분해서 조회한다.
 - Drift report는 severity와 acknowledgement/resolution 상태를 가진다.
+- Controller scheduled drift worker가 due schedule을 drift-check job으로 생성한다.
 - Remediation은 자동 실행하지 않고 approval workflow로만 연결한다.
+- Web Admin에서 policy source 저장, policy list, selected agent direct assignment,
+  drift schedule 저장, drift latest/history 확인을 제공한다.
 
 이번 범위에서 제외한 것:
 
 - group/selector 자동 확장 assignment worker
-- scheduled drift worker가 실제 drift-check job을 자동 생성하는 루프
 - 자동 remediation 실행
-- Web Admin policy management 화면
+- saved selector/group rollout UI
 
 ## Policy Object
 
@@ -64,7 +66,25 @@ Validation:
 - `spec.selector.matchLabels`가 필요하다.
 - `spec.checks`가 최소 1개 필요하다.
 - 현재 check primitive는 service running, package present, file SHA-256이다.
+- `file.sha256` 값은 64자 lowercase hex SHA-256이어야 한다. 짧은 값,
+  uppercase hex, non-hex 문자는 domain parser에서 거부한다.
 - remediation이 선언되면 MVP에서는 `approvalRequired: true`가 필요하다.
+
+File checksum check:
+
+```yaml
+checks:
+  - id: rendered-template
+    file:
+      path: /etc/nginx/conf.d/sponzey.conf
+      sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+```
+
+`file.template` runbook execution이 보고한 rendered artifact checksum은 이
+`file.sha256` expected value로 사용할 수 있다. Drift check는 agent filesystem의
+현재 file bytes를 다시 읽어 SHA-256을 계산하고 expected value와 비교한다.
+Controller는 이 경로에서 rendered body나 template body를 저장하지 않으며,
+artifact metadata에서 policy를 자동 생성하지 않는다.
 
 ## Assignment
 
@@ -92,6 +112,9 @@ agent 목록에서 현재 배정된 policy id를 확인할 수 있다.
 
 Selector 기반 assignment는 domain type으로 방향만 열어두었고, 실제 rollout
 worker와 UI는 후속 task 범위다.
+
+Web Admin은 현재 selected agent에 대한 direct assignment를 제공한다. 여러 agent
+또는 saved selector/group에 policy를 rollout하는 제품형 화면은 아직 후속 범위다.
 
 ## Scheduled Drift
 
@@ -123,16 +146,19 @@ GET /api/drift/scheduled
 Authorization: Bearer <admin-token>
 ```
 
-현재 구현은 due schedule을 조회하고 저장소에서 `last_checked_at`와 다음
-`next_due_at`를 갱신할 수 있는 repository 경계를 제공한다. 실제 background
-worker가 due schedule을 읽어 drift-check job을 자동 생성하는 기능은 후속
-작업이다.
+Controller는 process bootstrap 이후 명시적으로 구성된 immutable settings와 store
+dependency를 사용해 scheduled drift worker를 시작한다. Worker는 due schedule을
+읽고, policy와 agent를 검증한 뒤, controller-signed drift-check job과 assignment를
+저장한다. Job/assignment 저장이 완료된 뒤에만 dispatch 대상이 되며, worker는
+runtime env를 다시 읽거나 process env를 변경하지 않는다.
 
 Missed schedule handling:
 
 - Domain helper는 `next_due_at`보다 현재 시간이 늦으면 due로 판단한다.
-- grace duration보다 늦은 schedule은 `missed=true`로 표시할 수 있다.
-- worker 구현 시 missed schedule은 audit 대상이다.
+- grace duration보다 늦은 schedule은 missed schedule로 audit에 남긴다.
+- Disabled agent schedule은 assignment를 만들지 않고 skip audit을 남긴 뒤 schedule
+  timestamp를 갱신한다.
+- Missing policy 또는 missing agent는 skip audit 대상이다.
 
 ## Drift Latest and History
 
@@ -167,8 +193,28 @@ Remediation은 자동 실행하지 않는다.
 현재 정책:
 
 - Policy에 remediation이 선언되면 `approvalRequired: true`가 필요하다.
-- Drift에서 remediation request를 만들 수 있다.
-- Remediation request는 approval request로 연결된다.
+- Domain/application layer는 `drifted` 상태의 drift report와 remediation이 선언된
+  policy에서 proposed remediation request를 만들 수 있다.
+- Remediation request state는 `proposed`, `pending_approval`, `approved`,
+  `job_created`, `running`, `succeeded_pending_verify`, `resolved`, `failed`,
+  `rejected`, `expired`, `canceled`로 제한한다.
+- `create_job` 전이는 `approved` 상태에서만 허용하고, `resolved` 전이는
+  `succeeded_pending_verify` 이후에만 허용한다.
+- Remediation proposal은 `remediation_requested` audit event를 남기고,
+  `remediation_requests` SQLite metadata table에 저장할 수 있다.
+- Application layer는 persisted remediation request를 `pending_approval`로
+  전이하며 approval request를 생성할 수 있다.
+- Approval 승인 이후에는 기존 signed runbook job/envelope 생성 경로를 사용해
+  job과 assignment를 만들고 remediation request를 `job_created` 상태와
+  `job_id`로 갱신할 수 있다. Runner/protocol에는 remediation 전용 우회 경로를
+  추가하지 않는다.
+- Job result가 성공하면 remediation request는 `succeeded_pending_verify`까지만
+  전이한다. 성공 result만으로 `resolved`를 기록하지 않는다.
+- Verification evidence가 remediation의 agent, policy, job과 exact match될 때만
+  remediation request를 `resolved`로 전이하고 latest drift report에
+  `resolution_job_id`를 기록할 수 있다.
+- Drift resolved correlation의 Controller API 연결, CLI/Web Admin remediation
+  queue/detail/result 화면은 후속 task 범위다.
 - Approval 없이 runbook을 자동 실행하지 않는다.
 - Remediation job 결과가 성공하면 latest drift report를 resolved 상태로 연결할 수 있다.
 
@@ -196,8 +242,10 @@ GET  /api/agents/{agent_id}/drift
 - `policy_saved`
 - `policy_assigned`
 - `scheduled_drift_configured`
+- `scheduled_drift_job_created`
+- `scheduled_drift_missed`
+- `scheduled_drift_skipped_missing_policy`
+- `scheduled_drift_skipped_missing_agent`
+- `scheduled_drift_skipped_disabled_agent`
 - `remediation_approval_requested`
 - `drift_resolved_by_remediation`
-
-Scheduled drift worker가 실제 자동 job 생성 루프를 갖게 되면 missed schedule,
-job creation, failure도 audit 대상이 된다.
