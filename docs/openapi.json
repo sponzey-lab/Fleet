@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Sponzey Fleet Controller API",
-    "version": "0.0.17",
+    "version": "0.0.18",
     "summary": "REST API for the Sponzey Fleet controller.",
     "description": "Sponzey Fleet exposes controller APIs for agent enrollment, inventory, job dispatch, snapshots, drift reports, and audit events. HTTP transport is supported only for local or short-lived tests. Use HTTPS for product, production, shared, or long-running environments because HTTP does not provide confidentiality or integrity."
   },
