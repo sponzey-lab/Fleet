@@ -284,6 +284,9 @@ SPONZEY_NPM_TOKEN_FILE=token.md ./scripts/npm_publish_current_platform.sh
 The script installs into a temporary npm prefix and verifies that `sponzey --help` runs through the installed wrapper.
 
 For full multi-platform npm publish, use the GitHub Actions workflow in
-`.github/workflows/npm-release.yml`. Store an npm automation token in the
-repository secret `NPM_TOKEN`, bump all package versions, then push a matching
-tag such as `v0.1.2`.
+`.github/workflows/npm-release.yml`. Configure npm Trusted Publisher for the
+wrapper and all four platform packages, bump all package versions, then push a
+matching new tag. The workflow authenticates with a short-lived GitHub Actions
+OIDC identity and does not require an `NPM_TOKEN` repository secret. See
+[`npm-trusted-publishing.md`](npm-trusted-publishing.md) for the exact package
+and publisher settings.

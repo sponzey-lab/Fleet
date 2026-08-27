@@ -3,6 +3,8 @@ const path = require("path");
 
 const root = path.join(__dirname, "..", "..");
 const wrapperPackage = require("../package.json");
+const expectedLicense = "AGPL-3.0-only";
+const expectedRepository = "git+https://github.com/sponzey-lab/Fleet.git";
 
 const expected = [
   ["@sponzey/fleet-darwin-arm64", "darwin", "arm64"],
@@ -44,6 +46,14 @@ for (const [name, os, cpu] of expected) {
   }
   if (!Array.isArray(packageJson.files) || !packageJson.files.includes("bin")) {
     console.error(`${dir} must publish the bin directory`);
+    process.exit(1);
+  }
+  if (packageJson.license !== expectedLicense) {
+    console.error(`${dir} license must be ${expectedLicense}`);
+    process.exit(1);
+  }
+  if (packageJson.repository?.url !== expectedRepository) {
+    console.error(`${dir} repository must be ${expectedRepository}`);
     process.exit(1);
   }
 }

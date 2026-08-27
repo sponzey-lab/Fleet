@@ -33,13 +33,14 @@ jobs:
       dry_run: ${{ steps.release.outputs.dry_run }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
 
       - name: Validate package metadata
         id: release
@@ -115,7 +116,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Build and stage npm platform package
         run: ./scripts/npm_stage_current_platform.sh --out-dir dist/npm
@@ -149,13 +150,17 @@ jobs:
       id-token: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Node.js for npm registry
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+
+      - name: Install npm with Trusted Publishing support
+        run: npm install --global npm@11
 
       - name: Download platform packages
         uses: actions/download-artifact@v4
@@ -197,7 +202,6 @@ jobs:
       - name: Publish platform packages, then wrapper
         shell: bash
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           NPM_TAG: ${{ needs.validate.outputs.npm_tag }}
           DRY_RUN: ${{ needs.validate.outputs.dry_run }}
         run: |
@@ -206,9 +210,6 @@ jobs:
           publish_flags=(--access public --tag "$NPM_TAG")
           if [[ "$DRY_RUN" == "true" ]]; then
             publish_flags+=(--dry-run)
-          elif [[ -z "${NODE_AUTH_TOKEN:-}" ]]; then
-            echo "NPM_TOKEN repository secret is required for a real publish." >&2
-            exit 1
           fi
 
           for package in \

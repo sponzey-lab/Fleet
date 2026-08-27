@@ -57,7 +57,13 @@ SPONZEY_NPM_TOKEN_FILE=token.md ./scripts/npm_publish_current_platform.sh
 ./scripts/manual_npm_registry_smoke.sh
 ```
 
-The publish script stages the current `target/release/sponzey` binary into the matching platform package, publishes that package first, then publishes this wrapper package. The wrapper package is what users install:
+This local/manual path uses a short-lived token file because npm Trusted
+Publishing is available only inside a configured cloud CI/CD workflow. The
+normal multi-platform release path uses GitHub Actions OIDC and does not use an
+`NPM_TOKEN` secret. The publish script stages the current
+`target/release/sponzey` binary into the matching platform package, publishes
+that package first, then publishes this wrapper package. The wrapper package is
+what users install:
 
 ```sh
 npm install -g @sponzey/fleet
@@ -101,9 +107,27 @@ sponzey upgrade --dry-run
 
 GitHub Actions release:
 
-1. Add an npm automation token as the repository secret `NPM_TOKEN`.
-2. Bump `Cargo.toml`, `Cargo.lock`, root `package.json`, `npm/fleet/package.json`, and every `npm/fleet-*/package.json` to the same version.
-3. Push a matching tag, for example `v0.0.16`.
+1. Configure npm Trusted Publisher for the wrapper and all four platform
+   packages using GitHub organization `sponzey-lab`, repository `Fleet`, and
+   workflow filename `npm-release.yml`.
+2. Allow `npm publish` for each Trusted Publisher configuration. Leave the npm
+   environment field empty unless the workflow job is updated to use the same
+   GitHub environment.
+3. Bump `Cargo.toml`, `Cargo.lock`, root `package.json`,
+   `npm/fleet/package.json`, and every `npm/fleet-*/package.json` to the same
+   version.
+4. Push a matching new tag.
 
-The `.github/workflows/npm-release.yml` workflow builds native platform packages on GitHub-hosted runners, publishes all platform packages first, and publishes this wrapper package last.
+See [npm Trusted Publishing](../../docs/npm-trusted-publishing.md) for the full
+package list and setup checklist. The `.github/workflows/npm-release.yml`
+workflow requests a short-lived OIDC identity, builds native platform packages
+on GitHub-hosted runners, publishes all platform packages first, and publishes
+this wrapper package last. No long-lived npm publish token is stored in GitHub.
 Linux release binaries are built on Ubuntu 22.04 to avoid requiring glibc 2.39 from Ubuntu 24.04.
+
+## License
+
+Sponzey Fleet and the distributed `sponzey` binaries are licensed under
+`AGPL-3.0-only`. See the repository
+[`LICENSE`](https://github.com/sponzey-lab/Fleet/blob/main/LICENSE) file and
+[license notes](https://github.com/sponzey-lab/Fleet/blob/main/docs/license.md).

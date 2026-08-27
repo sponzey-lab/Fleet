@@ -1,6 +1,6 @@
 {
   "name": "@sponzey/fleet-linux-x64",
-  "version": "0.0.16",
+  "version": "0.0.17",
   "description": "Sponzey Fleet Rust binary for Linux x64",
   "os": [
     "linux"
@@ -12,5 +12,9 @@
     "bin",
     "README.md"
   ],
-  "license": "Apache-2.0"
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sponzey-lab/Fleet.git"
+  },
+  "license": "AGPL-3.0-only"
 }

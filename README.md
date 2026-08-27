@@ -783,3 +783,10 @@ npm run build --workspace web-admin
 ./scripts/smoke_immediate_dispatch.sh
 ./scripts/smoke_remote_tls_loopback.sh
 ```
+
+## License
+
+Sponzey Fleet is licensed under the GNU Affero General Public License version 3
+only (`AGPL-3.0-only`). This applies to the Rust workspace, Web Admin, npm
+wrapper, and distributed `sponzey` binaries unless a file explicitly states a
+different license. See [LICENSE](LICENSE) and [docs/license.md](docs/license.md).
