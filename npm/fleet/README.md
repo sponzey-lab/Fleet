@@ -103,7 +103,7 @@ GitHub Actions release:
 
 1. Add an npm automation token as the repository secret `NPM_TOKEN`.
 2. Bump `Cargo.toml`, `Cargo.lock`, root `package.json`, `npm/fleet/package.json`, and every `npm/fleet-*/package.json` to the same version.
-3. Push a matching tag, for example `v0.0.15`.
+3. Push a matching tag, for example `v0.0.16`.
 
 The `.github/workflows/npm-release.yml` workflow builds native platform packages on GitHub-hosted runners, publishes all platform packages first, and publishes this wrapper package last.
 Linux release binaries are built on Ubuntu 22.04 to avoid requiring glibc 2.39 from Ubuntu 24.04.

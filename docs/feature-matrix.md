@@ -1,7 +1,7 @@
 # Sponzey Fleet Feature Matrix
 
 작성일: 2026-07-07
-기준 구현: v0.0.15 현재 워킹트리, `.tasks/phase005` 완료 작업 및 루트 `.tasks/plan.md` Post-MVP 계획 기준
+기준 구현: v0.0.16 현재 워킹트리, `.tasks/phase005` 완료 작업 및 루트 `.tasks/plan.md` Post-MVP 계획 기준
 
 상태 표기:
 
