@@ -242,11 +242,11 @@ MVP부터 반드시 들어갈 것:
 ```bash
 npm install -g @sponzey/fleet
 
-sponzey controller init
-sponzey controller start
+fleet controller init
+fleet controller start
 
-sponzey agent init --url https://fleet.example.com --token <enrollment-token>
-sponzey agent start
+fleet agent init --url https://fleet.example.com --token <enrollment-token>
+fleet agent start
 ```
 
 나중에 패키지를 분리할 수는 있지만, 실행 바이너리는 계속 단일 `sponzey`를 기본으로 한다.
@@ -282,8 +282,8 @@ web-admin/
 배포 원칙:
 
 - Rust workspace는 여러 crate로 나누지만 배포 바이너리는 `sponzey` 하나다.
-- Controller, Agent, CLI 역할은 `sponzey controller ...`, `sponzey agent ...`, `sponzey ...` subcommand로 선택한다.
-- `web-admin/dist`는 `sponzey controller start`가 서빙하는 static asset으로 embed하거나 release artifact로 같이 패키징한다.
+- Controller, Agent, CLI 역할은 `fleet controller ...`, `fleet agent ...`, `sponzey ...` subcommand로 선택한다.
+- `web-admin/dist`는 `fleet controller start`가 서빙하는 static asset으로 embed하거나 release artifact로 같이 패키징한다.
 - npm package는 현재 OS/arch에 맞는 `sponzey` Rust binary를 노출한다.
 - npm이 없는 운영 환경은 standalone binary, `.deb`, `.rpm`, Homebrew, Docker를 사용한다.
 
@@ -313,8 +313,8 @@ npx @sponzey/fleet demo
 
 ```bash
 npm install -g @sponzey/fleet
-sponzey controller init --data-dir ./sponzey-fleet
-sponzey controller start \
+fleet controller init --data-dir ./sponzey-fleet
+fleet controller start \
   --host 127.0.0.1 \
   --port 7700 \
   --data-dir ./sponzey-fleet \
@@ -325,12 +325,12 @@ sponzey controller start \
 
 ```bash
 npm install -g @sponzey/fleet
-sponzey controller init --data-dir /var/lib/sponzey-fleet
-sponzey controller start \
+fleet controller init --data-dir /var/lib/fleet
+fleet controller start \
   --host 0.0.0.0 \
   --port 7700 \
-  --data-dir /var/lib/sponzey-fleet \
-  --db sqlite:///var/lib/sponzey-fleet/controller/fleet.db \
+  --data-dir /var/lib/fleet \
+  --db sqlite:///var/lib/fleet/controller/fleet.db \
   --external-url https://fleet.example.com
 ```
 
@@ -349,22 +349,22 @@ PoC:
 
 ```bash
 npm install -g @sponzey/fleet
-sponzey agent init --url https://fleet.example.com --token <token>
-sponzey agent start
+fleet agent init --url https://fleet.example.com --token <token>
+fleet agent start
 ```
 
 운영:
 
 ```bash
 npm install -g @sponzey/fleet
-sudo sponzey agent init \
+sudo fleet agent init \
   --url https://fleet.example.com \
   --token <token> \
   --name web-01 \
   --labels role=web,env=prod,region=apne2
 
-sudo sponzey agent install-service
-sudo sponzey agent start-service
+sudo fleet agent install-service
+sudo fleet agent start-service
 ```
 
 운영 고려:
@@ -408,8 +408,8 @@ curl -fsSL https://get.sponzey.dev/fleet.sh | sudo bash -s -- \
 업데이트 명령:
 
 ```bash
-sponzey controller upgrade --to latest
-sponzey agent upgrade --channel latest
+fleet controller upgrade --to latest
+fleet agent upgrade --channel latest
 ```
 
 MVP에서는 자동 업데이트를 하지 않는다. v0.3 이후 agent policy 기반 staged rollout을 지원한다.
@@ -723,9 +723,9 @@ MVP는 “npm으로 controller와 agent를 설치하고, agent가 outbound로 �
 
 - `npm install -g @sponzey/fleet`
 - `npx @sponzey/fleet demo`
-- `sponzey controller init/start`
-- `sponzey agent init/start`
-- `sponzey agent install-service` for systemd
+- `fleet controller init/start`
+- `fleet agent init/start`
+- `fleet agent install-service` for systemd
 
 #### Controller
 
@@ -754,31 +754,31 @@ MVP는 “npm으로 controller와 agent를 설치하고, agent가 outbound로 �
 
 #### CLI
 
-- `sponzey login`
-- `sponzey agents list`
+- `fleet login`
+- `fleet agents list`
 - `sponzey fleet list`
-- `sponzey enroll-token create`
-- `sponzey agent install`
-- `sponzey run --selector role=web "uptime"`
-- `sponzey apply playbook.yml`
-- `sponzey facts web-01`
-- `sponzey logs nginx`
-- `sponzey logs web-01 --file /var/log/syslog`
-- `sponzey metrics web-01`
-- `sponzey drift check --policy nginx-running`
+- `fleet enroll-token create`
+- `fleet agent install`
+- `fleet run --selector role=web "uptime"`
+- `fleet apply playbook.yml`
+- `fleet facts web-01`
+- `fleet logs nginx`
+- `fleet logs web-01 --file /var/log/syslog`
+- `fleet metrics web-01`
+- `fleet drift check --policy nginx-running`
 
 초기 명령 alias:
 
 | 명령                           | 의미                                      | 실제 내부 동작                                                       |
 | ---------------------------- | --------------------------------------- | -------------------------------------------------------------- |
-| `sponzey agent install`      | agent 설치/등록/서비스화를 한 번에 처리               | `agent init` + `agent install-service` + `agent start-service` |
+| `fleet agent install`      | agent 설치/등록/서비스화를 한 번에 처리               | `agent init` + `agent install-service` + `agent start-service` |
 | `sponzey fleet list`         | fleet 대상 서버 목록 조회                       | `agents list`                                                  |
-| `sponzey run "uptime"`       | 기본 selector 전체 또는 현재 context 대상으로 명령 실행 | `run --selector <context> "uptime"`                            |
-| `sponzey apply playbook.yml` | YAML runbook 적용                         | `runbook apply playbook.yml`                                   |
-| `sponzey facts`              | 현재 context 대상 facts 조회                  | `facts --selector <context>`                                   |
-| `sponzey logs nginx`         | 서비스 로그 shortcut                         | systemd/journald 또는 configured log source tail                 |
-| `sponzey metrics`            | 현재 context metrics snapshot             | `metrics --selector <context>`                                 |
-| `sponzey drift check`        | policy 기준 drift 검사                      | `drift check --policy <default>`                               |
+| `fleet run "uptime"`       | 기본 selector 전체 또는 현재 context 대상으로 명령 실행 | `run --selector <context> "uptime"`                            |
+| `fleet apply playbook.yml` | YAML runbook 적용                         | `runbook apply playbook.yml`                                   |
+| `fleet facts`              | 현재 context 대상 facts 조회                  | `facts --selector <context>`                                   |
+| `fleet logs nginx`         | 서비스 로그 shortcut                         | systemd/journald 또는 configured log source tail                 |
+| `fleet metrics`            | 현재 context metrics snapshot             | `metrics --selector <context>`                                 |
+| `fleet drift check`        | policy 기준 drift 검사                      | `drift check --policy <default>`                               |
 
 #### UI
 
@@ -837,7 +837,7 @@ Phase 002의 핵심 방향:
 완료 기준:
 
 - `npm install -g` 후 `sponzey --help` 동작
-- `sponzey controller start`가 빈 API 서버 실행
+- `fleet controller start`가 빈 API 서버 실행
 - protocol message type이 Rust type과 문서로 정의됨
 
 산출물:
@@ -857,8 +857,8 @@ Phase 002의 핵심 방향:
 
 완료 기준:
 
-- `sponzey enroll-token create`로 토큰 발급
-- `sponzey agent init --url ... --token ...` 성공
+- `fleet enroll-token create`로 토큰 발급
+- `fleet agent init --url ... --token ...` 성공
 - UI/CLI에서 online agent 확인
 
 핵심 설계:
@@ -877,7 +877,7 @@ Phase 002의 핵심 방향:
 
 완료 기준:
 
-- `sponzey run --selector role=web "uptime"` 동작
+- `fleet run --selector role=web "uptime"` 동작
 - 서버별 output이 CLI와 UI에 실시간 표시
 - 실패/성공/타임아웃 상태가 저장
 
@@ -897,7 +897,7 @@ Phase 002의 핵심 방향:
 
 완료 기준:
 
-- `sponzey facts web-01` 출력
+- `fleet facts web-01` 출력
 - `--selector role=web,env=prod` 대상 선택
 - UI에서 agent facts와 labels 편집 가능
 
@@ -939,8 +939,8 @@ Phase 002의 핵심 방향:
 
 완료 기준:
 
-- `sponzey metrics web-01` 출력
-- `sponzey logs web-01 --file /var/log/syslog` streaming
+- `fleet metrics web-01` 출력
+- `fleet logs web-01 --file /var/log/syslog` streaming
 - UI에서 최근 metrics snapshot 확인
 
 주의:
@@ -1087,8 +1087,8 @@ Rust workspace:
 
 - `fleet-core`: 공통 domain model, errors, config
 - `fleet-protocol`: agent-controller message schema
-- `fleet-controller`: `sponzey controller`가 사용하는 API server, agent gateway, scheduler library
-- `fleet-agent`: `sponzey agent`가 사용하는 daemon, task runner, facts/metrics/logs/drift collector library
+- `fleet-controller`: `fleet controller`가 사용하는 API server, agent gateway, scheduler library
+- `fleet-agent`: `fleet agent`가 사용하는 daemon, task runner, facts/metrics/logs/drift collector library
 - `fleet-runner`: command/package/service/file primitive 실행
 - `fleet-store`: SQLite/Postgres storage abstraction
 - `fleet-cli`: 단일 제품 바이너리 `sponzey`와 subcommand UX
@@ -1340,17 +1340,17 @@ npx @sponzey/fleet demo
 
 ```bash
 npm install -g @sponzey/fleet
-sponzey controller init
-sponzey controller start
-sponzey enroll-token create --labels env=dev
+fleet controller init
+fleet controller start
+fleet enroll-token create --labels env=dev
 ```
 
 원격 서버:
 
 ```bash
 npm install -g @sponzey/fleet
-sudo sponzey agent init --url https://fleet.example.com --token <token> --labels role=web
-sudo sponzey agent install-service
+sudo fleet agent init --url https://fleet.example.com --token <token> --labels role=web
+sudo fleet agent install-service
 ```
 
 보여줄 것:
@@ -1363,8 +1363,8 @@ sudo sponzey agent install-service
 ### Demo 3. Drift and remediation
 
 ```bash
-sponzey policy apply nginx-running.yml
-sponzey drift check --selector role=web
+fleet policy apply nginx-running.yml
+fleet drift check --selector role=web
 ```
 
 보여줄 것:

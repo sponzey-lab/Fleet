@@ -54,10 +54,10 @@ manifest signature도 검증한다.
 ./scripts/verify_release_signature.sh dist/release ./release-public-key.pem
 ```
 
-`target/release/sponzey`가 존재하면 Linux release binary는 glibc baseline도 확인한다.
+`target/release/fleet`가 존재하면 Linux release binary는 glibc baseline도 확인한다.
 
 ```bash
-./scripts/check_linux_glibc_baseline.sh target/release/sponzey
+./scripts/check_linux_glibc_baseline.sh target/release/fleet
 ```
 
 ## One Command Gate
@@ -104,7 +104,7 @@ npm registry publish 이후 실제 global install 경로를 확인한다.
 문서 갱신 task에서는 아래 scan을 반드시 확인한다.
 
 ```bash
-rg -n --glob '!docs/release-gate.md' "dev-insecure-loopback|insecure remote HTTP|planned release package|sponzey agent enroll|agent enroll --" README.md README.ko.md PROJECT.md docs npm
+rg -n --glob '!docs/release-gate.md' "dev-insecure-loopback|insecure remote HTTP|planned release package|fleet agent enroll|agent enroll --" README.md README.ko.md PROJECT.md docs npm
 ```
 
 허용 가능한 결과:
@@ -117,7 +117,7 @@ rg -n --glob '!docs/release-gate.md' "dev-insecure-loopback|insecure remote HTTP
 - 현재 getting started 경로에 존재하지 않는 옵션이 남은 경우
 - HTTP 원격 사용 정책이 현재 구현과 반대로 설명된 경우
 - 이미 publish되는 platform package를 planned로 설명하는 경우
-- 현재 권장 UX인 `agent init` 대신 `sponzey agent enroll`을 기본 예시로 사용하는 경우
+- 현재 권장 UX인 `agent init` 대신 `fleet agent enroll`을 기본 예시로 사용하는 경우
 
 ## Current-State Review Scan
 
@@ -158,7 +158,7 @@ signature smoke가 포함되어야 한다. 해당 smoke가 빠지면 release 후
 | Gate | Owning phase | Required validation shape |
 | --- | --- | --- |
 | Template/artifact gate | Phase 1 | template render/checksum/artifact metadata contract test and smoke |
-| Remediation lifecycle gate | Phase 2 | remediation request/approval/job/result/audit integration test |
+| Remediation lifecycle gate | Phase 2 | remediation request/approval/job/result/audit integration test, verification report/result order convergence, fresh evidence/agent-policy-version-job mismatch rejection, origin-only resolution, and SQLite/Postgres atomic rollback contract |
 | Postgres store gate | Phase 3 | shared repository contract for SQLite and Postgres |
 | Artifact retention gate | Phase 4 | local `ArtifactStore` checksum and retention class smoke |
 | mTLS/key rotation gate | Phase 5 | TLS loopback with certificate/key rotation state tests |

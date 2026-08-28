@@ -235,6 +235,13 @@ export function createApiClient({ fetchImpl = globalThis.fetch, tokenProvider = 
     listAudit() {
       return request("/api/audit");
     },
+    exportAudit({ category = "", limit = 50, before = "" } = {}) {
+      const query = new URLSearchParams();
+      if (category) query.set("category", category);
+      query.set("limit", String(limit));
+      if (before) query.set("before", before);
+      return request(`/api/audit/export?${query.toString()}`);
+    },
     listEnrollmentTokens() {
       return request("/api/enrollment-tokens");
     },

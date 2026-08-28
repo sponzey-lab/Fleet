@@ -3,14 +3,14 @@ set -eu
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 REPO_ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)"
-BIN="$REPO_ROOT/target/debug/sponzey"
+BIN="$REPO_ROOT/target/debug/fleet"
 
 if [ ! -x "$BIN" ]; then
   cargo build --manifest-path "$REPO_ROOT/Cargo.toml" -p fleet-cli
 fi
 
 if [ "$#" -eq 0 ]; then
-  set -- --data-dir .sponzey
+  set -- --data-dir .fleet
 fi
 
 case "${1:-}" in
@@ -28,7 +28,7 @@ case "${1:-}" in
       exec "$BIN" controller --help
     fi
     cat >&2 <<EOF
-ERROR: run_agent.sh wraps only 'sponzey agent start'
+ERROR: run_agent.sh wraps only 'fleet agent start'
 
 For controller commands, use:
 
@@ -47,7 +47,7 @@ for arg in "$@"; do
   esac
 done
 
-DATA_DIR=".sponzey"
+DATA_DIR=".fleet"
 PREV=
 for arg in "$@"; do
   if [ "$PREV" = "--data-dir" ]; then

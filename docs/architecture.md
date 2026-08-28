@@ -18,7 +18,7 @@ Domain -> no outer layer dependency
 - `fleet-store` implements repository contracts and may depend on `fleet-domain` and `fleet-application`.
 - `fleet-controller` and `fleet-agent` are interface library crates used by the single product binary.
 - `fleet-cli` owns the only shipped binary target, `sponzey`.
-- Controller and agent roles are selected with `sponzey controller ...` and `sponzey agent ...`, not separate executables.
+- Controller and agent roles are selected with `fleet controller ...` and `fleet agent ...`, not separate executables.
 
 ## Current Fitness Check
 

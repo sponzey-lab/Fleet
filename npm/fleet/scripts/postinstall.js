@@ -42,8 +42,8 @@ function platformPackageName() {
 
 function platformBinaryCandidates(packageName) {
   return [
-    path.resolve(__dirname, "..", "node_modules", "@sponzey", packageName, "bin", "sponzey"),
-    path.resolve(__dirname, "..", "..", packageName, "bin", "sponzey"),
+    path.resolve(__dirname, "..", "node_modules", "@sponzey", packageName, "bin", "fleet"),
+    path.resolve(__dirname, "..", "..", packageName, "bin", "fleet"),
   ];
 }
 
@@ -52,7 +52,7 @@ function warn(message) {
 }
 
 function packageBinShim() {
-  return path.resolve(__dirname, "..", "bin", "sponzey");
+  return path.resolve(__dirname, "..", "bin", "fleet");
 }
 
 function ensureGlobalBinShim(binDir) {
@@ -61,7 +61,7 @@ function ensureGlobalBinShim(binDir) {
   }
 
   const source = packageBinShim();
-  const target = path.resolve(binDir, "sponzey");
+  const target = path.resolve(binDir, "fleet");
   if (fs.existsSync(target)) {
     return target;
   }
@@ -76,7 +76,7 @@ function ensureGlobalBinShim(binDir) {
       fs.chmodSync(target, 0o755);
       return target;
     } catch (copyError) {
-      warn(`could not create global sponzey launcher at ${target}: ${copyError.message}`);
+      warn(`could not create global fleet launcher at ${target}: ${copyError.message}`);
       warn(`original symlink error: ${error.message}`);
       return null;
     }
@@ -104,7 +104,7 @@ function createLauncher(source, target) {
 }
 
 function safePathLauncherDirs(binDir) {
-  const configured = (process.env.SPONZEY_FLEET_POSTINSTALL_LINK_DIRS || "")
+  const configured = (process.env.FLEET_POSTINSTALL_LINK_DIRS || "")
     .split(path.delimiter)
     .filter(Boolean)
     .map((entry) => path.resolve(entry));
@@ -123,13 +123,13 @@ function commandExistsOnPath(command) {
 }
 
 function ensurePathVisibleLauncher(binDir) {
-  if (!isGlobalInstall() || commandExistsOnPath("sponzey")) {
+  if (!isGlobalInstall() || commandExistsOnPath("fleet")) {
     return null;
   }
 
   const source = packageBinShim();
   for (const dir of safePathLauncherDirs(binDir)) {
-    const target = path.join(dir, "sponzey");
+    const target = path.join(dir, "fleet");
     const launcher = createLauncher(source, target);
     if (launcher) {
       return launcher;
@@ -145,16 +145,16 @@ const pathLauncher = binDirInPath ? null : ensurePathVisibleLauncher(binDir);
 if (binDir && !binDirInPath) {
   warn(`npm global bin is not in PATH: ${binDir}`);
   if (pathLauncher) {
-    console.warn(`Created PATH-visible sponzey launcher at: ${pathLauncher}`);
+    console.warn(`Created PATH-visible fleet launcher at: ${pathLauncher}`);
     console.warn("You can now run:");
-    console.warn("  sponzey --help");
+    console.warn("  fleet --help");
   }
   if (launcher) {
-    console.warn(`sponzey launcher installed at: ${launcher}`);
+    console.warn(`fleet launcher installed at: ${launcher}`);
     console.warn("Run it directly with:");
     console.warn(`  ${launcher} --help`);
   }
-  console.warn("Add it before running sponzey directly:");
+  console.warn("Add it before running fleet directly:");
   console.warn(`  export PATH="${binDir}:$PATH"`);
 }
 

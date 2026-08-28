@@ -28,6 +28,6 @@ fi
 mkdir -p "$PACK_DIR/package"
 tar -xzf "$TARBALL" -C "$PACK_DIR/package" --strip-components 1
 
-SPONZEY_FLEET_BIN="$REPO_ROOT/target/debug/sponzey" "$PACK_DIR/package/bin/sponzey" --help >/dev/null
+FLEET_BIN="$REPO_ROOT/target/debug/fleet" "$PACK_DIR/package/bin/fleet" --help >/dev/null
 
 echo "npm local pack smoke ok"

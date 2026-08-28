@@ -20,7 +20,7 @@ Planned 또는 Partial 항목은 다음 phase 번호를 기준으로 실행한�
 | --- | --- | --- | --- |
 | Template primitive / rendered artifact | Partial | Phase 1/4/5 | Plain-variable `file.template` parser/render/runner path, explicit SecretProvider-compatible resolver injection, TaskResult artifact metadata reporting, optional body persistence into local `ArtifactStore`, SQLite metadata storage, checksum drift contract, local `ArtifactStore` body contract, Controller artifact retrieval API, Web Admin artifact metadata/retrieval surface, typed `SecretRef`, application `SecretProvider` trait, disabled/static fake provider redaction tests, typed startup `SecretProviderSettings`, controller bootstrap provider factory, and agent runbook resolver handoff exist. Secret-backed template artifact body bytes are omitted by default. External adapters remain. |
 | Artifact metadata/store contract | Partial | Phase 4 | SQLite metadata table, controller metadata write path, filesystem-neutral `ArtifactStore` application contract, local filesystem implementation with checksum verification/path traversal rejection/delete contract, task result artifact body persistence, Controller artifact retrieval API, and Web Admin artifact metadata/retrieval surface exist. S3-compatible adapter remains. |
-| Policy-based remediation lifecycle | Partial | Phase 2 | Request state machine, SQLite metadata persistence, persisted approval request, approved signed runbook job creation, result state update, drift resolution verification, Controller API surface, thin CLI/Web Admin surface, and feature-gated Postgres repository/runtime adapter dispatch exist. Auto-remediation worker remains |
+| Policy-based remediation lifecycle | Partial | Phase 2 | Request state machine, SQLite metadata persistence, persisted approval request, approved signed runbook job creation, Controller task-event lifecycle reconciliation, and feature-gated Postgres repository/runtime adapter dispatch exist. Verified signed drifted reports atomically create one idempotent Proposed request with origin/audits. A successful remediation result atomically creates one correlated signed verification drift Job and queues it after commit when disconnected. Before listener readiness, a bounded startup scan reconciles correlation-free pending verification records and safely audits unverifiable legacy rows without dispatch. Successful verification plus fresh compliant evidence after remediation execution atomically resolves the remediation and only its origin drift, regardless of report/result delivery order. Legacy manual running/result/verify API and CLI commands are deprecated and return `409`; Web Admin displays persisted lifecycle state without manual transition controls. Approval-bypassing execution remains out of scope |
 | Postgres store | Partial | Phase 3 | `DatabaseSettings`, typed Postgres URL/SSL mode/connect timeout/pool parsing, blocking Postgres client pool boundary, minimum native TLS adapter for `sslmode=prefer/require`, SQLite shared repository contract harness, feature-gated Postgres migration skeleton, ignored integration migration test, repository slices through RemediationRequest, `ControllerStore`/`ControllerStoreRef` boundary, feature-gated Controller Postgres open/migration, direct server runtime adapter dispatch, typed job+assignment transaction boundary, and queued-only dispatch claim/release contract exist. Custom CA/client certificate rotation, scheduled drift/retention lease, and HA claim semantics are follow-up tasks |
 | S3-compatible artifact store | Planned | Phase 4/5 | Decision recorded; adapter implementation deferred until typed bootstrap `ArtifactStoreSettings`, external secret reference credential handling, feature-gated contract tests, and redaction tests are in place |
 | mTLS / certificate and key rotation | Partial | Phase 5 | `ControllerTrustSettings`, `TlsServerIdentitySettings`, `ControllerSigningIdentitySettings`, and `AgentClientCertificateTrust` separate TLS server identity, controller signing identity, and future agent client cert trust at startup. `--agent-client-ca-cert`/`agent_client_ca_cert_path` is parsed as explicit future mTLS trust material but rejected before serving requests until listener enforcement exists. Agent certificate lifecycle domain state machine, snapshot/restore boundary, application repository/use-case contract, SQLite/Postgres-shaped public metadata persistence foundation, public-only lifecycle update/ack protocol schema, controller ack observation/audit, internal controller update dispatch helper, admin protected status and issuance request API/CLI surfaces, and agent explicit rejection ack exist; issue/renew/activate/revoke public controller surfaces, agent-side certificate application, listener enforcement, revocation propagation, and runtime trust checks remain. Controller signing key rotation domain state machine, dual-trust decision policy, rotation-state persistence contract, application operation/audit boundary, signing material validation boundary, filesystem staging/swap boundary, bootstrap runtime guard, explicit signer selection context, agent-side controller signing trust bundle verification, trust-bundle update/ack protocol and session foundation, agent trust sidecar restart survival, read-only rotation status API/CLI, mutation API/CLI, restart-plan API/CLI, audited external restart-action API/CLI, admin-triggered trust-bundle rollout API/CLI, bounded retry coordinator API/CLI, already-current ack skip, staged rollout domain state machine/persistence/worker, and Web Admin staged rollout surface exist. In-process hot reload/self-restart is not a current product path without a future ADR and reload state machine |
@@ -41,7 +41,7 @@ Planned 또는 Partial 항목은 다음 phase 번호를 기준으로 실행한�
 
 | 기능 | 상태 | 현재 기준 |
 | --- | --- | --- |
-| 단일 `sponzey` 바이너리의 controller subcommand | Implemented | `sponzey controller init/start` |
+| 단일 `sponzey` 바이너리의 controller subcommand | Implemented | `fleet controller init/start` |
 | controller data directory 초기화 | Implemented | key, admin token hash, SQLite store 생성 |
 | Web Admin static serving | Implemented | `/admin` |
 | OpenAPI JSON과 Swagger UI | Implemented | `/openapi.json`, `/swagger-ui` |
@@ -64,14 +64,14 @@ Planned 또는 Partial 항목은 다음 phase 번호를 기준으로 실행한�
 
 | 기능 | 상태 | 현재 기준 |
 | --- | --- | --- |
-| Agent enrollment/init | Implemented | `sponzey agent init`, alias `enroll` |
+| Agent enrollment/init | Implemented | `fleet agent init`, alias `enroll` |
 | Persistent outbound WebSocket session | Implemented | heartbeat와 task dispatch 분리 |
 | Reconnect 지속 시도 | Implemented | `--once`, `--max-reconnect-attempts`로 변경 가능 |
 | Controller fingerprint pinning | Implemented | enrollment 이후 controller identity 확인 |
 | Signed task envelope 검증 | Implemented | signature, expiry, replay, target 검증 |
 | Command task 실행 | Implemented | output chunk와 result 전송 |
 | Command cancel/timeout process boundary | Implemented | cancel/timeout 시 runner가 child process kill 후 status 보고 |
-| Runbook primitive 실행 | Partial | package/service/file.copy와 plain-variable/secret-ref file.template 실행 경로 존재. Secret-backed rendering uses explicit agent resolver handoff and omits artifact body bytes by default. `sponzey apply` remains validation-only and does not resolve secrets. file.template은 TaskResult artifact metadata와 optional non-secret rendered body를 controller에 보고한다. Local `ArtifactStore` body persistence, Controller retrieval API, Web Admin artifact surface, typed `SecretRef`, and application `SecretProvider` contract exist |
+| Runbook primitive 실행 | Partial | package/service/file.copy와 plain-variable/secret-ref file.template 실행 경로 존재. Secret-backed rendering uses explicit agent resolver handoff and omits artifact body bytes by default. `fleet apply` remains validation-only and does not resolve secrets. file.template은 TaskResult artifact metadata와 optional non-secret rendered body를 controller에 보고한다. Local `ArtifactStore` body persistence, Controller retrieval API, Web Admin artifact surface, typed `SecretRef`, and application `SecretProvider` contract exist |
 | Drift check assignment 실행 | Implemented | signed drift job dispatch. File SHA-256 policy checks require 64-char lowercase hex and can use rendered template artifact checksum as expected value |
 | Facts 수집 | Implemented | static inventory payload, memory/disk usage 제외, disk/partition/mount/network inventory 포함 |
 | Metrics 수집 | Implemented | usage telemetry snapshot |
@@ -96,8 +96,8 @@ Planned 또는 Partial 항목은 다음 phase 번호를 기준으로 실행한�
 | Approval queue | Implemented | pending approvals, approve/reject, expire due |
 | Target preview | Implemented | selector preview endpoint와 Web Admin command/runbook job 생성 전 preview, warning, selected/disabled/offline count 표시 |
 | Runbook catalog/validate UI | Partial | runbook job creation and result status 존재. Phase 7에서 Git catalog/revision/activation UI |
-| Policy assignment API | Implemented | policy source 저장, direct agent assignment, schedule 저장/조회. Remediation request state machine, persistence, approval-to-job, and result verification application path exist; API surface remains Phase 2 |
-| Policy assignment UI | Implemented | policy save/list, selected-agent assignment, drift schedule. Remediation request queue/detail UI remains Phase 2 |
+| Policy assignment API | Implemented | policy source 저장, direct agent assignment, schedule 저장/조회. Verified signed drifted evidence가 Proposed remediation request를 원자적으로 생성하며, TaskStarted/TaskResult가 persisted remediation lifecycle을 반영하고 success가 correlated signed verification Job을 생성한다. successful verification과 fresh-compliant evidence는 remediation과 origin drift를 원자적으로 resolve하며 startup recovery도 구현됐다. legacy manual lifecycle API는 `409` deprecated contract다 |
+| Policy assignment UI | Implemented | policy save/list, selected-agent assignment, drift schedule와 persisted proposal/approval/running/pending verify/resolved lifecycle queue/detail을 표시한다. manual running/result/verify control은 제공하지 않는다 |
 
 ## CLI
 
@@ -114,7 +114,7 @@ Planned 또는 Partial 항목은 다음 phase 번호를 기준으로 실행한�
 | `apply` | Partial | validation-only. Phase 7 catalog activation과 별도이며 execution은 signed job path만 사용 |
 | `retention cleanup` | Implemented | explicit cleanup |
 | `audit export` | Implemented | category filter, cursor paging, JSONL renderer |
-| `login`/admin profile | Implemented | `.sponzey/cli-profile.json`, owner-only permission check, remote operator commands |
+| `login`/admin profile | Implemented | `.fleet/cli-profile.json`, owner-only permission check, remote operator commands |
 | `upgrade` | Partial | dry-run upgrade policy inspection only. Phase 9에서 signed staged update policy |
 
 ## Packaging

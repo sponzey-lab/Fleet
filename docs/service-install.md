@@ -5,28 +5,28 @@ Service installation supports dry-run rendering everywhere and guarded systemd w
 ## Commands
 
 ```bash
-sponzey controller install-service --data-dir /var/lib/sponzey-fleet --dry-run
-sponzey agent install-service --data-dir /var/lib/sponzey-fleet --dry-run
-sponzey controller start-service --dry-run
-sponzey agent start-service --dry-run
-sponzey controller restart-service --dry-run
-sponzey controller status-service --dry-run
-sponzey agent status-service --dry-run
-sponzey controller logs-service --lines 50 --dry-run
-sponzey agent logs-service --lines 50 --dry-run
-sponzey controller uninstall-service --dry-run
-sponzey agent uninstall-service --dry-run
+fleet controller install-service --data-dir /var/lib/fleet --dry-run
+fleet agent install-service --data-dir /var/lib/fleet --dry-run
+fleet controller start-service --dry-run
+fleet agent start-service --dry-run
+fleet controller restart-service --dry-run
+fleet controller status-service --dry-run
+fleet agent status-service --dry-run
+fleet controller logs-service --lines 50 --dry-run
+fleet agent logs-service --lines 50 --dry-run
+fleet controller uninstall-service --dry-run
+fleet agent uninstall-service --dry-run
 ```
 
-Without `--dry-run`, `install-service` writes `/etc/systemd/system/sponzey-fleet-controller.service` or `/etc/systemd/system/sponzey-fleet-agent.service`, then runs `systemctl daemon-reload` and `systemctl enable ...`. `start-service` runs `systemctl start ...`. `restart-service` runs `systemctl restart ...` for the controller service. `status-service` runs `systemctl status ... --no-pager`. `logs-service` runs `journalctl -u ... --no-pager -n <lines>`. `uninstall-service` runs `systemctl disable --now ...`, removes the service file, then runs `systemctl daemon-reload`.
+Without `--dry-run`, `install-service` writes `/etc/systemd/system/fleet-controller.service` or `/etc/systemd/system/fleet-agent.service`, then runs `systemctl daemon-reload` and `systemctl enable ...`. `start-service` runs `systemctl start ...`. `restart-service` runs `systemctl restart ...` for the controller service. `status-service` runs `systemctl status ... --no-pager`. `logs-service` runs `journalctl -u ... --no-pager -n <lines>`. `uninstall-service` runs `systemctl disable --now ...`, removes the service file, then runs `systemctl daemon-reload`.
 
 Non-Linux hosts fail with a clear Linux requirement. Install/start/uninstall
 operations require root. Status/log queries require Linux/systemd but do not
 require root. Dry-run never writes system files.
 
 For controller signing key rotation, record restart intent first through
-`sponzey controller signing-rotation restart-action --confirm-external-restart`,
-then run `sponzey controller restart-service`. The API records audit intent but
+`fleet controller signing-rotation restart-action --confirm-external-restart`,
+then run `fleet controller restart-service`. The API records audit intent but
 does not self-restart the HTTP handler or reload key material in-process.
 
 The MVP repository also provides foreground scripts for local development:
@@ -43,12 +43,74 @@ The HTTP example below is for local testing only. Product, customer,
 production, shared, or long-running environments must use HTTPS.
 
 ```bash
-./target/debug/sponzey controller init --data-dir .sponzey
-./scripts/run_controller.sh --host 127.0.0.1 --port 7700 --data-dir .sponzey --external-url http://127.0.0.1:7700
-TOKEN=$(./target/debug/sponzey enroll-token create --data-dir .sponzey --labels role=web,env=dev)
-./target/debug/sponzey agent init --data-dir .sponzey --url http://127.0.0.1:7700 --token "$TOKEN" --name web-01 --labels role=web,env=dev
-./scripts/run_agent.sh --data-dir .sponzey
+./target/debug/fleet controller init --data-dir .fleet
+./scripts/run_controller.sh --host 127.0.0.1 --port 7700 --data-dir .fleet --external-url http://127.0.0.1:7700
+TOKEN=$(./target/debug/fleet enroll-token create --data-dir .fleet --labels role=web,env=dev)
+./target/debug/fleet agent init --data-dir .fleet --url http://127.0.0.1:7700 --token "$TOKEN" --name web-01 --labels role=web,env=dev
+./scripts/run_agent.sh --data-dir .fleet
 ```
+
+## Migration from `.sponzey` and old systemd units
+
+New installations use `.fleet` locally, `/var/lib/fleet` for services, and
+`fleet-controller.service` / `fleet-agent.service`. The `fleet` binary can read
+an existing `.sponzey` data directory for backup, but it never moves or deletes
+that directory automatically. Do this migration during a maintenance window.
+
+1. Stop both old units and confirm they are inactive:
+
+   ```bash
+   sudo systemctl stop sponzey-fleet-agent.service sponzey-fleet-controller.service
+   sudo systemctl is-active sponzey-fleet-agent.service sponzey-fleet-controller.service
+   ```
+
+2. Create and retain a controller backup from the old directory. Do not place
+   the archive inside either data directory.
+
+   ```bash
+   fleet controller backup --data-dir /var/lib/sponzey-fleet \
+     --output ./fleet-before-path-migration.backup.json
+   ```
+
+3. Refuse to continue if the destination already contains data. Copy ownership,
+   permissions, and contents; do not use a move command or delete the source.
+
+   ```bash
+   sudo test ! -e /var/lib/fleet || sudo test -z "$(sudo find /var/lib/fleet -mindepth 1 -print -quit)"
+   sudo install -d -m 700 /var/lib/fleet
+   sudo cp -a /var/lib/sponzey-fleet/. /var/lib/fleet/
+   sudo diff -qr /var/lib/sponzey-fleet /var/lib/fleet
+   ```
+
+4. Validate the copied controller data before installing the new units:
+
+   ```bash
+   fleet controller backup --data-dir /var/lib/fleet \
+     --output ./fleet-after-path-migration.backup.json
+   fleet controller restore --data-dir /var/lib/fleet \
+     --input ./fleet-after-path-migration.backup.json --dry-run
+   ```
+
+5. Render and inspect the new units, then install and health-check them. Only
+   after the checks pass may you disable and remove the old units.
+
+   ```bash
+   sudo fleet controller install-service --data-dir /var/lib/fleet
+   sudo fleet agent install-service --data-dir /var/lib/fleet
+   sudo fleet controller start-service
+   sudo fleet agent start-service
+   sudo fleet controller status-service
+   sudo fleet agent status-service
+   sudo systemctl disable --now sponzey-fleet-agent.service sponzey-fleet-controller.service
+   sudo rm -f /etc/systemd/system/sponzey-fleet-agent.service /etc/systemd/system/sponzey-fleet-controller.service
+   sudo systemctl daemon-reload
+   ```
+
+If a copy check, restore dry-run, or health check fails, stop the new units,
+restore the old units, and start them against `/var/lib/sponzey-fleet`. Keep the
+old data and backup until the new services have operated successfully. CLI
+profiles are intentionally not copied: run `fleet login` again to create a new
+owner-only `.fleet/cli-profile.json`.
 
 ## Required Service Properties
 
@@ -75,7 +137,7 @@ After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/absolute/path/to/sponzey controller start --data-dir /var/lib/sponzey-fleet
+ExecStart=/absolute/path/to/fleet controller start --data-dir /var/lib/fleet
 Restart=on-failure
 
 [Install]
@@ -91,7 +153,7 @@ After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/absolute/path/to/sponzey agent start --data-dir /var/lib/sponzey-fleet
+ExecStart=/absolute/path/to/fleet agent start --data-dir /var/lib/fleet
 Restart=on-failure
 
 [Install]
@@ -153,18 +215,18 @@ scheduling are separate follow-up work.
 
 ## Upgrade Policy
 
-`sponzey upgrade` is intentionally a dry-run planning command in the current
+`fleet upgrade` is intentionally a dry-run planning command in the current
 release line. It does not replace the running binary or edit service files.
 
 ```bash
-sponzey upgrade --dry-run
-sponzey upgrade --channel beta --version 0.2.0-beta.1 --dry-run
+fleet upgrade --dry-run
+fleet upgrade --channel beta --version 0.2.0-beta.1 --dry-run
 ```
 
 The supported upgrade path is:
 
 1. Stop controller and agent services.
-2. Back up controller data with `sponzey controller backup`.
+2. Back up controller data with `fleet controller backup`.
 3. Download an npm package update or standalone release archive.
 4. Verify release artifact integrity with `SHA256SUMS` and, when published,
    `SHA256SUMS.sig`.

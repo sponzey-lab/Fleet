@@ -3,14 +3,14 @@ set -eu
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 REPO_ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)"
-BIN="$REPO_ROOT/target/debug/sponzey"
+BIN="$REPO_ROOT/target/debug/fleet"
 
 # Web Admin assets are embedded into the Rust binary with include_str!, so local
 # controller runs must rebuild to pick up HTML/CSS/JS changes.
 cargo build --manifest-path "$REPO_ROOT/Cargo.toml" -p fleet-cli
 
 if [ "$#" -eq 0 ]; then
-  set -- --host 127.0.0.1 --port 7700 --data-dir .sponzey --external-url http://127.0.0.1:7700
+  set -- --host 127.0.0.1 --port 7700 --data-dir .fleet --external-url http://127.0.0.1:7700
 fi
 
 case "${1:-}" in
@@ -41,7 +41,7 @@ case "${1:-}" in
       exec "$BIN" agent --help
     fi
     cat >&2 <<EOF
-ERROR: run_controller.sh wraps only 'sponzey controller start'
+ERROR: run_controller.sh wraps only 'fleet controller start'
 
 For agent commands, use:
 
@@ -60,7 +60,7 @@ for arg in "$@"; do
   esac
 done
 
-DATA_DIR=".sponzey"
+DATA_DIR=".fleet"
 PREV=
 for arg in "$@"; do
   if [ "$PREV" = "--data-dir" ]; then

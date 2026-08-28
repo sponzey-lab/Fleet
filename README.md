@@ -1,703 +1,456 @@
 # Sponzey Fleet
 
-[한국어 문서](README.ko.md)
+[한국어 설명서](README.ko.md)
 
-Sponzey Fleet is an agent-based server operations tool. It is distributed as one
-`sponzey` binary. The role is selected by the command you run.
+Sponzey Fleet lets you manage several computers from one place. You install the
+same `sponzey` program on every machine, then choose what that machine should do:
 
-```text
-sponzey controller ...
-sponzey agent ...
-sponzey enroll-token ...
-sponzey run ...
-sponzey demo
+- The **Controller** is the control center. It stores data, shows the Web Admin
+  page, signs jobs, and receives connections from agents.
+- An **Agent** runs on each managed computer. It connects to the Controller,
+  reports inventory and metrics, and runs jobs signed by the Controller.
+
+One Controller can manage many Agents. The Controller never needs to open an
+incoming connection to an Agent; every Agent connects outward to the Controller.
+
+> The npm package is named `@sponzey/fleet`, but the current command is
+> `sponzey`.
+
+## What you need
+
+For the easiest start, prepare:
+
+- macOS or Linux
+- Node.js and npm
+- a terminal window
+- a web browser
+
+Check that Node.js and npm are installed:
+
+```bash
+node --version
+npm --version
 ```
 
-The core runtime is Rust. The npm package only installs the Rust binary.
-
-## Simple Picture
-
-| Part       | Where it runs                           | What it does                                                                                       |
-| ---------- | --------------------------------------- | -------------------------------------------------------------------------------------------------- |
-| Controller | The machine operators open in a browser | Stores the database, serves Web Admin UI, creates enrollment tokens, receives agents, signs tasks. |
-| Agent      | Each machine you want to manage         | Connects to the controller, sends health/facts/metrics, runs controller-signed tasks.              |
-
-One controller can manage many agents.
-
-Important terms:
-
-| Term             | Meaning                                                                                                   |
-| ---------------- | --------------------------------------------------------------------------------------------------------- |
-| Data directory   | Folder where Sponzey stores keys, database, and local settings. Local examples use `.sponzey`.            |
-| Admin token      | Printed by `sponzey controller init`. Use it only for the Web Admin UI and protected APIs.                |
-| Enrollment token | Created by `sponzey enroll-token create`. Use it once when registering an agent.                          |
-| Controller URL   | Address agents use to reach the controller. The setup flow is the same whether the URL is local or HTTPS. |
-| Runbook          | A one-time YAML operation plan that becomes a signed job and runs ordered steps on selected agents.       |
-| Policy           | A saved desired-state document used to check drift and decide whether remediation should be requested.    |
-
-Facts and metrics mean different things:
-
-| Data    | Meaning                                                                                                                                                               |
-| ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Facts   | Mostly stable inventory, such as OS, architecture, hostname, CPU core count, memory total/modules, disk devices, mount layout, disk capacity, and network interfaces. |
-| Metrics | Time-series usage telemetry, such as CPU usage, memory usage, disk usage, process count, and service failure counts.                                                  |
+If either command is missing, install a current Node.js LTS release first.
 
 ## Install
 
+Install Sponzey Fleet globally so the `sponzey` command is available in every
+terminal:
+
 ```bash
 npm install -g @sponzey/fleet
-sponzey --help
+sponzey --version
 ```
 
-If `sponzey` is not found after installation, your npm global bin directory is
-not in `PATH`. The installer creates the npm global `sponzey` launcher when it
-can, and also tries to create a PATH-visible launcher in a safe writable bin
-directory such as `/usr/local/bin`. The installer does not silently edit shell
-profile files. If your shell still cannot find `sponzey`, check the npm bin
-directory with:
+If you install it only inside a project with `npm install @sponzey/fleet`, run it
+as `npx sponzey` instead.
+
+If the terminal says `sponzey: command not found`, inspect npm's global command
+directory:
 
 ```bash
 echo "$(npm prefix -g)/bin"
 ```
 
-Then add that directory to your shell `PATH`, for example:
+Add the printed directory to your shell `PATH`, then open a new terminal.
 
-```bash
-export PATH="$(npm prefix -g)/bin:$PATH"
-```
-
-From this source repository:
+To build directly from this repository:
 
 ```bash
 cargo build -p fleet-cli
-./target/debug/sponzey --help
+./target/debug/fleet --version
 ```
 
-If you use the source build, replace `sponzey` below with `./target/debug/sponzey`.
+When using the source build, replace `sponzey` in the examples below with
+`./target/debug/fleet`.
 
-### Install Paths
+## Try the one-command demo
 
-Use npm for the simplest developer and small-server install:
-
-```bash
-npm install -g @sponzey/fleet
-```
-
-Use standalone release archives when you do not want npm on the target host.
-Release archives are named:
-
-```text
-sponzey-darwin-arm64.tar.gz
-sponzey-darwin-x64.tar.gz
-sponzey-linux-arm64.tar.gz
-sponzey-linux-x64.tar.gz
-```
-
-Verify the archive checksum before installing. If the release publishes
-`SHA256SUMS.sig`, verify the signed checksum manifest with the pinned release
-public key before trusting the archive:
-
-```bash
-./scripts/verify_standalone_artifacts.sh dist/release
-./scripts/verify_release_signature.sh dist/release ./release-public-key.pem
-```
-
-The release workflow publishes `SHA256SUMS` with the archives. Signature
-verification signs that checksum manifest; the release public key must come from
-the project release channel, not from inside the downloaded archive.
-
-For long-running Linux hosts, install the resolved binary as a systemd service:
-
-```bash
-sponzey controller install-service --data-dir /var/lib/sponzey-fleet --dry-run
-sudo sponzey controller install-service --data-dir /var/lib/sponzey-fleet
-sponzey controller status-service --dry-run
-sponzey controller logs-service --dry-run
-```
-
-Agent services use the same shape with `sponzey agent install-service`.
-Service units pass explicit CLI arguments and do not patch process environment
-at runtime.
-
-Upgrade is currently an external package/artifact operation. Inspect the policy
-before replacing a binary:
-
-```bash
-sponzey upgrade --dry-run
-```
-
-Back up controller data before any upgrade that may touch controller storage.
-
-## Fastest Demo
+Before setting up real machines, run:
 
 ```bash
 sponzey demo
 ```
 
-This starts a temporary controller, enrolls a temporary agent, runs a sample job,
-and prints the Web Admin URL.
+The demo creates temporary Controller and Agent data, runs a small job, and
+prints a Web Admin URL. It removes the temporary data when it finishes.
 
-## API Documentation
+## Understand the three important values
 
-The Controller serves the operator UI at `/admin`. External REST API
-documentation is available as OpenAPI 3.1 JSON and Swagger UI:
+You will see these values during setup:
 
-```text
-GET /openapi.json
-GET /swagger-ui
-```
+| Value | What it is | Where to use it |
+| --- | --- | --- |
+| Admin token | The password for operators | Paste it into Web Admin or use it with protected CLI/API commands |
+| Enrollment token | A short-lived, usually one-time Agent registration code | Use it only with `fleet agent init` |
+| Data directory | A folder containing keys, settings, and Controller or Agent data | Use the same directory every time you start that role |
 
-Protected API calls use the admin token printed by `sponzey controller init` as
-a Bearer token. Do not use Swagger UI over HTTP except for local or short-lived
-tests because tokens and request payloads are not encrypted. The detailed API
-contract, public/internal endpoint boundary, pagination shape, and deprecation
-policy are maintained in [docs/api.md](docs/api.md). The agent WebSocket
-protocol is documented separately in [docs/protocol.md](docs/protocol.md).
+The admin token and enrollment token are different. Do not use one in place of
+the other.
 
-For repeated CLI operations, store the controller endpoint and admin token in a
-local profile:
+## Beginner setup: Controller and Agent on one computer
 
-```bash
-sponzey login --controller-url https://fleet.example.com --admin-token <admin-token>
-sponzey agents remote-list
-sponzey selectors preview --selector role=web
-sponzey jobs list
-sponzey approvals list
-sponzey audit export --category security --limit 100 > audit-security.jsonl
-```
+This is the safest way to learn. You will use two terminal windows on the same
+computer.
 
-The default profile path is `.sponzey/cli-profile.json`. Treat it as a secret:
-the CLI writes it with owner-only permissions and protected remote commands
-refuse group/world-readable profile files. Command flags such as
-`--controller-url` and `--admin-token` override the profile for that one
-process only.
+### Step 1: initialize the Controller
 
-The current bootstrap admin token maps to the `bootstrap-admin` actor with the
-`owner` role. Minimal role and permission boundaries are documented in
-[docs/security.md](docs/security.md).
-
-Current implementation status is tracked in
-[docs/feature-matrix.md](docs/feature-matrix.md). Release verification commands
-and required smoke checks are tracked in [docs/release-gate.md](docs/release-gate.md).
-
-## Transport Safety Warning
-
-HTTP controller URLs are supported for setup checks, local development, lab
-testing, and short-lived validation only. Treat HTTP as a test-only transport.
-
-For any product, customer, production, shared, or long-running environment, you
-must use HTTPS. If you choose to run Sponzey over HTTP, controller-agent traffic
-is not encrypted. HTTP transport provides no confidentiality or integrity
-guarantee and can expose tokens, commands, operational data, and traffic to
-man-in-the-middle attacks.
-
-## Pick Your Values First
-
-The setup steps are always the same. The examples below use local values so you
-can copy them first:
-
-```text
-DATA_DIR:        .sponzey
-CONTROLLER_URL: http://127.0.0.1:7700
-```
-
-When you move to a real remote controller, change only the values:
-
-- Use a production data directory such as `/var/lib/sponzey-fleet`.
-- Use a controller URL such as `http://192.168.0.10:7700` or `https://fleet.example.com`.
-- Use `http://` only for tests. Use `https://` for product or production use.
-- If the controller URL starts with `http://`, Sponzey prints a warning every time because controller-agent traffic is not encrypted.
-- If you want HTTPS, finish [HTTPS Preparation](#https-preparation) first.
-
-## One Setup Flow
-
-Use this same order for local testing, SSH tunnel development, test-only HTTP
-remote use, and HTTPS remote use. The commands here are the local copy-and-paste
-version. For a real remote controller, replace only the data directory,
-controller URL, name, labels, and token.
-
-### 1. Initialize The Controller
-
-Run once on the controller machine:
+Open the first terminal and run:
 
 ```bash
-sponzey controller init --data-dir .sponzey
+mkdir -p sponzey-controller
+fleet controller init --data-dir ./sponzey-controller
 ```
 
-Copy the `admin token` printed by this command. You will paste it into the Web
-Admin UI.
+The command prints an `admin token`. Copy it into a password manager or another
+safe temporary place. The Controller stores only its hash and does not show the
+same raw token again.
 
-### 2. Start The Controller
+Initialization is normally done only once.
+
+### Step 2: start the Controller
+
+In the same terminal, run:
 
 ```bash
-sponzey controller start \
+fleet controller start \
   --host 127.0.0.1 \
   --port 7700 \
-  --data-dir .sponzey \
+  --data-dir ./sponzey-controller \
   --external-url http://127.0.0.1:7700
 ```
 
-Keep the controller terminal open.
+Leave this terminal open. The Controller stops if you press `Ctrl+C` or close
+the terminal.
 
-### 3. Open Web Admin
+`http://` is acceptable for this same-computer lesson only. Sponzey prints a
+warning to remind you that HTTP is not encrypted.
 
-Open the controller URL with `/admin` at the end.
+### Step 3: open Web Admin
+
+Open this address in your browser:
 
 ```text
 http://127.0.0.1:7700/admin
 ```
 
-Paste the admin token from step 1.
+Paste the admin token from Step 1. You should now see Web Admin, even though no
+Agent is connected yet.
 
-The Web Admin surface shows agent inventory, selected agent details, facts,
-disk and mount inventory, metrics charts with a range selector, drift latest
-and history, agent operational logs, job output, per-target assignment state,
-pending approvals, enrollment tokens, policy assignment, runbook job creation,
-audit events, and an HTTP transport warning banner when opened over HTTP.
+### Step 4: create an Agent enrollment token
 
-### 4. Create An Enrollment Token
-
-Run this on the controller machine:
+Open a second terminal. Run this command while the Controller remains running:
 
 ```bash
-TOKEN=$(sponzey enroll-token create \
-  --data-dir .sponzey \
-  --labels role=web,env=dev)
+fleet enroll-token create \
+  --data-dir ./sponzey-controller \
+  --labels role=test,env=local
 ```
 
-This token is for the agent. It is not the admin token.
+Copy the token printed by the command. This is the enrollment token, not the
+admin token. You can also create enrollment tokens from Web Admin.
 
-You can also print a ready-to-run agent command:
+### Step 5: initialize the Agent
 
-```bash
-sponzey enroll-token create \
-  --data-dir .sponzey \
-  --labels role=web,env=dev \
-  --controller-url http://127.0.0.1:7700 \
-  --name web-01 \
-  --print-init-command
-```
-
-### 5. Initialize The Agent
-
-Run once on the agent machine:
+In the second terminal, replace `PASTE_ENROLLMENT_TOKEN_HERE` with the token from
+Step 4, then run:
 
 ```bash
-sponzey agent init \
-  --data-dir .sponzey \
+mkdir -p sponzey-agent
+fleet agent init \
+  --data-dir ./sponzey-agent \
   --url http://127.0.0.1:7700 \
-  --token "$TOKEN" \
-  --name web-01 \
-  --labels role=web,env=dev
+  --token PASTE_ENROLLMENT_TOKEN_HERE \
+  --name my-first-agent \
+  --labels role=test,env=local
 ```
 
-### 6. Start The Agent
+Agent initialization creates an Agent identity and pins the Controller identity.
+It is normally done only once per Agent data directory.
 
-For a one-time check:
+### Step 6: start the Agent
+
+Run:
 
 ```bash
-sponzey agent start \
-  --data-dir .sponzey \
-  --once
+fleet agent start --data-dir ./sponzey-agent
 ```
 
-For a continuous local agent:
+Leave this terminal open too. Refresh Web Admin. `my-first-agent` should appear
+in the Agent list.
+
+To perform only one connection check and exit, use:
 
 ```bash
-sponzey agent start \
-  --data-dir .sponzey
+fleet agent start --data-dir ./sponzey-agent --once
 ```
 
-Refresh Web Admin. The agent should appear in the agent list.
+The normal Agent keeps reconnecting when the network or Controller is briefly
+unavailable.
 
-`agent start` is meant to stay alive. If the controller is temporarily down or
-the network is unavailable, it keeps retrying by default. Use `--once` for a
-single smoke check, or `--max-reconnect-attempts <N>` when you explicitly want
-the process to exit after repeated connection failures.
+## Real setup: Controller and Agent on different computers
 
-By default, the agent also uploads product-safe operational log chunks every
-30 seconds. These are agent status events, not raw system log files. Change the
-interval with `--log-upload-interval-seconds <SECONDS>`, or disable this upload
-with `--disable-log-upload`.
+The order is the same, but the Agent must use the Controller computer's real IP
+address or DNS name.
 
-Heartbeat, facts, metrics, and operational logs have separate intervals.
-Heartbeat is only the liveness tick and does not control task dispatch. Static
-inventory facts default to every 300 seconds with `--facts-interval-seconds`.
-Usage metrics default to every 30 seconds with `--metrics-interval-seconds`.
-Task assignments are pushed on the persistent session independently from those
-telemetry intervals.
+The examples below use `192.168.0.10` as the Controller address. Replace it with
+your own value.
 
-## Runbooks And Policies
+### Step 1: find the Controller computer's address
 
-Runbooks and policies solve different problems.
-
-| Feature | Use it when you want to                                                                                                                          | What happens                                                                                                                                                   |
-| ------- | ------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Runbook | Execute an ordered operation once, such as collecting local facts, checking a port, installing a package, starting a service, or copying a file. | The controller validates the YAML, creates a signed runbook job, waits for approval when required, then dispatches it to the selected agent session.           |
-| Policy  | Define what a machine should look like over time, such as "nginx should be running on web agents".                                               | The controller stores the policy source, can assign it to agents, can store drift schedules, and drift checks compare actual state against that desired state. |
-
-### Runbooks
-
-A runbook is a small Sponzey YAML document for repeatable operational steps. It
-is not an Ansible playbook and does not try to be Ansible-compatible. The goal is
-predictable execution and audit: every runbook becomes a job with assignment
-state, output chunks, result status, approval events, and audit events.
-
-Minimal runbook:
-
-```yaml
-apiVersion: fleet.sponzey.dev/v1alpha1
-kind: Runbook
-name: quick-inventory
-matchLabels:
-  role: web
-steps:
-  - id: collect-facts
-    facts.collect: {}
-```
-
-Common supported steps include:
-
-- `facts.collect` and `metrics.snapshot` for read-only snapshots.
-- `port.check` and `process.check` for read-only checks.
-- `package`, `service`, and `file.copy` for controlled idempotent mutations.
-
-Important behavior:
-
-- `sponzey apply <file>` validates a runbook locally. It does not execute remote
-
-  privileged changes.
-- `POST /api/jobs/runbook` and the Web Admin Runbooks panel create the actual
-
-  controller-signed execution job.
-- Runbook jobs are treated as high-risk because one document can contain several
-
-  mutation steps. Approval is required before dispatch when the controller marks
-  the job as `pending_approval`.
-- If a runbook request specifies `target_agent_ids`, `selector`, or
-
-  `matchLabels`, those request targets win. If the request does not specify a
-  target, the controller uses the selector inside the runbook document.
-- `dryRun: true` skips every primitive. `checkMode: true` allows read-only checks
-
-  but skips mutation steps.
-
-In Web Admin, either select one agent or enter a target selector in the Runbooks
-panel and use "Preview targets" before creating the job. The preview comes from
-the controller selector API and shows matched, dispatchable, disabled, and
-offline counts. Check the confirmation box, create the runbook job, and approve
-it from the Approvals panel when required. The job output and target assignment
-state appear in the Run and Jobs areas.
-
-See [docs/runbooks.md](docs/runbooks.md) for the full schema, primitive list,
-idempotency rules, and signed dispatch details.
-
-### Policies
-
-A policy is a desired-state document. It answers "what should be true for this
-agent or group of agents?" rather than "run these steps right now".
-
-Minimal policy:
-
-```yaml
-apiVersion: fleet.sponzey.dev/v1alpha1
-kind: Policy
-metadata:
-  id: policy-nginx-running
-  name: nginx-running
-  version: 1
-spec:
-  selector:
-    matchLabels:
-      role: web
-  checks:
-    - id: nginx-service
-      service:
-        name: nginx
-        state: running
-  schedule:
-    intervalSeconds: 300
-  remediation:
-    runbookRef: runbooks/nginx-restart.yml
-    approvalRequired: true
-```
-
-Current policy behavior:
-
-- Policies are stored as source documents after domain validation.
-- Web Admin can save policies, list policies, assign a selected policy directly
-
-  to a selected agent, and store a drift interval for that policy-agent pair.
-- Agent inventory includes assigned policy ids.
-- Drift reports can be viewed as latest and paged history.
-- A policy does not change a host by itself. Remediation must go through an
-
-  approval workflow and a runbook-style execution path.
-- Scheduled drift entries are stored and queried. The controller scheduled
-
-  drift worker creates signed due drift-check jobs automatically; create an
-  explicit drift-check job when you need an immediate out-of-cycle check.
-
-In Web Admin, paste a policy into the Policies panel and save it. Select an
-agent, select the policy, then use "Assign selected policy" to attach it to that
-agent. Set "Drift interval seconds" and schedule drift when you want the
-controller to remember the intended check cadence. Use the Drift area to inspect
-the latest report and history.
-
-See [docs/policy.md](docs/policy.md) and [docs/api.md](docs/api.md) for the
-policy API, drift report fields, and current scheduling boundary.
-
-## How Run Works
-
-The controller does not open a connection to an agent. Each agent opens one
-outbound persistent WebSocket session to the controller after enrollment.
-
-When you run a command from Web Admin or `sponzey run`, the controller first
-stores the job and its signed task assignment. If the target agent is currently
-connected, the controller pushes the task immediately over that existing
-session. The run path does not wait for the next heartbeat. Heartbeat is only a
-liveness signal.
-
-If the target agent is offline, the job stays queued. When the agent reconnects
-and authenticates again, the controller drains pending assignments for that
-agent and pushes the next task over the renewed session.
-
-The agent returns `output_chunk` messages and one `task_result` over the same
-session. Web Admin polls the job detail and output APIs as a fallback display
-path, so the UI can show queued, delivered, running, completed, and no-output
-states without embedding raw command output in product logs.
-
-Revoking an agent key disables the agent, closes any active session with the
-`agent_revoked` reason, and blocks additional task delivery. Revoke is not the
-job stop button. To stop a specific job, call `POST /api/jobs/{job_id}/cancel`
-or use the equivalent UI/CLI surface when available.
-
-Cancel records the job and assignment as `canceled`. If the agent session is
-active and the task was already dispatched, the controller sends `task_cancel`
-over the existing WebSocket session. The agent kills the current command
-process when the task id matches and reports `task_result.status = "canceled"`.
-Command timeout is separate: timeout reports `task_result.status = "timed_out"`
-and the controller stores the job as `expired`.
-
-## Target Preview and Snapshots
-
-Before creating a job, automation or Web Admin can call `POST
-/api/selectors/preview` with either a string selector or `matchLabels`:
-
-```json
-{ "matchLabels": { "role": "web", "env": "prod" } }
-```
-
-Supported string selectors are `agent:<name-or-id>`, `label:key=value`, and
-`key=value,key2=value2`. Disabled or revoked agents are shown in preview but
-excluded from dispatch. Offline agents can be selected; their assignments stay
-queued until they reconnect.
-
-When a job is created, the controller stores the selector source and a target
-snapshot. Later label or status changes do not change the job's original target
-set.
-
-The Web Admin Run and Runbooks panels expose selector input and "Preview
-targets" controls for command and runbook jobs. The UI displays the controller
-preview response and blocks selector-based submission only when the response has
-zero dispatchable targets.
-
-For multi-agent jobs, create the job after checking the preview result. The
-controller creates one assignment per target in that snapshot. The optional job
-`strategy` controls fanout:
-
-```json
-{
-  "strategy": {
-    "concurrency": 2,
-    "maxFailures": 1
-  }
-}
-```
-
-`concurrency` defaults to `1`, which means sequential dispatch. `maxFailures`
-is optional; when the threshold is reached, remaining queued assignments are
-canceled instead of being dispatched. Job detail responses include the saved
-strategy, per-target `task_id`, `assignment_status`, and `last_error` fields,
-plus an `assignment_summary` count object so Web Admin and automation can
-distinguish connectivity from execution state.
-
-## Risky Jobs And Approval
-
-Sponzey separates creating a risky job from dispatching it to an agent.
-
-Safe single-agent probes such as `uptime` can be queued immediately. Shell
-commands, `sudo`, `su`, reboot/shutdown actions, user/group changes,
-package/service/file mutations, unknown commands, and broad multi-agent targets
-create an approval request instead. The job stays in `pending_approval` and is
-not dispatched until the approval is approved.
-
-`confirmed_high_risk` and `--confirm-risk` are compatibility acknowledgements.
-They do not replace approval. An approval records the approver, reason, status,
-expiry, and audit events.
-
-The approver is derived from the authenticated admin token. Approval request
-bodies can include a reason; UI-provided actor fields are not trusted for audit
-or authorization.
-
-The approval API is available now:
-
-```text
-GET  /api/approvals?status=pending
-POST /api/approvals/{approval_id}/approve
-POST /api/approvals/{approval_id}/reject
-POST /api/approvals/expire
-```
-
-The Web Admin approval queue uses the same API. Approve/reject actions send only
-the decision reason; the controller derives the approver from the authenticated
-admin token and then refreshes approval, job, and audit views.
-
-## HTTPS Preparation
-
-You need this section for product, customer, production, shared, or long-running
-use. HTTP works without this section, but HTTP is test-only and Sponzey will
-keep printing an insecure HTTP warning.
-
-There are two common ways to provide HTTPS. This section is preparation, not a
-second setup flow.
-
-After HTTPS is ready, go back to [One Setup Flow](#one-setup-flow) and replace
-the local values:
-
-- `http://127.0.0.1:7700` becomes your HTTPS controller URL.
-- `.sponzey` becomes your production data directory if needed.
-- `agent start` uses the production data directory.
-
-If your HTTPS certificate is private or self-signed, add this to `agent init`:
+On Linux, try:
 
 ```bash
---tls-ca-cert /path/to/ca.pem
+hostname -I
 ```
 
-### Built-In HTTPS
-
-Prepare these files on the controller machine:
-
-```text
-/etc/sponzey/tls/fullchain.pem
-/etc/sponzey/tls/privkey.pem
-```
-
-The private key must not be readable by other users.
+On macOS Wi-Fi, try:
 
 ```bash
-sudo chmod 600 /etc/sponzey/tls/privkey.pem
+ipconfig getifaddr en0
 ```
 
-Start the controller:
+You may also find the address in your router or cloud server dashboard.
+
+### Step 2: initialize and start the Controller
+
+On the Controller computer:
 
 ```bash
-sponzey controller start \
+mkdir -p sponzey-controller
+fleet controller init --data-dir ./sponzey-controller
+```
+
+Save the printed admin token, then start the Controller:
+
+```bash
+fleet controller start \
   --host 0.0.0.0 \
   --port 7700 \
-  --data-dir /var/lib/sponzey-fleet \
+  --data-dir ./sponzey-controller \
+  --external-url http://192.168.0.10:7700
+```
+
+Two addresses have different meanings here:
+
+- `--host 0.0.0.0` means “listen on all network interfaces.” It is a bind value,
+  not an address that an Agent can use.
+- `--external-url http://192.168.0.10:7700` is the address Agents and operators
+  actually use.
+
+Never put `0.0.0.0` in `--external-url` or `agent init --url`.
+
+Your firewall must allow the chosen port. If another computer cannot open
+`http://192.168.0.10:7700/admin`, check the Controller process, IP address,
+router/network rules, and firewall before continuing.
+
+### Step 3: create an enrollment token on the Controller
+
+On the Controller computer:
+
+```bash
+fleet enroll-token create \
+  --data-dir ./sponzey-controller \
+  --labels role=web,env=test
+```
+
+Transfer the printed token securely to the Agent computer. Enrollment tokens
+are short-lived and should not be posted in chat rooms, tickets, or source code.
+
+### Step 4: install and initialize the Agent computer
+
+On the Agent computer:
+
+```bash
+npm install -g @sponzey/fleet
+mkdir -p sponzey-agent
+fleet agent init \
+  --data-dir ./sponzey-agent \
+  --url http://192.168.0.10:7700 \
+  --token PASTE_ENROLLMENT_TOKEN_HERE \
+  --name web-01 \
+  --labels role=web,env=test
+```
+
+Then start it:
+
+```bash
+fleet agent start --data-dir ./sponzey-agent
+```
+
+Open `http://192.168.0.10:7700/admin` and confirm that `web-01` is online.
+
+> `127.0.0.1` always means “this same computer.” An Agent on a second computer
+> must not use `127.0.0.1` unless it connects through a local SSH tunnel.
+
+## Use HTTPS for real or long-running environments
+
+Plain HTTP does not encrypt admin tokens, enrollment traffic, jobs, or Agent
+data. Use HTTP only for local learning, a private lab, or short-lived testing.
+Use HTTPS for production, customer, shared, Internet-facing, or long-running
+installations.
+
+### Option A: built-in HTTPS
+
+Prepare a certificate chain and private key on the Controller, then run:
+
+```bash
+fleet controller start \
+  --host 0.0.0.0 \
+  --port 7700 \
+  --data-dir /var/lib/fleet \
   --external-url https://fleet.example.com:7700 \
   --tls-cert /etc/sponzey/tls/fullchain.pem \
   --tls-key /etc/sponzey/tls/privkey.pem
 ```
 
-### Reverse Proxy HTTPS
+The private key should be readable only by the account running the Controller.
 
-Use this when Nginx, Caddy, a load balancer, or another proxy handles HTTPS.
-Sponzey can stay on loopback:
+Initialize Agents with the same HTTPS URL:
 
 ```bash
-sponzey controller start \
+fleet agent init \
+  --data-dir /var/lib/fleet \
+  --url https://fleet.example.com:7700 \
+  --token PASTE_ENROLLMENT_TOKEN_HERE \
+  --name web-01 \
+  --labels role=web,env=prod
+```
+
+If the server certificate uses a private or self-signed CA, add:
+
+```text
+--tls-ca-cert /path/to/ca.pem
+```
+
+### Option B: HTTPS reverse proxy
+
+Nginx, Caddy, a cloud load balancer, or another reverse proxy can handle HTTPS.
+In that case, keep Sponzey on Controller loopback:
+
+```bash
+fleet controller start \
   --host 127.0.0.1 \
   --port 7700 \
-  --data-dir /var/lib/sponzey-fleet \
+  --data-dir /var/lib/fleet \
   --external-url https://fleet.example.com
 ```
 
-Your proxy should forward HTTPS traffic to `127.0.0.1:7700`.
+Configure the proxy to forward HTTPS requests to `127.0.0.1:7700`, including
+WebSocket connections.
 
-## SSH Tunnel Development
+## What you can do in Web Admin
 
-SSH tunnel development uses the same setup flow. The only difference is that the
-agent reaches the controller through a local tunnel URL.
+After an Agent connects, Web Admin can:
 
-On the agent machine, keep this running:
+- show Agent online/offline state and inventory
+- display facts, metrics, drift history, and product-safe Agent logs
+- create command and runbook jobs
+- preview selector targets before creating a multi-Agent job
+- show per-Agent assignment state and job output
+- create and decide approval requests
+- save and assign policies and schedule drift checks
+- show remediation progress and audit events
 
-```bash
-ssh -N -L 7700:127.0.0.1:7700 <user>@<controller-host>
-```
+Jobs are stored before they are sent. If an Agent is offline, its assignment
+stays queued and can be delivered after the Agent reconnects.
 
-Then use this URL on the agent machine:
+## Policies and remediation in plain language
 
-```text
-http://127.0.0.1:7700
-```
+A **runbook** says, “perform these steps now.” A **policy** says, “this condition
+should remain true over time.”
 
-If you use the controller machine's LAN IP with plain `http://`, Sponzey allows
-it but prints an insecure HTTP warning.
+For example, a policy can say that nginx should be running on every Agent with
+the label `role=web`.
 
-## Local Scripts
+The remediation flow is:
 
-The scripts are shortcuts around the same single binary.
+1. A signed drift check reports that the machine does not match the policy.
+2. The Controller creates a remediation proposal.
+3. An operator reviews and approves it.
+4. The Controller creates and signs a runbook job.
+5. The Agent runs the job and reports the result.
+6. The Controller runs a verification check.
+7. Fresh compliant evidence resolves the remediation and its original drift.
 
-```bash
-./scripts/run_controller.sh --host 127.0.0.1 --port 7700 --data-dir .sponzey --external-url http://127.0.0.1:7700
-./scripts/run_agent.sh --data-dir .sponzey
-```
+Remediation does not bypass approval. The old manual `running`, `result`, and
+`verify` API/CLI commands are deprecated and return `409`; authenticated Agent
+events and stored verification evidence are the source of truth.
 
-Important:
+See [Runbooks](docs/runbooks.md), [Policies](docs/policy.md), and the
+[API contract](docs/api.md) for complete schemas and advanced examples.
 
-- `run_controller.sh` wraps `sponzey controller start`.
-- `run_agent.sh` wraps `sponzey agent start`.
-- The scripts do not run `controller init`, `enroll-token create`, or `agent init`.
-- Do not run `scripts/run_agent.sh controller ...`; that script is agent-only.
+## Optional operator CLI login
 
-## Remove An Agent
-
-Stop the agent first.
-
-If you installed a systemd service:
-
-```bash
-sponzey agent uninstall-service --dry-run
-sudo sponzey agent uninstall-service
-```
-
-Then remove the local agent directory:
+Web Admin is the easiest operator interface. If you prefer the CLI, save a
+Controller URL and admin token in a local profile:
 
 ```bash
-rm -rf .sponzey/agent
+fleet login \
+  --controller-url https://fleet.example.com \
+  --admin-token PASTE_ADMIN_TOKEN_HERE
 ```
 
-For a production data directory:
+Then commands such as these use that profile:
 
 ```bash
-sudo rm -rf /var/lib/sponzey-fleet/agent
+fleet agents remote-list
+sponzey jobs list
+sponzey approvals list
+sponzey remediations list
+fleet audit export --category security --limit 100
 ```
 
-Controller inventory and audit records are kept. To use the same host again,
-create a new enrollment token and run `sponzey agent init` again.
+The profile contains an operator credential. Do not copy it to other users or
+commit it to source control.
 
-## Back Up And Restore Controller Data
+## Running continuously on Linux
 
-Back up the controller before deleting a data directory, moving to another
-machine, or performing risky maintenance. Stop the controller first so the
-SQLite database is not being written while the backup is created.
+On a Linux system using systemd, first initialize the Controller or Agent with
+the same persistent data directory that the service will use. Preview the unit
+before installing it:
 
 ```bash
-sponzey controller backup \
-  --data-dir .sponzey \
+fleet controller install-service \
+  --data-dir /var/lib/fleet \
+  --dry-run
+
+fleet agent install-service \
+  --data-dir /var/lib/fleet \
+  --dry-run
+```
+
+Installing or removing a service requires Linux and root privileges:
+
+```bash
+sudo fleet agent install-service --data-dir /var/lib/fleet
+sudo fleet agent start-service
+sudo fleet agent status-service
+sudo fleet agent logs-service
+```
+
+Controller service commands have the same shape. Verify the dry-run output and
+your HTTPS/reverse-proxy settings before relying on a service in production.
+
+## Back up the Controller
+
+Back up before an upgrade, migration, or machine move. Stop the Controller first
+so SQLite is not being written during the backup.
+
+```bash
+fleet controller backup \
+  --data-dir ./sponzey-controller \
   --output ./sponzey-controller.backup.json
 ```
 
-The backup archive contains sensitive controller state, including the controller
-identity keys and SQLite data. Store it like a secret.
+The backup contains Controller keys and operational data. Treat it as a secret.
 
-Validate a restore without writing files:
+Validate a backup without writing anything:
 
 ```bash
-sponzey controller restore \
+fleet controller restore \
   --data-dir ./restore-check \
   --input ./sponzey-controller.backup.json \
   --dry-run
@@ -706,70 +459,85 @@ sponzey controller restore \
 Restore into an empty data directory:
 
 ```bash
-sponzey controller restore \
-  --data-dir .sponzey-restored \
+fleet controller restore \
+  --data-dir ./sponzey-controller-restored \
   --input ./sponzey-controller.backup.json
 ```
 
-Restore refuses to overwrite an existing controller directory. Use `--force`
-only after you have confirmed the target data directory can be replaced.
+## Common problems
 
-To reset everything, remove the whole data directory:
+### `sponzey: command not found`
 
-```bash
-rm -rf .sponzey
-```
-
-Deleting the data directory is a reset. Backup/restore preserves controller
-identity, inventory, jobs, audit events, telemetry, and enrollment records.
-
-## Common Problems
+Open a new terminal after global installation. If it still fails, check
+`$(npm prefix -g)/bin` and add that directory to `PATH`.
 
 ### `controller is not initialized`
 
-Run `controller init` once with the same data directory.
-
-### `unable to open database file`
-
-The controller data directory was probably not initialized. Run
-`sponzey controller init --data-dir ...` first.
+Run `fleet controller init` once. Make sure `controller init` and
+`controller start` use exactly the same `--data-dir`.
 
 ### `agent is not enrolled`
 
-Run `sponzey agent init ...` before `sponzey agent start ...`.
+Run `fleet agent init` once. Make sure `agent init` and `agent start` use
+exactly the same Agent `--data-dir`.
 
-### A running job stays running after the agent disconnects
+### The Agent cannot connect
 
-This is expected. The controller does not mark a job as failed just because the
-WebSocket dropped. A final `task_result`, cancel, timeout, or expiry policy
-decides the terminal state. Use job output and audit entries to confirm what
-happened.
+Check these items in order:
 
-### Cancel, failed, and expired look different
+1. Is the Controller terminal or service still running?
+2. Is the Agent using the Controller IP/DNS name instead of its own
+   `127.0.0.1`?
+3. Is port `7700` open in the operating-system and cloud firewalls?
+4. Does the URL start with `https://` when the Controller uses TLS?
+5. Does a private CA require `--tls-ca-cert` during Agent initialization?
 
-`canceled` means an operator cancel was recorded. `failed` means the agent
-reported a non-zero or failed result. `expired` means timeout or assignment
-expiry won. These states are intentionally separate.
+### The Agent does not appear in Web Admin
+
+Check the Agent terminal for enrollment, identity, or connection errors. An
+enrollment token is usually one-time use; create a new one instead of retrying a
+consumed token.
 
 ### `WARNING: insecure HTTP controller URL enabled`
 
-This is not a crash. It means your controller URL starts with `http://`, so
-controller-agent traffic is not encrypted. HTTP is test-only. Product,
-customer, production, shared, or long-running environments must use HTTPS.
-HTTP transport provides no confidentiality or integrity guarantee.
+This is a warning, not a crash. It means traffic is not encrypted. Use HTTPS
+outside local or short-lived testing.
 
 ### Web Admin shows `{"error":"not_found"}`
 
-Open `/admin`, not an API path.
+Open `/admin`, for example `http://127.0.0.1:7700/admin`.
 
-### Which token goes where?
+### A job stays queued
 
-- Web Admin UI: use the admin token from `sponzey controller init`.
-- Agent init: use the enrollment token from `sponzey enroll-token create`.
+The target Agent may be offline or waiting behind another assignment. Start the
+Agent and inspect the Job and Audit views. Queued work is not silently treated
+as completed.
 
-## Development Checks
+## Security reminders
 
-The full release gate is documented in [docs/release-gate.md](docs/release-gate.md).
+- Never commit admin tokens, enrollment tokens, private keys, or backup files.
+- Use HTTPS for real environments.
+- Keep Controller, Agent, and TLS private-key files readable only by the service
+  account that needs them.
+- Review target preview and approval details before running privileged jobs.
+- Back up the Controller before upgrades or destructive maintenance.
+
+More detail is available in [Security](docs/security.md),
+[Storage](docs/storage.md), and the [feature matrix](docs/feature-matrix.md).
+
+## API and development documentation
+
+The Controller serves:
+
+```text
+/admin         Web Admin
+/openapi.json  OpenAPI 3.1 JSON
+/swagger-ui    Interactive API documentation
+```
+
+Do not enter real admin tokens in Swagger UI over plain HTTP.
+
+For contributors, the main checks are:
 
 ```bash
 cargo fmt --all --check
@@ -779,14 +547,13 @@ npm test --workspace @sponzey/fleet
 npm test --workspace web-admin
 npm run typecheck --workspace web-admin
 npm run build --workspace web-admin
-./scripts/smoke_mvp.sh
-./scripts/smoke_immediate_dispatch.sh
-./scripts/smoke_remote_tls_loopback.sh
 ```
+
+See the [release gate](docs/release-gate.md) for the complete release procedure.
 
 ## License
 
 Sponzey Fleet is licensed under the GNU Affero General Public License version 3
-only (`AGPL-3.0-only`). This applies to the Rust workspace, Web Admin, npm
-wrapper, and distributed `sponzey` binaries unless a file explicitly states a
-different license. See [LICENSE](LICENSE) and [docs/license.md](docs/license.md).
+only (`AGPL-3.0-only`). The license covers the Rust workspace, Web Admin, npm
+wrapper, and distributed binaries unless a file explicitly says otherwise.
+See [LICENSE](LICENSE) and [license notes](docs/license.md).

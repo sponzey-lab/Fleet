@@ -174,6 +174,10 @@ pub enum WirePayload {
     },
     DriftReport {
         agent_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        job_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_id: Option<String>,
         status: String,
         expected: String,
         actual: String,
@@ -455,6 +459,61 @@ mod tests {
         assert_eq!(decoded, heartbeat());
         assert!(encoded.contains("\"protocol_version\":1"));
         assert!(encoded.contains("\"heartbeat\""));
+    }
+
+    #[test]
+    fn drift_report_legacy_fixture_decodes_without_task_correlation() {
+        let body = r#"{
+            "protocol_version": 1,
+            "message_id": "msg-drift-legacy",
+            "correlation_id": "corr-drift-legacy",
+            "agent_id": "agent-1",
+            "timestamp_ms": 1,
+            "payload": {
+                "type": "drift_report",
+                "payload": {
+                    "agent_id": "agent-1",
+                    "status": "drifted",
+                    "expected": "package nginx present",
+                    "actual": "package nginx missing"
+                }
+            }
+        }"#;
+
+        let decoded = decode_message(body).unwrap();
+        assert!(!encode_message(&decoded).unwrap().contains("\"job_id\""));
+        let WirePayload::DriftReport {
+            job_id, task_id, ..
+        } = decoded.payload
+        else {
+            panic!("expected drift report");
+        };
+
+        assert_eq!(job_id, None);
+        assert_eq!(task_id, None);
+    }
+
+    #[test]
+    fn drift_report_with_task_correlation_roundtrips() {
+        let message = WireMessage::new(
+            "msg-drift-correlated",
+            "corr-drift-correlated",
+            Some("agent-1".to_owned()),
+            1,
+            WirePayload::DriftReport {
+                agent_id: "agent-1".to_owned(),
+                job_id: Some("job-drift".to_owned()),
+                task_id: Some("task-drift".to_owned()),
+                status: "drifted".to_owned(),
+                expected: "package nginx present".to_owned(),
+                actual: "package nginx missing".to_owned(),
+            },
+        );
+
+        assert_eq!(
+            decode_message(&encode_message(&message).unwrap()).unwrap(),
+            message
+        );
     }
 
     #[test]

@@ -29,7 +29,7 @@ mkdir -p "$PACK_DIR/package"
 tar -xzf "$TARBALL" -C "$PACK_DIR/package" --strip-components 1
 
 set +e
-OUTPUT="$(SPONZEY_FLEET_BIN="$REPO_ROOT/target/debug/sponzey" "$PACK_DIR/package/bin/sponzey" demo 2>&1)"
+OUTPUT="$(FLEET_BIN="$REPO_ROOT/target/debug/fleet" "$PACK_DIR/package/bin/fleet" demo 2>&1)"
 STATUS=$?
 set -e
 if [ "$STATUS" -ne 0 ]; then

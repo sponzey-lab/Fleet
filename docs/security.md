@@ -12,7 +12,7 @@ Phase 6 work in `.tasks/plan.md`.
 
 Current behavior:
 
-- `sponzey controller init` prints one raw admin token.
+- `fleet controller init` prints one raw admin token.
 - The raw admin token is shown once and is not stored in plaintext.
 - The controller stores only the admin token hash.
 - The stored bootstrap admin token maps to actor `bootstrap-admin`.
@@ -40,6 +40,68 @@ The request context is passed explicitly into the API route handling path. UI
 state is not an authority. Request payload fields such as `created_by`,
 `confirmed_by`, or approval `actor` are compatibility hints only; the controller
 overrides or ignores them when an authenticated admin actor is available.
+
+## Authenticated Agent Drift Evidence
+
+An authenticated WebSocket session proves the reporting agent identity, but it
+does not make its drift-report payload authoritative. A report that supplies a
+job/task pair becomes automation-eligible only after the controller matches the
+pair and session agent to a persisted signed drift assignment with a stored
+policy id, version, and purpose. The controller, rather than the wire payload,
+constructs the typed provenance written to storage.
+
+The application proposal boundary validates the Controller-verified report,
+policy id, and policy version before storage allocates the report id. The id is
+then a correlation reference, never a substitute for those checks. Compliant,
+unverified, missing-policy, mismatched-policy, and non-drift reports remain
+observations and never create a proposal.
+
+Creating an automated proposal is a narrow storage transaction: the verified
+drift report, its typed origin id, proposed remediation metadata, and redacted
+Drift/Policy audits are committed together. If any insert fails, none of those
+records is emitted. A duplicate correlation returns the existing report and
+request without creating a Job or another audit event.
+
+Authenticated execution events use a separate narrow transaction. The persisted
+task assignment is updated together with the matching remediation lifecycle
+transition and its redacted Policy audit. Duplicate or late events cannot
+overwrite a terminal assignment or create a second remediation audit; socket
+delivery itself is never treated as execution authority.
+
+A successful remediation result may create one follow-up verification drift Job
+only through a separate application-owned transaction. That transaction writes
+the signed single-target Job and assignment, the v19 remediation correlation,
+and one redacted `remediation_verification_created` Policy audit together. A
+duplicate result returns the existing correlation without a second assignment
+or audit. The Controller attempts WebSocket dispatch only after commit; an
+offline or disconnected agent leaves the assignment queued. Verification does
+not bypass the agent's normal signature, expiry, nonce, or target checks.
+
+Before binding its listener, the Controller performs one bounded (at most 100)
+recovery scan for `succeeded_pending_verify` records that have no verification
+correlation. Each candidate uses the same signed create boundary; correlated
+rows are not recreated. A legacy candidate without verifiable policy, policy
+version, execution Job, target, or task data is never dispatched. It receives
+only a `remediation_verification_recovery_skipped` Policy audit with its
+identifier and a fixed reason code—never policy source, task payload, output,
+or secret material. This is not a periodic retry worker or an HA claim.
+
+Resolution is also an application-owned transaction. The Controller joins the
+persisted successful verification assignment with the persisted correlated
+report, but freshness is measured against the remediation execution completion,
+not the verification TaskResult completion: agents may emit a report before the
+final result. The store rechecks the evidence id, agent, verification job/task,
+policy/version, `remediation_verification` purpose, and compliant status while
+committing the remediation status, only its origin drift resolution metadata,
+and the redacted `remediation_resolved_by_verification` Policy audit. Stale,
+unknown, drifted, failed, missing, or mismatched evidence is never promoted to
+resolved and never updates an unrelated latest drift report.
+
+Legacy reports with no pair, reports from raw-policy drift jobs, and reports
+with missing, unknown, mismatched, or non-drift assignments remain visible as
+uncorrelated observations. A supplied but invalid pair records exactly one
+`websocket_drift_provenance_mismatch` Security audit. Audit values do not
+include the raw policy document, task signature, report body, or secrets.
 
 ## Roles
 
@@ -163,7 +225,7 @@ manager integration.
 - Agent runbook planning adapts the selected provider into the runner's explicit
   resolver closure. The runner remains provider-agnostic and does not import
   application or infrastructure provider types.
-- `sponzey apply` is validation-only and does not resolve secret-backed
+- `fleet apply` is validation-only and does not resolve secret-backed
   templates. It must not read provider config, fixture files, or raw secret
   material.
 - Product Log, Field Debug Log, audit values, API responses, Web Admin state,
@@ -212,8 +274,8 @@ boundary for that future adapter is:
 ## CLI Profile And Login
 
 The CLI can use the bootstrap admin token directly or store it with the
-controller endpoint through `sponzey login`. The default profile path is
-`.sponzey/cli-profile.json`. The profile is treated as a secret and protected
+controller endpoint through `fleet login`. The default profile path is
+`.fleet/cli-profile.json`. The profile is treated as a secret and protected
 remote commands reject group/world-readable profile files.
 
 The stored credential still authenticates to the controller and produces the
@@ -287,9 +349,9 @@ Rules:
 - The current public controller surfaces are limited to admin protected
   read-only status and issuance request:
   `GET /api/agents/{agent_id}/certificate-lifecycle/status`,
-  `sponzey agents certificate-status <agent-id>`,
+  `fleet agents certificate-status <agent-id>`,
   `POST /api/agents/{agent_id}/certificate-lifecycle/request-issuance`, and
-  `sponzey agents request-certificate-issuance <agent-id>`.
+  `fleet agents request-certificate-issuance <agent-id>`.
 - The lifecycle status surface requires `agent_read`, returns `not_issued` for
   a known agent without lifecycle state, and exposes only public state,
   fingerprint prefixes, timestamps, and bounded reason values.

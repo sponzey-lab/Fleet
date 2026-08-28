@@ -14,7 +14,7 @@ NPM_CONFIG_PREFIX="$WORK_DIR/prefix" \
 NPM_CONFIG_CACHE="$WORK_DIR/cache" \
   npm install -g "$PACKAGE"
 
-"$WORK_DIR/prefix/bin/sponzey" --help >/dev/null
-PATH="$WORK_DIR/prefix/bin:$PATH" sponzey --help >/dev/null
+"$WORK_DIR/prefix/bin/fleet" --help >/dev/null
+PATH="$WORK_DIR/prefix/bin:$PATH" fleet --help >/dev/null
 
 echo "manual npm registry smoke ok: $PACKAGE"

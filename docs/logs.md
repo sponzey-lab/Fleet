@@ -5,13 +5,13 @@ or archival product.
 
 ## Agent Operational Log Upload
 
-`sponzey agent start` uploads a product-safe operational log chunk by default.
+`fleet agent start` uploads a product-safe operational log chunk by default.
 The default interval is 30 seconds.
 
 ```bash
-sponzey agent start
-sponzey agent start --log-upload-interval-seconds 60
-sponzey agent start --disable-log-upload
+fleet agent start
+fleet agent start --log-upload-interval-seconds 60
+fleet agent start --disable-log-upload
 ```
 
 Current behavior:
@@ -44,8 +44,8 @@ stdout/stderr chunks.
 ## File Tail
 
 ```bash
-sponzey logs --file /var/log/syslog
-sponzey logs web-01 --file /var/log/syslog --follow --max-duration-seconds 30
+fleet logs --file /var/log/syslog
+fleet logs web-01 --file /var/log/syslog --follow --max-duration-seconds 30
 ```
 
 Current behavior:
@@ -65,7 +65,7 @@ tail does not yet open a remote file through an agent task.
 When no `--file` is provided and the target looks like a safe systemd unit name, the CLI renders the intended journald command:
 
 ```bash
-sponzey logs nginx.service
+fleet logs nginx.service
 ```
 
 This is a skeleton for the later systemd/journald adapter. It validates the service name and does not shell-execute untrusted input.

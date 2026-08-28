@@ -19,12 +19,22 @@ use fleet_application::{
     MetricsRepository, MetricsSnapshotPageRecord as AppMetricsSnapshotPageRecord,
     MetricsSnapshotRecord as AppMetricsSnapshotRecord,
     PendingTaskAssignment as AppPendingTaskAssignment,
+    PersistVerifiedDriftProposalInput as AppPersistVerifiedDriftProposalInput,
+    PersistVerifiedDriftProposalOutput as AppPersistVerifiedDriftProposalOutput,
     PolicyAssignmentRecord as AppPolicyAssignmentRecord, PolicyRecord as AppPolicyRecord,
-    PolicyRepository, RemediationRequestRecord as AppRemediationRequestRecord,
-    RemediationRequestRepository, RetentionCleanupSummary as AppRetentionCleanupSummary,
-    RetentionCutoffs, RetentionRepository, RunbookJobRepository,
-    ScheduledDriftRecord as AppScheduledDriftRecord, SigningKeyRotationRecord,
-    SigningKeyRotationRepository, SnapshotPageCursor, TaskAssignmentRepository,
+    PolicyRepository,
+    RemediationExecutionPersistenceInput as AppRemediationExecutionPersistenceInput,
+    RemediationExecutionPersistenceRepository, RemediationProposalRepository,
+    RemediationProposalSave as AppRemediationProposalSave,
+    RemediationRequestRecord as AppRemediationRequestRecord, RemediationRequestRepository,
+    RemediationVerificationJobPersistenceInput as AppRemediationVerificationJobPersistenceInput,
+    RemediationVerificationJobRepository,
+    RemediationVerificationJobSave as AppRemediationVerificationJobSave,
+    RemediationVerificationRecoveryRepository, RemediationVerificationResolutionRepository,
+    RetentionCleanupSummary as AppRetentionCleanupSummary, RetentionCutoffs, RetentionRepository,
+    RunbookJobRepository, ScheduledDriftRecord as AppScheduledDriftRecord,
+    SigningKeyRotationRecord, SigningKeyRotationRepository, SnapshotPageCursor,
+    TaskAssignmentRepository, VerifiedDriftProposalRepository,
 };
 use fleet_domain::{
     Agent, AgentCapability, AgentCapabilitySnapshot, AgentCertificate, AgentCertificateFingerprint,
@@ -34,10 +44,11 @@ use fleet_domain::{
     AgentRuntimeProfile, AgentStatus, ArtifactChecksum, ArtifactId, ArtifactRetentionClass,
     AssignmentStatus, AuditActor, AuditCategory, AuditEvent, AuditTarget, AuditValue, CommandTask,
     ControllerPublicKey, ControllerSigningKeyRotation, ControllerSigningKeyRotationSnapshot,
-    DriftAcknowledgement, DriftCheckTask, DriftReport, DriftSeverity, DriftStatus, Job, JobId,
-    JobStatus, PackageManager, PrivilegeLevel, RenderedArtifactMetadata, RunbookExecutionTask,
-    ServiceManager, SigningKeyFingerprint, SigningKeyRotationState, TaskEnvelope, TaskExpiry,
-    TaskId, TaskKind, TaskNonce, TaskSignature, aggregate_job_status,
+    DriftAcknowledgement, DriftCheckPurpose, DriftCheckTask, DriftJobProvenance, DriftReport,
+    DriftReportId, DriftReportProvenance, DriftSeverity, DriftStatus, Job, JobId, JobStatus,
+    PackageManager, PrivilegeLevel, RenderedArtifactMetadata, RunbookExecutionTask, ServiceManager,
+    SigningKeyFingerprint, SigningKeyRotationState, TaskEnvelope, TaskExpiry, TaskId, TaskKind,
+    TaskNonce, TaskSignature, aggregate_job_status,
 };
 use rusqlite::{Connection, ErrorCode, OptionalExtension, params};
 use sha2::{Digest, Sha256};
@@ -45,7 +56,7 @@ use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 15;
+pub const CURRENT_SCHEMA_VERSION: i64 = 19;
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -393,6 +404,102 @@ impl PostgresStore {
         self.pool.checkout()
     }
 
+    pub fn find_remediation_verification_job_id(
+        &self,
+        remediation_id: &str,
+    ) -> Result<Option<String>, StoreError> {
+        self.checkout_client()?
+            .query_opt(
+                "SELECT job_id FROM remediation_verification_jobs WHERE remediation_id = $1",
+                &[&remediation_id],
+            )
+            .map(|row| row.map(|row| row.get(0)))
+            .map_err(|_| postgres_error("postgres remediation verification lookup failed"))
+    }
+
+    pub fn find_remediation_request_by_verification_job_id(
+        &self,
+        verification_job_id: &str,
+    ) -> Result<Option<AppRemediationRequestRecord>, StoreError> {
+        let row = self
+            .checkout_client()?
+            .query_opt(
+                "SELECT remediation_requests.id, policy_id, policy_name, agent_id, runbook_ref, status,
+                        approval_required, risk_summary, remediation_requests.job_id,
+                        origin_drift_report_id, policy_version, remediation_requests.created_at,
+                        remediation_requests.updated_at
+                 FROM remediation_requests
+                 JOIN remediation_verification_jobs
+                   ON remediation_verification_jobs.remediation_id = remediation_requests.id
+                 WHERE remediation_verification_jobs.job_id = $1",
+                &[&verification_job_id],
+            )
+            .map_err(|_| postgres_error("postgres remediation verification request lookup failed"))?;
+        row.map(|row| postgres_row_to_remediation_request_record(&row))
+            .transpose()
+    }
+
+    pub fn find_drift_report_by_correlation(
+        &self,
+        job_id: &str,
+        task_id: &str,
+    ) -> Result<Option<AppDriftReportRecord>, StoreError> {
+        let row = self
+            .checkout_client()?
+            .query_opt(
+                "SELECT id, agent_id, policy_name, status, expected, actual, checked_at,
+                        severity, acknowledged_at, acknowledged_by, resolved_at, resolution_job_id,
+                        job_id, task_id, policy_id, policy_version, purpose
+                 FROM drift_reports WHERE job_id = $1 AND task_id = $2",
+                &[&job_id, &task_id],
+            )
+            .map_err(|_| postgres_error("postgres drift correlation lookup failed"))?;
+        row.map(|row| postgres_row_to_drift_report_record(&row))
+            .transpose()
+    }
+
+    pub fn find_task_assignment_state_for_job(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<TaskAssignmentStateRecord>, StoreError> {
+        self.checkout_client()?
+            .query_opt(
+                "SELECT job_id, id, agent_id, status, completed_at FROM task_assignments
+                 WHERE job_id = $1 ORDER BY created_at, id LIMIT 1",
+                &[&job_id],
+            )
+            .map(|row| {
+                row.map(|row| TaskAssignmentStateRecord {
+                    job_id: row.get(0),
+                    task_id: row.get(1),
+                    agent_id: row.get(2),
+                    status: row.get(3),
+                    completed_at: row.get::<_, Option<i64>>(4).map(unix_secs_to_system_time),
+                })
+            })
+            .map_err(|_| postgres_error("postgres assignment state lookup failed"))
+    }
+
+    pub fn save_remediation_verification_job(
+        &self,
+        remediation_id: &str,
+        job_id: &str,
+        created_at: SystemTime,
+    ) -> Result<bool, StoreError> {
+        self.checkout_client()?
+            .execute(
+                "INSERT INTO remediation_verification_jobs (remediation_id, job_id, created_at)
+                 VALUES ($1, $2, $3) ON CONFLICT (remediation_id) DO NOTHING",
+                &[
+                    &remediation_id,
+                    &job_id,
+                    &system_time_to_unix_secs(created_at),
+                ],
+            )
+            .map(|inserted| inserted > 0)
+            .map_err(|_| postgres_error("postgres remediation verification insert failed"))
+    }
+
     #[cfg(test)]
     fn empty_pool_for_test(checkout_timeout: Duration) -> Self {
         Self {
@@ -521,6 +628,9 @@ impl PostgresStore {
                     command_args_json TEXT NOT NULL DEFAULT '[]',
                     command_max_output_bytes BIGINT NOT NULL DEFAULT 1048576,
                     drift_policy_document TEXT,
+                    drift_policy_id TEXT,
+                    drift_policy_version BIGINT,
+                    drift_purpose TEXT,
                     runbook_document TEXT,
                     selector_kind TEXT NOT NULL DEFAULT 'explicit_ids',
                     selector_source TEXT NOT NULL DEFAULT '',
@@ -538,6 +648,10 @@ impl PostgresStore {
                     labels_snapshot TEXT NOT NULL DEFAULT '',
                     PRIMARY KEY (job_id, agent_id)
                 );
+
+                ALTER TABLE jobs ADD COLUMN IF NOT EXISTS drift_policy_id TEXT;
+                ALTER TABLE jobs ADD COLUMN IF NOT EXISTS drift_policy_version BIGINT;
+                ALTER TABLE jobs ADD COLUMN IF NOT EXISTS drift_purpose TEXT;
 
                 CREATE TABLE IF NOT EXISTS task_assignments (
                     id TEXT PRIMARY KEY,
@@ -593,12 +707,28 @@ impl PostgresStore {
                     approval_required BOOLEAN NOT NULL,
                     risk_summary TEXT NOT NULL,
                     job_id TEXT,
+                    origin_drift_report_id BIGINT,
+                    policy_version BIGINT,
                     created_at BIGINT NOT NULL,
                     updated_at BIGINT NOT NULL
                 );
 
                 CREATE INDEX IF NOT EXISTS remediation_requests_filter_order_idx
                     ON remediation_requests (agent_id, policy_id, created_at, id);
+
+                ALTER TABLE remediation_requests ADD COLUMN IF NOT EXISTS origin_drift_report_id BIGINT;
+                ALTER TABLE remediation_requests ADD COLUMN IF NOT EXISTS policy_version BIGINT;
+
+                CREATE UNIQUE INDEX IF NOT EXISTS remediation_requests_active_policy_unique_idx
+                    ON remediation_requests (agent_id, policy_id)
+                    WHERE origin_drift_report_id IS NOT NULL
+                      AND status NOT IN ('resolved', 'failed', 'rejected', 'expired', 'canceled');
+
+                CREATE TABLE IF NOT EXISTS remediation_verification_jobs (
+                    remediation_id TEXT PRIMARY KEY REFERENCES remediation_requests(id) ON DELETE CASCADE,
+                    job_id TEXT NOT NULL UNIQUE REFERENCES jobs(id) ON DELETE RESTRICT,
+                    created_at BIGINT NOT NULL
+                );
 
                 CREATE TABLE IF NOT EXISTS facts_snapshots (
                     id BIGSERIAL PRIMARY KEY,
@@ -655,11 +785,26 @@ impl PostgresStore {
                     acknowledged_at BIGINT,
                     acknowledged_by TEXT,
                     resolved_at BIGINT,
-                    resolution_job_id TEXT
+                    resolution_job_id TEXT,
+                    job_id TEXT,
+                    task_id TEXT,
+                    policy_id TEXT,
+                    policy_version BIGINT,
+                    purpose TEXT
                 );
 
                 CREATE INDEX IF NOT EXISTS drift_reports_agent_page_idx
                     ON drift_reports (agent_id, checked_at DESC, id DESC);
+
+                ALTER TABLE drift_reports ADD COLUMN IF NOT EXISTS job_id TEXT;
+                ALTER TABLE drift_reports ADD COLUMN IF NOT EXISTS task_id TEXT;
+                ALTER TABLE drift_reports ADD COLUMN IF NOT EXISTS policy_id TEXT;
+                ALTER TABLE drift_reports ADD COLUMN IF NOT EXISTS policy_version BIGINT;
+                ALTER TABLE drift_reports ADD COLUMN IF NOT EXISTS purpose TEXT;
+
+                CREATE UNIQUE INDEX IF NOT EXISTS drift_reports_correlated_task_unique_idx
+                    ON drift_reports (job_id, task_id)
+                    WHERE job_id IS NOT NULL AND task_id IS NOT NULL;
 
                 CREATE TABLE IF NOT EXISTS policies (
                     id TEXT PRIMARY KEY,
@@ -795,6 +940,17 @@ pub struct TaskAssignmentStateRecord {
     pub task_id: String,
     pub agent_id: String,
     pub status: String,
+    pub completed_at: Option<SystemTime>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriftAssignmentProvenanceRecord {
+    pub job_id: String,
+    pub task_id: String,
+    pub agent_id: String,
+    pub policy_id: String,
+    pub policy_version: u32,
+    pub purpose: DriftCheckPurpose,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -893,15 +1049,19 @@ pub struct MetricsSnapshotPageRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DriftReportRecord {
+    pub id: DriftReportId,
     pub agent_id: String,
     pub report: DriftReport,
+    pub provenance: DriftReportProvenance,
     pub checked_at: SystemTime,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DriftReportPageRecord {
+    pub id: DriftReportId,
     pub agent_id: String,
     pub report: DriftReport,
+    pub provenance: DriftReportProvenance,
     pub checked_at: SystemTime,
     pub cursor: SnapshotPageCursor,
 }
@@ -993,6 +1153,21 @@ impl SqliteStore {
         )?;
         self.ensure_column(
             "jobs",
+            "drift_policy_id",
+            "ALTER TABLE jobs ADD COLUMN drift_policy_id TEXT",
+        )?;
+        self.ensure_column(
+            "jobs",
+            "drift_policy_version",
+            "ALTER TABLE jobs ADD COLUMN drift_policy_version INTEGER",
+        )?;
+        self.ensure_column(
+            "jobs",
+            "drift_purpose",
+            "ALTER TABLE jobs ADD COLUMN drift_purpose TEXT",
+        )?;
+        self.ensure_column(
+            "jobs",
             "selector_kind",
             "ALTER TABLE jobs ADD COLUMN selector_kind TEXT NOT NULL DEFAULT 'explicit_ids'",
         )?;
@@ -1072,6 +1247,29 @@ impl SqliteStore {
             "ALTER TABLE drift_reports ADD COLUMN severity TEXT NOT NULL DEFAULT 'unknown'",
         )?;
         self.ensure_column(
+            "remediation_requests",
+            "origin_drift_report_id",
+            "ALTER TABLE remediation_requests ADD COLUMN origin_drift_report_id INTEGER",
+        )?;
+        self.ensure_column(
+            "remediation_requests",
+            "policy_version",
+            "ALTER TABLE remediation_requests ADD COLUMN policy_version INTEGER",
+        )?;
+        self.connection.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS remediation_requests_active_policy_unique_idx
+             ON remediation_requests (agent_id, policy_id)
+             WHERE origin_drift_report_id IS NOT NULL
+               AND status NOT IN ('resolved', 'failed', 'rejected', 'expired', 'canceled');",
+        )?;
+        self.connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS remediation_verification_jobs (
+                remediation_id TEXT PRIMARY KEY REFERENCES remediation_requests(id) ON DELETE CASCADE,
+                job_id TEXT NOT NULL UNIQUE REFERENCES jobs(id) ON DELETE RESTRICT,
+                created_at INTEGER NOT NULL
+            );",
+        )?;
+        self.ensure_column(
             "drift_reports",
             "acknowledged_at",
             "ALTER TABLE drift_reports ADD COLUMN acknowledged_at INTEGER",
@@ -1090,6 +1288,36 @@ impl SqliteStore {
             "drift_reports",
             "resolution_job_id",
             "ALTER TABLE drift_reports ADD COLUMN resolution_job_id TEXT",
+        )?;
+        self.ensure_column(
+            "drift_reports",
+            "job_id",
+            "ALTER TABLE drift_reports ADD COLUMN job_id TEXT",
+        )?;
+        self.ensure_column(
+            "drift_reports",
+            "task_id",
+            "ALTER TABLE drift_reports ADD COLUMN task_id TEXT",
+        )?;
+        self.ensure_column(
+            "drift_reports",
+            "policy_id",
+            "ALTER TABLE drift_reports ADD COLUMN policy_id TEXT",
+        )?;
+        self.ensure_column(
+            "drift_reports",
+            "policy_version",
+            "ALTER TABLE drift_reports ADD COLUMN policy_version INTEGER",
+        )?;
+        self.ensure_column(
+            "drift_reports",
+            "purpose",
+            "ALTER TABLE drift_reports ADD COLUMN purpose TEXT",
+        )?;
+        self.connection.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS drift_reports_correlated_task_unique_idx
+             ON drift_reports (job_id, task_id)
+             WHERE job_id IS NOT NULL AND task_id IS NOT NULL;",
         )?;
         self.ensure_approval_requests_allow_reserved_job_id()?;
         self.record_schema_version()?;
@@ -1118,6 +1346,53 @@ impl SqliteStore {
                 "SELECT version FROM schema_migrations WHERE name = 'fleet_store'",
                 [],
                 |row| row.get(0),
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn find_remediation_request_by_verification_job_id_record(
+        &self,
+        verification_job_id: &str,
+    ) -> Result<Option<AppRemediationRequestRecord>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT remediation_requests.id, policy_id, policy_name, agent_id, runbook_ref, status,
+                        approval_required, risk_summary, remediation_requests.job_id,
+                        origin_drift_report_id, policy_version, remediation_requests.created_at,
+                        remediation_requests.updated_at
+                 FROM remediation_requests
+                 JOIN remediation_verification_jobs
+                   ON remediation_verification_jobs.remediation_id = remediation_requests.id
+                 WHERE remediation_verification_jobs.job_id = ?1",
+                params![verification_job_id],
+                row_to_remediation_request_record,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn find_drift_report_by_correlation(
+        &self,
+        job_id: &str,
+        task_id: &str,
+    ) -> Result<Option<AppDriftReportRecord>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT id, agent_id, policy_name, status, expected, actual, checked_at,
+                        severity, acknowledged_at, acknowledged_by, resolved_at, resolution_job_id,
+                        job_id, task_id, policy_id, policy_version, purpose
+                 FROM drift_reports WHERE job_id = ?1 AND task_id = ?2",
+                params![job_id, task_id],
+                |row| {
+                    row_to_drift_report_page_record(row).map(|record| AppDriftReportRecord {
+                        id: record.id,
+                        agent_id: record.agent_id,
+                        report: record.report,
+                        provenance: record.provenance,
+                        checked_at: record.checked_at,
+                    })
+                },
             )
             .optional()
             .map_err(StoreError::from)
@@ -1657,20 +1932,43 @@ impl SqliteStore {
         report: &DriftReport,
         checked_at: SystemTime,
     ) -> Result<(), StoreError> {
-        self.connection.execute(
-            "INSERT INTO drift_reports (
-                agent_id, policy_name, status, severity, expected, actual, checked_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                agent_id,
-                report.policy_name.as_str(),
-                drift_status_to_str(&report.status),
-                drift_severity_to_str(report.severity),
-                report.expected.as_str(),
-                report.actual.as_str(),
-                system_time_to_unix_secs(checked_at),
-            ],
-        )?;
+        self.insert_drift_report_with_provenance(
+            agent_id,
+            report,
+            &DriftReportProvenance::uncorrelated(),
+            checked_at,
+        )
+    }
+
+    pub fn insert_drift_report_with_provenance(
+        &self,
+        agent_id: &str,
+        report: &DriftReport,
+        provenance: &DriftReportProvenance,
+        checked_at: SystemTime,
+    ) -> Result<(), StoreError> {
+        self.connection
+            .execute(
+                "INSERT INTO drift_reports (
+                agent_id, policy_name, status, severity, expected, actual, checked_at,
+                job_id, task_id, policy_id, policy_version, purpose
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    agent_id,
+                    report.policy_name.as_str(),
+                    drift_status_to_str(&report.status),
+                    drift_severity_to_str(report.severity),
+                    report.expected.as_str(),
+                    report.actual.as_str(),
+                    system_time_to_unix_secs(checked_at),
+                    provenance.job_id.as_ref().map(JobId::as_str),
+                    provenance.task_id.as_ref().map(TaskId::as_str),
+                    provenance.policy_id.as_deref(),
+                    provenance.policy_version.map(i64::from),
+                    provenance.purpose.map(DriftCheckPurpose::as_str),
+                ],
+            )
+            .map_err(map_drift_report_constraint)?;
         Ok(())
     }
 
@@ -1680,8 +1978,9 @@ impl SqliteStore {
     ) -> Result<Option<DriftReportRecord>, StoreError> {
         self.connection
             .query_row(
-                "SELECT agent_id, policy_name, status, expected, actual, checked_at
+                "SELECT id, agent_id, policy_name, status, expected, actual, checked_at
                     , severity, acknowledged_at, acknowledged_by, resolved_at, resolution_job_id
+                    , job_id, task_id, policy_id, policy_version, purpose
                  FROM drift_reports
                  WHERE agent_id = ?1
                  ORDER BY checked_at DESC, id DESC
@@ -1689,16 +1988,19 @@ impl SqliteStore {
                 params![agent_id],
                 |row| {
                     Ok(DriftReportRecord {
-                        agent_id: row.get(0)?,
+                        id: DriftReportId::new(row.get(0)?)
+                            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        agent_id: row.get(1)?,
                         report: DriftReport {
-                            policy_name: row.get(1)?,
-                            status: parse_drift_status(&row.get::<_, String>(2)?),
-                            severity: parse_drift_severity(&row.get::<_, String>(6)?),
-                            acknowledgement: row_to_drift_acknowledgement(row, 7, 8, 9, 10)?,
-                            expected: row.get(3)?,
-                            actual: row.get(4)?,
+                            policy_name: row.get(2)?,
+                            status: parse_drift_status(&row.get::<_, String>(3)?),
+                            severity: parse_drift_severity(&row.get::<_, String>(7)?),
+                            acknowledgement: row_to_drift_acknowledgement(row, 8, 9, 10, 11)?,
+                            expected: row.get(4)?,
+                            actual: row.get(5)?,
                         },
-                        checked_at: unix_secs_to_system_time(row.get(5)?),
+                        provenance: row_to_drift_report_provenance(row, 12, 13, 14, 15, 16)?,
+                        checked_at: unix_secs_to_system_time(row.get(6)?),
                     })
                 },
             )
@@ -1718,6 +2020,7 @@ impl SqliteStore {
             let mut statement = self.connection.prepare(
                 "SELECT id, agent_id, policy_name, status, expected, actual, checked_at
                     , severity, acknowledged_at, acknowledged_by, resolved_at, resolution_job_id
+                    , job_id, task_id, policy_id, policy_version, purpose
                  FROM drift_reports
                  WHERE agent_id = ?1
                    AND (checked_at < ?2 OR (checked_at = ?2 AND id < ?3))
@@ -1736,6 +2039,7 @@ impl SqliteStore {
         let mut statement = self.connection.prepare(
             "SELECT id, agent_id, policy_name, status, expected, actual, checked_at
                 , severity, acknowledged_at, acknowledged_by, resolved_at, resolution_job_id
+                , job_id, task_id, policy_id, policy_version, purpose
              FROM drift_reports
              WHERE agent_id = ?1
              ORDER BY checked_at DESC, id DESC
@@ -2294,12 +2598,27 @@ impl SqliteStore {
         task: &DriftCheckTask,
         assignments: &[TaskEnvelope],
     ) -> Result<(), StoreError> {
+        self.save_drift_check_job_with_assignments_and_provenance_record(
+            job,
+            task,
+            assignments,
+            None,
+        )
+    }
+
+    pub fn save_drift_check_job_with_assignments_and_provenance_record(
+        &self,
+        job: &Job,
+        task: &DriftCheckTask,
+        assignments: &[TaskEnvelope],
+        provenance: Option<&DriftJobProvenance>,
+    ) -> Result<(), StoreError> {
         self.run_sqlite_transaction(|| {
             self.connection.execute(
                 "INSERT INTO jobs (
                     id, status, risk, approval_requirement, timeout_ms,
-                    drift_policy_document
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    drift_policy_document, drift_policy_id, drift_policy_version, drift_purpose
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     job.id().as_str(),
                     job_status_to_str(job.status()),
@@ -2307,12 +2626,130 @@ impl SqliteStore {
                     approval_requirement_to_str(job.approval_requirement()),
                     job.timeout().as_millis() as i64,
                     task.policy_document(),
+                    provenance.map(|value| value.policy_id.as_str()),
+                    provenance.map(|value| i64::from(value.policy_version)),
+                    provenance.map(|value| value.purpose.as_str()),
                 ],
             )?;
             for assignment in assignments {
                 sqlite_insert_task_assignment_in_connection(&self.connection, assignment)?;
             }
             Ok(())
+        })
+    }
+
+    /// Atomically persists the one verification drift job correlated to a remediation request.
+    pub fn save_remediation_verification_job_record(
+        &self,
+        input: &AppRemediationVerificationJobPersistenceInput,
+    ) -> Result<AppRemediationVerificationJobSave, StoreError> {
+        self.run_sqlite_transaction(|| {
+            if let Some(job_id) =
+                self.find_remediation_verification_job_id(&input.remediation_id)?
+            {
+                return Ok(AppRemediationVerificationJobSave {
+                    job_id,
+                    created: false,
+                });
+            }
+            self.connection.execute(
+                "INSERT INTO jobs (
+                    id, status, risk, approval_requirement, timeout_ms,
+                    drift_policy_document, drift_policy_id, drift_policy_version, drift_purpose
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    input.job.id().as_str(),
+                    job_status_to_str(input.job.status()),
+                    task_risk_to_str(input.job.risk()),
+                    approval_requirement_to_str(input.job.approval_requirement()),
+                    input.job.timeout().as_millis() as i64,
+                    input.task.policy_document(),
+                    input.provenance.policy_id.as_str(),
+                    i64::from(input.provenance.policy_version),
+                    input.provenance.purpose.as_str(),
+                ],
+            )?;
+            sqlite_insert_task_assignment_in_connection(&self.connection, &input.assignment)?;
+            let inserted = self.connection.execute(
+                "INSERT INTO remediation_verification_jobs (remediation_id, job_id, created_at)
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    input.remediation_id.as_str(),
+                    input.job.id().as_str(),
+                    system_time_to_unix_secs(input.audit.occurred_at),
+                ],
+            )?;
+            if inserted != 1 {
+                return Err(StoreError::Domain(
+                    "remediation verification correlation was not created".to_owned(),
+                ));
+            }
+            self.insert_audit(&input.audit)?;
+            Ok(AppRemediationVerificationJobSave {
+                job_id: input.job.id().as_str().to_owned(),
+                created: true,
+            })
+        })
+    }
+
+    /// Atomically records a resolution derived from one persisted verification evidence report.
+    pub fn resolve_remediation_verification_evidence_record(
+        &self,
+        remediation: &AppRemediationRequestRecord,
+        origin_drift_report_id: &DriftReportId,
+        evidence_report_id: &DriftReportId,
+        verification_job_id: &str,
+        verification_task_id: &str,
+        audit: &AuditEvent,
+    ) -> Result<AppRemediationRequestRecord, StoreError> {
+        self.run_sqlite_transaction(|| {
+            let correlation = self.find_remediation_verification_job_id(&remediation.id)?;
+            if correlation.as_deref() != Some(verification_job_id) {
+                return Err(StoreError::NotFound);
+            }
+            let evidence_exists = self.connection.query_row(
+                "SELECT 1 FROM drift_reports
+                 WHERE id = ?1 AND agent_id = ?2 AND job_id = ?3 AND task_id = ?4
+                   AND policy_id = ?5 AND policy_version = ?6
+                   AND purpose = 'remediation_verification' AND status = 'compliant'",
+                params![
+                    evidence_report_id.as_i64(),
+                    remediation.agent_id,
+                    verification_job_id,
+                    verification_task_id,
+                    remediation.policy_id,
+                    remediation.policy_version.map(i64::from),
+                ],
+                |row| row.get::<_, i64>(0),
+            ).optional()?;
+            if evidence_exists.is_none() {
+                return Err(StoreError::NotFound);
+            }
+            let remediation_changed = self.connection.execute(
+                "UPDATE remediation_requests SET status = ?2, job_id = ?3, updated_at = ?4 WHERE id = ?1",
+                params![
+                    remediation.id,
+                    remediation.status,
+                    remediation.job_id,
+                    system_time_to_unix_secs(remediation.updated_at),
+                ],
+            )?;
+            if remediation_changed != 1 {
+                return Err(StoreError::NotFound);
+            }
+            let origin_changed = self.connection.execute(
+                "UPDATE drift_reports SET resolved_at = ?2, resolution_job_id = ?3 WHERE id = ?1",
+                params![
+                    origin_drift_report_id.as_i64(),
+                    system_time_to_unix_secs(audit.occurred_at),
+                    verification_job_id,
+                ],
+            )?;
+            if origin_changed != 1 {
+                return Err(StoreError::NotFound);
+            }
+            self.insert_audit(audit)?;
+            Ok(remediation.clone())
         })
     }
 
@@ -2366,16 +2803,16 @@ impl SqliteStore {
         })
     }
 
-    fn run_sqlite_transaction<F>(&self, operation: F) -> Result<(), StoreError>
+    fn run_sqlite_transaction<T, F>(&self, operation: F) -> Result<T, StoreError>
     where
-        F: FnOnce() -> Result<(), StoreError>,
+        F: FnOnce() -> Result<T, StoreError>,
     {
         self.connection.execute_batch("BEGIN IMMEDIATE")?;
         match operation() {
-            Ok(()) => self
-                .connection
-                .execute_batch("COMMIT")
-                .map_err(StoreError::from),
+            Ok(value) => {
+                self.connection.execute_batch("COMMIT")?;
+                Ok(value)
+            }
             Err(error) => {
                 let _ = self.connection.execute_batch("ROLLBACK");
                 Err(error)
@@ -2539,6 +2976,58 @@ impl SqliteStore {
         self.update_task_assignment_status(task_id, status, occurred_at, last_error)
     }
 
+    pub fn persist_remediation_execution_transition_record(
+        &self,
+        input: &AppRemediationExecutionPersistenceInput,
+    ) -> Result<bool, StoreError> {
+        self.run_sqlite_transaction(|| {
+            let Some(current_status) = self.find_task_assignment_status(&input.task_id)? else {
+                return Ok(false);
+            };
+            if assignment_status_value_is_terminal(&current_status) {
+                return Ok(false);
+            }
+            let occurred_at = system_time_to_unix_secs(input.occurred_at);
+            let changed = match input.assignment_status.as_str() {
+                "started" => self.connection.execute(
+                    "UPDATE task_assignments SET status = ?2, started_at = ?3 WHERE id = ?1",
+                    params![input.task_id, input.assignment_status, occurred_at],
+                )?,
+                "succeeded" | "failed" | "canceled" | "expired" => self.connection.execute(
+                    "UPDATE task_assignments
+                     SET status = ?2, completed_at = ?3, last_error = COALESCE(?4, last_error)
+                     WHERE id = ?1",
+                    params![
+                        input.task_id,
+                        input.assignment_status,
+                        occurred_at,
+                        input.assignment_last_error
+                    ],
+                )?,
+                _ => {
+                    return Err(StoreError::Domain(
+                        "unsupported remediation assignment transition".to_owned(),
+                    ));
+                }
+            };
+            if changed == 0 {
+                return Ok(false);
+            }
+            if let Some(remediation) = &input.remediation {
+                self.update_remediation_request_status_record(
+                    &remediation.id,
+                    &remediation.status,
+                    remediation.job_id.as_deref(),
+                    input.occurred_at,
+                )?;
+            }
+            if let Some(audit) = &input.remediation_audit {
+                self.insert_audit(audit)?;
+            }
+            Ok(true)
+        })
+    }
+
     pub fn claim_task_assignment_for_dispatch(
         &self,
         task_id: &str,
@@ -2589,13 +3078,48 @@ impl SqliteStore {
             .map_err(StoreError::from)
     }
 
+    pub fn find_drift_assignment_provenance(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<DriftAssignmentProvenanceRecord>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT ta.job_id, ta.id, ta.agent_id, j.drift_policy_id,
+                        j.drift_policy_version, j.drift_purpose
+                 FROM task_assignments ta
+                 JOIN jobs j ON j.id = ta.job_id
+                 WHERE ta.id = ?1
+                   AND j.drift_policy_document IS NOT NULL
+                   AND j.drift_policy_id IS NOT NULL
+                   AND j.drift_policy_version IS NOT NULL
+                   AND j.drift_purpose IS NOT NULL",
+                params![task_id],
+                |row| {
+                    let purpose = row.get::<_, String>(5)?;
+                    let Some(purpose) = DriftCheckPurpose::parse(&purpose) else {
+                        return Err(rusqlite::Error::InvalidQuery);
+                    };
+                    Ok(DriftAssignmentProvenanceRecord {
+                        job_id: row.get(0)?,
+                        task_id: row.get(1)?,
+                        agent_id: row.get(2)?,
+                        policy_id: row.get(3)?,
+                        policy_version: row.get::<_, i64>(4)?.max(0) as u32,
+                        purpose,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
     pub fn find_task_assignment_state_for_job(
         &self,
         job_id: &str,
     ) -> Result<Option<TaskAssignmentStateRecord>, StoreError> {
         self.connection
             .query_row(
-                "SELECT job_id, id, agent_id, status
+                "SELECT job_id, id, agent_id, status, completed_at
                  FROM task_assignments
                  WHERE job_id = ?1
                  ORDER BY created_at, id
@@ -2607,6 +3131,7 @@ impl SqliteStore {
                         task_id: row.get(1)?,
                         agent_id: row.get(2)?,
                         status: row.get(3)?,
+                        completed_at: row.get::<_, Option<i64>>(4)?.map(unix_secs_to_system_time),
                     })
                 },
             )
@@ -3421,8 +3946,9 @@ impl SqliteStore {
         self.connection.execute(
             "INSERT INTO remediation_requests (
                 id, policy_id, policy_name, agent_id, runbook_ref, status,
-                approval_required, risk_summary, job_id, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                approval_required, risk_summary, job_id, origin_drift_report_id, policy_version,
+                created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 request.id,
                 request.policy_id,
@@ -3437,11 +3963,174 @@ impl SqliteStore {
                 },
                 request.risk_summary,
                 request.job_id,
+                request.origin_drift_report_id.map(DriftReportId::as_i64),
+                request.policy_version.map(i64::from),
                 system_time_to_unix_secs(request.created_at),
                 system_time_to_unix_secs(request.updated_at),
             ],
         )?;
         Ok(())
+    }
+
+    pub fn save_remediation_proposal_record(
+        &self,
+        request: &AppRemediationRequestRecord,
+        audit: &AuditEvent,
+    ) -> Result<AppRemediationProposalSave, StoreError> {
+        self.run_sqlite_transaction(|| {
+            let existing = self
+                .connection
+                .query_row(
+                    "SELECT id, policy_id, policy_name, agent_id, runbook_ref, status,
+                            approval_required, risk_summary, job_id, origin_drift_report_id,
+                            policy_version, created_at, updated_at
+                     FROM remediation_requests
+                     WHERE agent_id = ?1 AND policy_id = ?2
+                       AND origin_drift_report_id IS NOT NULL
+                       AND status NOT IN ('resolved', 'failed', 'rejected', 'expired', 'canceled')
+                     ORDER BY created_at, id
+                     LIMIT 1",
+                    params![request.agent_id, request.policy_id],
+                    row_to_remediation_request_record,
+                )
+                .optional()?;
+            if let Some(remediation) = existing {
+                return Ok(AppRemediationProposalSave {
+                    remediation,
+                    created: false,
+                });
+            }
+            self.save_remediation_request_record(request)?;
+            self.insert_audit(audit)?;
+            Ok(AppRemediationProposalSave {
+                remediation: request.clone(),
+                created: true,
+            })
+        })
+    }
+
+    pub fn save_verified_drift_proposal_record(
+        &self,
+        input: &AppPersistVerifiedDriftProposalInput,
+    ) -> Result<AppPersistVerifiedDriftProposalOutput, StoreError> {
+        self.run_sqlite_transaction(|| {
+            let job_id = input
+                .provenance
+                .job_id
+                .as_ref()
+                .ok_or_else(|| StoreError::Domain("verified drift requires job id".to_owned()))?;
+            let task_id = input
+                .provenance
+                .task_id
+                .as_ref()
+                .ok_or_else(|| StoreError::Domain("verified drift requires task id".to_owned()))?;
+            let existing = self
+                .connection
+                .query_row(
+                    "SELECT id, agent_id, policy_name, status, expected, actual, checked_at,
+                            severity, acknowledged_at, acknowledged_by, resolved_at, resolution_job_id,
+                            job_id, task_id, policy_id, policy_version, purpose
+                     FROM drift_reports WHERE job_id = ?1 AND task_id = ?2",
+                    params![job_id.as_str(), task_id.as_str()],
+                    |row| {
+                        row_to_drift_report_page_record(row).map(|record| AppDriftReportRecord {
+                            id: record.id,
+                            agent_id: record.agent_id,
+                            report: record.report,
+                            provenance: record.provenance,
+                            checked_at: record.checked_at,
+                        })
+                    },
+                )
+                .optional()?;
+            if let Some(report) = existing {
+                let remediation = self
+                    .connection
+                    .query_row(
+                        "SELECT id, policy_id, policy_name, agent_id, runbook_ref, status,
+                                approval_required, risk_summary, job_id, origin_drift_report_id,
+                                policy_version, created_at, updated_at
+                         FROM remediation_requests WHERE origin_drift_report_id = ?1
+                         ORDER BY created_at, id LIMIT 1",
+                        params![report.id.as_i64()],
+                        row_to_remediation_request_record,
+                    )
+                    .optional()?
+                    .ok_or_else(|| {
+                        StoreError::Domain("verified drift has no remediation proposal".to_owned())
+                    })?;
+                return Ok(AppPersistVerifiedDriftProposalOutput {
+                    report,
+                    proposal: AppRemediationProposalSave {
+                        remediation,
+                        created: false,
+                    },
+                });
+            }
+            self.connection
+                .execute(
+                    "INSERT INTO drift_reports (
+                        agent_id, policy_name, status, severity, expected, actual, checked_at,
+                        job_id, task_id, policy_id, policy_version, purpose
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    params![
+                        input.agent_id,
+                        input.report.policy_name,
+                        drift_status_to_str(&input.report.status),
+                        drift_severity_to_str(input.report.severity),
+                        input.report.expected,
+                        input.report.actual,
+                        system_time_to_unix_secs(input.checked_at),
+                        job_id.as_str(),
+                        task_id.as_str(),
+                        input.provenance.policy_id,
+                        input.provenance.policy_version.map(i64::from),
+                        input.provenance.purpose.map(DriftCheckPurpose::as_str),
+                    ],
+                )
+                .map_err(map_drift_report_constraint)?;
+            let report_id = DriftReportId::new(self.connection.last_insert_rowid())
+                .map_err(|error| StoreError::Domain(format!("{error:?}")))?;
+            let report = AppDriftReportRecord {
+                id: report_id,
+                agent_id: input.agent_id.clone(),
+                report: input.report.clone(),
+                provenance: input.provenance.clone(),
+                checked_at: input.checked_at,
+            };
+            self.insert_audit(&input.drift_audit)?;
+            let mut remediation = input.remediation.clone();
+            remediation.origin_drift_report_id = Some(report_id);
+            let existing = self
+                .connection
+                .query_row(
+                    "SELECT id, policy_id, policy_name, agent_id, runbook_ref, status,
+                            approval_required, risk_summary, job_id, origin_drift_report_id,
+                            policy_version, created_at, updated_at
+                     FROM remediation_requests
+                     WHERE agent_id = ?1 AND policy_id = ?2
+                       AND origin_drift_report_id IS NOT NULL
+                       AND status NOT IN ('resolved', 'failed', 'rejected', 'expired', 'canceled')
+                     ORDER BY created_at, id LIMIT 1",
+                    params![remediation.agent_id, remediation.policy_id],
+                    row_to_remediation_request_record,
+                )
+                .optional()?;
+            let proposal = if let Some(existing) = existing {
+                AppRemediationProposalSave {
+                    remediation: existing,
+                    created: false,
+                }
+            } else {
+                self.save_remediation_request_record(&remediation)?;
+                self.insert_audit(&input.proposal_audit)?;
+                AppRemediationProposalSave {
+                    remediation,
+                    created: true,
+                }
+            };
+            Ok(AppPersistVerifiedDriftProposalOutput { report, proposal })
+        })
     }
 
     pub fn find_remediation_request_record(
@@ -3451,7 +4140,8 @@ impl SqliteStore {
         self.connection
             .query_row(
                 "SELECT id, policy_id, policy_name, agent_id, runbook_ref, status,
-                        approval_required, risk_summary, job_id, created_at, updated_at
+                        approval_required, risk_summary, job_id, origin_drift_report_id, policy_version,
+                        created_at, updated_at
                  FROM remediation_requests
                  WHERE id = ?1",
                 params![request_id],
@@ -3459,6 +4149,52 @@ impl SqliteStore {
             )
             .optional()
             .map_err(StoreError::from)
+    }
+
+    pub fn find_remediation_request_by_job_id_record(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<AppRemediationRequestRecord>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT id, policy_id, policy_name, agent_id, runbook_ref, status,
+                        approval_required, risk_summary, job_id, origin_drift_report_id, policy_version,
+                        created_at, updated_at
+                 FROM remediation_requests
+                 WHERE job_id = ?1",
+                params![job_id],
+                row_to_remediation_request_record,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn find_remediation_verification_job_id(
+        &self,
+        remediation_id: &str,
+    ) -> Result<Option<String>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT job_id FROM remediation_verification_jobs WHERE remediation_id = ?1",
+                params![remediation_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn save_remediation_verification_job(
+        &self,
+        remediation_id: &str,
+        job_id: &str,
+        created_at: SystemTime,
+    ) -> Result<bool, StoreError> {
+        let inserted = self.connection.execute(
+            "INSERT INTO remediation_verification_jobs (remediation_id, job_id, created_at)
+             VALUES (?1, ?2, ?3) ON CONFLICT (remediation_id) DO NOTHING",
+            params![remediation_id, job_id, system_time_to_unix_secs(created_at)],
+        )?;
+        Ok(inserted > 0)
     }
 
     pub fn list_remediation_request_records(
@@ -3470,7 +4206,8 @@ impl SqliteStore {
         let limit = limit.clamp(1, 500);
         let mut statement = self.connection.prepare(
             "SELECT id, policy_id, policy_name, agent_id, runbook_ref, status,
-                    approval_required, risk_summary, job_id, created_at, updated_at
+                    approval_required, risk_summary, job_id, origin_drift_report_id, policy_version,
+                    created_at, updated_at
              FROM remediation_requests
              ORDER BY created_at, id",
         )?;
@@ -3490,6 +4227,34 @@ impl SqliteStore {
             }
         }
         Ok(records)
+    }
+
+    /// Returns the bounded, correlation-free verification backlog for controller startup.
+    pub fn list_pending_remediation_verification_recovery_records(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<AppRemediationRequestRecord>, StoreError> {
+        let limit = limit.clamp(1, 100);
+        let mut statement = self.connection.prepare(
+            "SELECT remediation_requests.id, remediation_requests.policy_id,
+                    remediation_requests.policy_name, remediation_requests.agent_id,
+                    remediation_requests.runbook_ref, remediation_requests.status,
+                    remediation_requests.approval_required, remediation_requests.risk_summary,
+                    remediation_requests.job_id, remediation_requests.origin_drift_report_id,
+                    remediation_requests.policy_version,
+                    remediation_requests.created_at, remediation_requests.updated_at
+             FROM remediation_requests
+             LEFT JOIN remediation_verification_jobs
+               ON remediation_verification_jobs.remediation_id = remediation_requests.id
+             WHERE remediation_requests.status = 'succeeded_pending_verify'
+               AND remediation_verification_jobs.remediation_id IS NULL
+             ORDER BY remediation_requests.created_at, remediation_requests.id
+             LIMIT ?1",
+        )?;
+        statement
+            .query_map(params![limit], row_to_remediation_request_record)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
     }
 
     pub fn update_remediation_request_status_record(
@@ -4938,6 +5703,37 @@ impl ArtifactStore for LocalArtifactStore {
 
 #[cfg(feature = "postgres")]
 impl PostgresStore {
+    pub fn find_drift_assignment_provenance(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<DriftAssignmentProvenanceRecord>, StoreError> {
+        let row = self
+            .checkout_client()?
+            .query_opt(
+                "SELECT ta.job_id, ta.id, ta.agent_id, j.drift_policy_id,
+                    j.drift_policy_version, j.drift_purpose
+             FROM task_assignments ta JOIN jobs j ON j.id = ta.job_id
+             WHERE ta.id = $1 AND j.drift_policy_document IS NOT NULL
+               AND j.drift_policy_id IS NOT NULL
+               AND j.drift_policy_version IS NOT NULL
+               AND j.drift_purpose IS NOT NULL",
+                &[&task_id],
+            )
+            .map_err(|_| postgres_error("postgres drift provenance query failed"))?;
+        Ok(row.and_then(|row| {
+            DriftCheckPurpose::parse(&row.get::<_, String>(5)).map(|purpose| {
+                DriftAssignmentProvenanceRecord {
+                    job_id: row.get(0),
+                    task_id: row.get(1),
+                    agent_id: row.get(2),
+                    policy_id: row.get(3),
+                    policy_version: row.get::<_, i64>(4).max(0) as u32,
+                    purpose,
+                }
+            })
+        }))
+    }
+
     pub fn save_agent(&mut self, agent: Agent) -> Result<(), StoreError> {
         <Self as AgentRepository>::save(self, agent)
     }
@@ -5361,6 +6157,16 @@ impl DriftCheckJobRepository for PostgresStore {
         task: &DriftCheckTask,
         assignments: &[TaskEnvelope],
     ) -> Result<(), <Self as TaskAssignmentRepository>::Error> {
+        self.save_drift_check_job_with_assignments_and_provenance(job, task, assignments, None)
+    }
+
+    fn save_drift_check_job_with_assignments_and_provenance(
+        &mut self,
+        job: Job,
+        task: &DriftCheckTask,
+        assignments: &[TaskEnvelope],
+        provenance: Option<&DriftJobProvenance>,
+    ) -> Result<(), <Self as TaskAssignmentRepository>::Error> {
         let mut client = self.checkout_client()?;
         let mut transaction = client
             .transaction()
@@ -5369,8 +6175,8 @@ impl DriftCheckJobRepository for PostgresStore {
             .execute(
                 "INSERT INTO jobs (
                     id, status, risk, approval_requirement, timeout_ms,
-                    drift_policy_document
-                 ) VALUES ($1, $2, $3, $4, $5, $6)",
+                    drift_policy_document, drift_policy_id, drift_policy_version, drift_purpose
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
                 &[
                     &job.id().as_str(),
                     &job_status_to_str(job.status()),
@@ -5378,6 +6184,9 @@ impl DriftCheckJobRepository for PostgresStore {
                     &approval_requirement_to_str(job.approval_requirement()),
                     &(job.timeout().as_millis() as i64),
                     &task.policy_document(),
+                    &provenance.map(|value| value.policy_id.as_str()),
+                    &provenance.map(|value| i64::from(value.policy_version)),
+                    &provenance.map(|value| value.purpose.as_str()),
                 ],
             )
             .map_err(|error| {
@@ -5691,6 +6500,16 @@ impl DriftRepository for PostgresStore {
         postgres_insert_drift_report(self, agent_id, report, checked_at)
     }
 
+    fn insert_drift_report_with_provenance(
+        &mut self,
+        agent_id: &str,
+        report: &DriftReport,
+        provenance: &DriftReportProvenance,
+        checked_at: SystemTime,
+    ) -> Result<(), Self::Error> {
+        postgres_insert_drift_report_with_provenance(self, agent_id, report, provenance, checked_at)
+    }
+
     fn latest_drift_report(
         &self,
         agent_id: &str,
@@ -5865,6 +6684,17 @@ impl RemediationRequestRepository for PostgresStore {
         postgres_find_remediation_request(self, request_id)
     }
 
+    fn find_remediation_request_by_job_id(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<AppRemediationRequestRecord>, Self::Error> {
+        postgres_list_remediation_requests(self, None, None, 500).map(|requests| {
+            requests
+                .into_iter()
+                .find(|request| request.job_id.as_deref() == Some(job_id))
+        })
+    }
+
     fn list_remediation_requests(
         &self,
         agent_id: Option<&str>,
@@ -5882,6 +6712,297 @@ impl RemediationRequestRepository for PostgresStore {
         updated_at: SystemTime,
     ) -> Result<(), Self::Error> {
         postgres_update_remediation_request_status(self, request_id, status, job_id, updated_at)
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl RemediationExecutionPersistenceRepository for PostgresStore {
+    type Error = StoreError;
+
+    fn persist_remediation_execution_transition(
+        &mut self,
+        input: AppRemediationExecutionPersistenceInput,
+    ) -> Result<bool, Self::Error> {
+        let mut client = self.checkout_client()?;
+        let mut transaction = client
+            .transaction()
+            .map_err(|_| postgres_error("postgres remediation execution transaction failed"))?;
+        let current_status = transaction
+            .query_opt(
+                "SELECT status FROM task_assignments WHERE id = $1",
+                &[&input.task_id],
+            )
+            .map_err(|_| postgres_error("postgres remediation execution assignment lookup failed"))?
+            .map(|row| row.get::<_, String>(0));
+        let Some(current_status) = current_status else {
+            transaction.rollback().ok();
+            return Ok(false);
+        };
+        if assignment_status_value_is_terminal(&current_status) {
+            transaction.rollback().ok();
+            return Ok(false);
+        }
+        let occurred_at = system_time_to_unix_secs(input.occurred_at);
+        let changed = match input.assignment_status.as_str() {
+            "started" => transaction.execute(
+                "UPDATE task_assignments SET status = $2, started_at = $3 WHERE id = $1",
+                &[&input.task_id, &input.assignment_status, &occurred_at],
+            ),
+            "succeeded" | "failed" | "canceled" | "expired" => transaction.execute(
+                "UPDATE task_assignments
+                 SET status = $2, completed_at = $3, last_error = COALESCE($4, last_error)
+                 WHERE id = $1",
+                &[
+                    &input.task_id,
+                    &input.assignment_status,
+                    &occurred_at,
+                    &input.assignment_last_error,
+                ],
+            ),
+            _ => {
+                return Err(StoreError::Domain(
+                    "unsupported remediation assignment transition".to_owned(),
+                ));
+            }
+        }
+        .map_err(|_| postgres_error("postgres remediation execution assignment update failed"))?;
+        if changed == 0 {
+            transaction.rollback().ok();
+            return Ok(false);
+        }
+        if let Some(remediation) = &input.remediation {
+            transaction.execute(
+                "UPDATE remediation_requests SET status = $2, job_id = $3, updated_at = $4 WHERE id = $1",
+                &[&remediation.id, &remediation.status, &remediation.job_id, &occurred_at],
+            ).map_err(|_| postgres_error("postgres remediation execution update failed"))?;
+        }
+        if let Some(audit) = &input.remediation_audit {
+            postgres_insert_audit_in_transaction(&mut transaction, audit)?;
+        }
+        transaction
+            .commit()
+            .map_err(|_| postgres_error("postgres remediation execution commit failed"))?;
+        Ok(true)
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl RemediationVerificationJobRepository for PostgresStore {
+    fn find_remediation_verification_job(
+        &self,
+        remediation_id: &str,
+    ) -> Result<Option<String>, <Self as RemediationRequestRepository>::Error> {
+        self.find_remediation_verification_job_id(remediation_id)
+    }
+
+    fn save_remediation_verification_job(
+        &mut self,
+        input: AppRemediationVerificationJobPersistenceInput,
+    ) -> Result<AppRemediationVerificationJobSave, <Self as RemediationRequestRepository>::Error>
+    {
+        let mut client = self.checkout_client()?;
+        let mut transaction = client
+            .transaction()
+            .map_err(|_| postgres_error("postgres remediation verification transaction failed"))?;
+        let remediation_exists = transaction
+            .query_opt(
+                "SELECT id FROM remediation_requests WHERE id = $1 FOR UPDATE",
+                &[&input.remediation_id],
+            )
+            .map_err(|_| postgres_error("postgres remediation verification lookup failed"))?;
+        if remediation_exists.is_none() {
+            transaction.rollback().ok();
+            return Err(StoreError::NotFound);
+        }
+        if let Some(existing) = transaction
+            .query_opt(
+                "SELECT job_id FROM remediation_verification_jobs WHERE remediation_id = $1",
+                &[&input.remediation_id],
+            )
+            .map_err(|_| {
+                postgres_error("postgres remediation verification correlation lookup failed")
+            })?
+            .map(|row| row.get(0))
+        {
+            transaction.rollback().ok();
+            return Ok(AppRemediationVerificationJobSave {
+                job_id: existing,
+                created: false,
+            });
+        }
+        transaction
+            .execute(
+                "INSERT INTO jobs (
+                    id, status, risk, approval_requirement, timeout_ms,
+                    drift_policy_document, drift_policy_id, drift_policy_version, drift_purpose
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                &[
+                    &input.job.id().as_str(),
+                    &job_status_to_str(input.job.status()),
+                    &task_risk_to_str(input.job.risk()),
+                    &approval_requirement_to_str(input.job.approval_requirement()),
+                    &(input.job.timeout().as_millis() as i64),
+                    &input.task.policy_document(),
+                    &input.provenance.policy_id,
+                    &i64::from(input.provenance.policy_version),
+                    &input.provenance.purpose.as_str(),
+                ],
+            )
+            .map_err(|error| {
+                postgres_constraint_or_context(
+                    error,
+                    "postgres remediation verification job insert failed",
+                )
+            })?;
+        postgres_insert_task_assignment_in_transaction(&mut transaction, &input.assignment)?;
+        transaction
+            .execute(
+                "INSERT INTO remediation_verification_jobs (remediation_id, job_id, created_at)
+                 VALUES ($1, $2, $3)",
+                &[
+                    &input.remediation_id,
+                    &input.job.id().as_str(),
+                    &system_time_to_unix_secs(input.audit.occurred_at),
+                ],
+            )
+            .map_err(|error| {
+                postgres_constraint_or_context(
+                    error,
+                    "postgres remediation verification correlation insert failed",
+                )
+            })?;
+        postgres_insert_audit_in_transaction(&mut transaction, &input.audit)?;
+        transaction
+            .commit()
+            .map_err(|_| postgres_error("postgres remediation verification commit failed"))?;
+        Ok(AppRemediationVerificationJobSave {
+            job_id: input.job.id().as_str().to_owned(),
+            created: true,
+        })
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl RemediationVerificationResolutionRepository for PostgresStore {
+    fn resolve_remediation_verification_evidence(
+        &mut self,
+        remediation: AppRemediationRequestRecord,
+        origin_drift_report_id: DriftReportId,
+        evidence_report_id: DriftReportId,
+        verification_job_id: &str,
+        verification_task_id: &str,
+        audit: AuditEvent,
+    ) -> Result<AppRemediationRequestRecord, <Self as RemediationRequestRepository>::Error> {
+        let mut client = self.checkout_client()?;
+        let mut transaction = client.transaction().map_err(|_| {
+            postgres_error("postgres remediation verification resolution transaction failed")
+        })?;
+        let correlation = transaction
+            .query_opt(
+                "SELECT job_id FROM remediation_verification_jobs WHERE remediation_id = $1 FOR UPDATE",
+                &[&remediation.id],
+            )
+            .map_err(|_| postgres_error("postgres remediation verification resolution lookup failed"))?
+            .map(|row| row.get::<_, String>(0));
+        if correlation.as_deref() != Some(verification_job_id) {
+            transaction.rollback().ok();
+            return Err(StoreError::NotFound);
+        }
+        let evidence_exists = transaction
+            .query_opt(
+                "SELECT 1 FROM drift_reports
+                 WHERE id = $1 AND agent_id = $2 AND job_id = $3 AND task_id = $4
+                   AND policy_id = $5 AND policy_version = $6
+                   AND purpose = 'remediation_verification' AND status = 'compliant'",
+                &[
+                    &evidence_report_id.as_i64(),
+                    &remediation.agent_id,
+                    &verification_job_id,
+                    &verification_task_id,
+                    &remediation.policy_id,
+                    &remediation.policy_version.map(i64::from),
+                ],
+            )
+            .map_err(|_| {
+                postgres_error("postgres remediation verification evidence lookup failed")
+            })?;
+        if evidence_exists.is_none() {
+            transaction.rollback().ok();
+            return Err(StoreError::NotFound);
+        }
+        let updated = transaction
+            .execute(
+                "UPDATE remediation_requests SET status = $2, job_id = $3, updated_at = $4 WHERE id = $1",
+                &[
+                    &remediation.id,
+                    &remediation.status,
+                    &remediation.job_id,
+                    &system_time_to_unix_secs(remediation.updated_at),
+                ],
+            )
+            .map_err(|_| postgres_error("postgres remediation verification resolution update failed"))?;
+        if updated != 1 {
+            transaction.rollback().ok();
+            return Err(StoreError::NotFound);
+        }
+        let origin_updated = transaction
+            .execute(
+                "UPDATE drift_reports SET resolved_at = $2, resolution_job_id = $3 WHERE id = $1",
+                &[
+                    &origin_drift_report_id.as_i64(),
+                    &system_time_to_unix_secs(audit.occurred_at),
+                    &verification_job_id,
+                ],
+            )
+            .map_err(|_| {
+                postgres_error("postgres remediation verification origin update failed")
+            })?;
+        if origin_updated != 1 {
+            transaction.rollback().ok();
+            return Err(StoreError::NotFound);
+        }
+        postgres_insert_audit_in_transaction(&mut transaction, &audit)?;
+        transaction.commit().map_err(|_| {
+            postgres_error("postgres remediation verification resolution commit failed")
+        })?;
+        Ok(remediation)
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl RemediationVerificationRecoveryRepository for PostgresStore {
+    type Error = StoreError;
+
+    fn list_pending_remediation_verification_recovery(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<AppRemediationRequestRecord>, Self::Error> {
+        postgres_list_pending_remediation_verification_recovery(self, limit)
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl RemediationProposalRepository for PostgresStore {
+    type Error = StoreError;
+
+    fn save_remediation_proposal(
+        &mut self,
+        remediation: AppRemediationRequestRecord,
+        audit: AuditEvent,
+    ) -> Result<AppRemediationProposalSave, Self::Error> {
+        postgres_save_remediation_proposal(self, &remediation, &audit)
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl VerifiedDriftProposalRepository for PostgresStore {
+    type Error = StoreError;
+
+    fn save_verified_drift_proposal(
+        &mut self,
+        input: AppPersistVerifiedDriftProposalInput,
+    ) -> Result<AppPersistVerifiedDriftProposalOutput, Self::Error> {
+        postgres_save_verified_drift_proposal(self, &input)
     }
 }
 
@@ -6634,6 +7755,13 @@ impl RemediationRequestRepository for SqliteStore {
         self.find_remediation_request_record(request_id)
     }
 
+    fn find_remediation_request_by_job_id(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<AppRemediationRequestRecord>, Self::Error> {
+        self.find_remediation_request_by_job_id_record(job_id)
+    }
+
     fn list_remediation_requests(
         &self,
         agent_id: Option<&str>,
@@ -6651,6 +7779,89 @@ impl RemediationRequestRepository for SqliteStore {
         updated_at: SystemTime,
     ) -> Result<(), Self::Error> {
         self.update_remediation_request_status_record(request_id, status, job_id, updated_at)
+    }
+}
+
+impl RemediationProposalRepository for SqliteStore {
+    type Error = StoreError;
+
+    fn save_remediation_proposal(
+        &mut self,
+        remediation: AppRemediationRequestRecord,
+        audit: AuditEvent,
+    ) -> Result<AppRemediationProposalSave, Self::Error> {
+        self.save_remediation_proposal_record(&remediation, &audit)
+    }
+}
+
+impl RemediationExecutionPersistenceRepository for SqliteStore {
+    type Error = StoreError;
+
+    fn persist_remediation_execution_transition(
+        &mut self,
+        input: AppRemediationExecutionPersistenceInput,
+    ) -> Result<bool, Self::Error> {
+        self.persist_remediation_execution_transition_record(&input)
+    }
+}
+
+impl RemediationVerificationJobRepository for SqliteStore {
+    fn find_remediation_verification_job(
+        &self,
+        remediation_id: &str,
+    ) -> Result<Option<String>, <Self as RemediationRequestRepository>::Error> {
+        self.find_remediation_verification_job_id(remediation_id)
+    }
+
+    fn save_remediation_verification_job(
+        &mut self,
+        input: AppRemediationVerificationJobPersistenceInput,
+    ) -> Result<AppRemediationVerificationJobSave, <Self as RemediationRequestRepository>::Error>
+    {
+        self.save_remediation_verification_job_record(&input)
+    }
+}
+
+impl RemediationVerificationResolutionRepository for SqliteStore {
+    fn resolve_remediation_verification_evidence(
+        &mut self,
+        remediation: AppRemediationRequestRecord,
+        origin_drift_report_id: DriftReportId,
+        evidence_report_id: DriftReportId,
+        verification_job_id: &str,
+        verification_task_id: &str,
+        audit: AuditEvent,
+    ) -> Result<AppRemediationRequestRecord, <Self as RemediationRequestRepository>::Error> {
+        self.resolve_remediation_verification_evidence_record(
+            &remediation,
+            &origin_drift_report_id,
+            &evidence_report_id,
+            verification_job_id,
+            verification_task_id,
+            &audit,
+        )
+    }
+}
+
+impl RemediationVerificationRecoveryRepository for SqliteStore {
+    type Error = StoreError;
+
+    fn list_pending_remediation_verification_recovery(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<AppRemediationRequestRecord>, Self::Error> {
+        self.list_pending_remediation_verification_recovery_records(limit)
+    }
+}
+
+impl VerifiedDriftProposalRepository for SqliteStore {
+    type Error = StoreError;
+
+    fn save_verified_drift_proposal(
+        &mut self,
+        input: AppPersistVerifiedDriftProposalInput,
+    ) -> Result<AppPersistVerifiedDriftProposalOutput, Self::Error> {
+        self.save_verified_drift_proposal_record(&input)
     }
 }
 
@@ -6888,14 +8099,28 @@ impl DriftRepository for SqliteStore {
         SqliteStore::insert_drift_report(self, agent_id, report, checked_at)
     }
 
+    fn insert_drift_report_with_provenance(
+        &mut self,
+        agent_id: &str,
+        report: &DriftReport,
+        provenance: &DriftReportProvenance,
+        checked_at: SystemTime,
+    ) -> Result<(), Self::Error> {
+        SqliteStore::insert_drift_report_with_provenance(
+            self, agent_id, report, provenance, checked_at,
+        )
+    }
+
     fn latest_drift_report(
         &self,
         agent_id: &str,
     ) -> Result<Option<AppDriftReportRecord>, Self::Error> {
         Ok(
             SqliteStore::latest_drift_report(self, agent_id)?.map(|record| AppDriftReportRecord {
+                id: record.id,
                 agent_id: record.agent_id,
                 report: record.report,
+                provenance: record.provenance,
                 checked_at: record.checked_at,
             }),
         )
@@ -6911,8 +8136,10 @@ impl DriftRepository for SqliteStore {
             SqliteStore::list_drift_reports(self, agent_id, limit, before)?
                 .into_iter()
                 .map(|record| AppDriftReportPageRecord {
+                    id: record.id,
                     agent_id: record.agent_id,
                     report: record.report,
+                    provenance: record.provenance,
                     checked_at: record.checked_at,
                     cursor: record.cursor,
                 })
@@ -7101,6 +8328,7 @@ fn row_to_drift_report_page_record(
     let id = row.get(0)?;
     let checked_at = unix_secs_to_system_time(row.get(6)?);
     Ok(DriftReportPageRecord {
+        id: DriftReportId::new(id).map_err(|_| rusqlite::Error::InvalidQuery)?,
         agent_id: row.get(1)?,
         report: DriftReport {
             policy_name: row.get(2)?,
@@ -7110,12 +8338,65 @@ fn row_to_drift_report_page_record(
             expected: row.get(4)?,
             actual: row.get(5)?,
         },
+        provenance: row_to_drift_report_provenance(row, 12, 13, 14, 15, 16)?,
         checked_at,
         cursor: SnapshotPageCursor {
             occurred_at: checked_at,
             row_id: id,
         },
     })
+}
+
+fn row_to_drift_report_provenance(
+    row: &rusqlite::Row<'_>,
+    job_id_index: usize,
+    task_id_index: usize,
+    policy_id_index: usize,
+    policy_version_index: usize,
+    purpose_index: usize,
+) -> rusqlite::Result<DriftReportProvenance> {
+    let job_id = row.get::<_, Option<String>>(job_id_index)?;
+    let task_id = row.get::<_, Option<String>>(task_id_index)?;
+    let policy_id = row.get::<_, Option<String>>(policy_id_index)?;
+    let policy_version = row.get::<_, Option<i64>>(policy_version_index)?;
+    let purpose = row.get::<_, Option<String>>(purpose_index)?;
+
+    let (Some(job_id), Some(task_id), Some(policy_id), Some(policy_version), Some(purpose)) =
+        (job_id, task_id, policy_id, policy_version, purpose)
+    else {
+        return Ok(DriftReportProvenance::uncorrelated());
+    };
+    let (Ok(job_id), Ok(task_id), Some(purpose)) = (
+        JobId::new(job_id),
+        TaskId::new(task_id),
+        DriftCheckPurpose::parse(&purpose),
+    ) else {
+        return Ok(DriftReportProvenance::uncorrelated());
+    };
+    if policy_version < 0 {
+        return Ok(DriftReportProvenance::uncorrelated());
+    }
+
+    Ok(DriftReportProvenance::verified(
+        job_id,
+        task_id,
+        policy_id,
+        policy_version as u32,
+        purpose,
+    ))
+}
+
+fn map_drift_report_constraint(error: rusqlite::Error) -> StoreError {
+    if matches!(
+        &error,
+        rusqlite::Error::SqliteFailure(code, _)
+            if code.code == ErrorCode::ConstraintViolation
+    ) {
+        return StoreError::ConstraintViolation(
+            "drift report correlation must be unique".to_owned(),
+        );
+    }
+    StoreError::Sqlite(error)
 }
 
 fn row_to_policy_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<PolicyRecord> {
@@ -7193,8 +8474,16 @@ fn row_to_remediation_request_record(
         approval_required: row.get::<_, i64>(6)? != 0,
         risk_summary: row.get(7)?,
         job_id: row.get(8)?,
-        created_at: unix_secs_to_system_time(row.get(9)?),
-        updated_at: unix_secs_to_system_time(row.get(10)?),
+        origin_drift_report_id: row
+            .get::<_, Option<i64>>(9)?
+            .map(DriftReportId::new)
+            .transpose()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+        policy_version: row
+            .get::<_, Option<i64>>(10)?
+            .and_then(|value| u32::try_from(value).ok()),
+        created_at: unix_secs_to_system_time(row.get(11)?),
+        updated_at: unix_secs_to_system_time(row.get(12)?),
     })
 }
 
@@ -7642,12 +8931,30 @@ fn postgres_insert_drift_report(
     report: &DriftReport,
     checked_at: SystemTime,
 ) -> Result<(), StoreError> {
+    postgres_insert_drift_report_with_provenance(
+        store,
+        agent_id,
+        report,
+        &DriftReportProvenance::uncorrelated(),
+        checked_at,
+    )
+}
+
+#[cfg(feature = "postgres")]
+fn postgres_insert_drift_report_with_provenance(
+    store: &PostgresStore,
+    agent_id: &str,
+    report: &DriftReport,
+    provenance: &DriftReportProvenance,
+    checked_at: SystemTime,
+) -> Result<(), StoreError> {
     store
         .checkout_client()?
         .execute(
             "INSERT INTO drift_reports (
-                agent_id, policy_name, status, severity, expected, actual, checked_at
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                agent_id, policy_name, status, severity, expected, actual, checked_at,
+                job_id, task_id, policy_id, policy_version, purpose
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
             &[
                 &agent_id,
                 &report.policy_name.as_str(),
@@ -7656,10 +8963,17 @@ fn postgres_insert_drift_report(
                 &report.expected.as_str(),
                 &report.actual.as_str(),
                 &system_time_to_unix_secs(checked_at),
+                &provenance.job_id.as_ref().map(JobId::as_str),
+                &provenance.task_id.as_ref().map(TaskId::as_str),
+                &provenance.policy_id.as_deref(),
+                &provenance.policy_version.map(i64::from),
+                &provenance.purpose.map(DriftCheckPurpose::as_str),
             ],
         )
         .map(|_| ())
-        .map_err(|_| postgres_error("postgres drift report insert failed"))
+        .map_err(|error| {
+            postgres_constraint_or_context(error, "postgres drift report insert failed")
+        })
 }
 
 #[cfg(feature = "postgres")]
@@ -7670,8 +8984,9 @@ fn postgres_latest_drift_report(
     store
         .checkout_client()?
         .query_opt(
-            "SELECT agent_id, policy_name, status, expected, actual, checked_at,
-                    severity, acknowledged_at, acknowledged_by, resolved_at, resolution_job_id
+            "SELECT id, agent_id, policy_name, status, expected, actual, checked_at,
+                    severity, acknowledged_at, acknowledged_by, resolved_at, resolution_job_id,
+                    job_id, task_id, policy_id, policy_version, purpose
              FROM drift_reports
              WHERE agent_id = $1
              ORDER BY checked_at DESC, id DESC
@@ -7697,7 +9012,8 @@ fn postgres_list_drift_reports(
         client
             .query(
                 "SELECT id, agent_id, policy_name, status, expected, actual, checked_at,
-                        severity, acknowledged_at, acknowledged_by, resolved_at, resolution_job_id
+                        severity, acknowledged_at, acknowledged_by, resolved_at, resolution_job_id,
+                        job_id, task_id, policy_id, policy_version, purpose
                  FROM drift_reports
                  WHERE agent_id = $1
                    AND (checked_at < $2 OR (checked_at = $2 AND id < $3))
@@ -7710,7 +9026,8 @@ fn postgres_list_drift_reports(
         client
             .query(
                 "SELECT id, agent_id, policy_name, status, expected, actual, checked_at,
-                        severity, acknowledged_at, acknowledged_by, resolved_at, resolution_job_id
+                        severity, acknowledged_at, acknowledged_by, resolved_at, resolution_job_id,
+                        job_id, task_id, policy_id, policy_version, purpose
                  FROM drift_reports
                  WHERE agent_id = $1
                  ORDER BY checked_at DESC, id DESC
@@ -7730,16 +9047,19 @@ fn postgres_row_to_drift_report_record(
     row: &postgres::Row,
 ) -> Result<AppDriftReportRecord, StoreError> {
     Ok(AppDriftReportRecord {
-        agent_id: row.get(0),
+        id: DriftReportId::new(row.get(0))
+            .map_err(|_| postgres_error("invalid drift report id"))?,
+        agent_id: row.get(1),
         report: DriftReport {
-            policy_name: row.get(1),
-            status: parse_drift_status(&row.get::<_, String>(2)),
-            severity: parse_drift_severity(&row.get::<_, String>(6)),
-            acknowledgement: postgres_row_to_drift_acknowledgement(row, 7, 8, 9, 10),
-            expected: row.get(3),
-            actual: row.get(4),
+            policy_name: row.get(2),
+            status: parse_drift_status(&row.get::<_, String>(3)),
+            severity: parse_drift_severity(&row.get::<_, String>(7)),
+            acknowledgement: postgres_row_to_drift_acknowledgement(row, 8, 9, 10, 11),
+            expected: row.get(4),
+            actual: row.get(5),
         },
-        checked_at: unix_secs_to_system_time(row.get(5)),
+        provenance: postgres_row_to_drift_report_provenance(row, 12, 13, 14, 15, 16),
+        checked_at: unix_secs_to_system_time(row.get(6)),
     })
 }
 
@@ -7750,6 +9070,7 @@ fn postgres_row_to_drift_report_page_record(
     let id: i64 = row.get(0);
     let checked_at = unix_secs_to_system_time(row.get(6));
     Ok(AppDriftReportPageRecord {
+        id: DriftReportId::new(id).map_err(|_| postgres_error("invalid drift report id"))?,
         agent_id: row.get(1),
         report: DriftReport {
             policy_name: row.get(2),
@@ -7759,12 +9080,44 @@ fn postgres_row_to_drift_report_page_record(
             expected: row.get(4),
             actual: row.get(5),
         },
+        provenance: postgres_row_to_drift_report_provenance(row, 12, 13, 14, 15, 16),
         checked_at,
         cursor: SnapshotPageCursor {
             occurred_at: checked_at,
             row_id: id,
         },
     })
+}
+
+#[cfg(feature = "postgres")]
+fn postgres_row_to_drift_report_provenance(
+    row: &postgres::Row,
+    job_id_index: usize,
+    task_id_index: usize,
+    policy_id_index: usize,
+    policy_version_index: usize,
+    purpose_index: usize,
+) -> DriftReportProvenance {
+    let (Some(job_id), Some(task_id), Some(policy_id), Some(policy_version), Some(purpose)) = (
+        row.get::<_, Option<String>>(job_id_index),
+        row.get::<_, Option<String>>(task_id_index),
+        row.get::<_, Option<String>>(policy_id_index),
+        row.get::<_, Option<i64>>(policy_version_index),
+        row.get::<_, Option<String>>(purpose_index),
+    ) else {
+        return DriftReportProvenance::uncorrelated();
+    };
+    let (Ok(job_id), Ok(task_id), Some(purpose)) = (
+        JobId::new(job_id),
+        TaskId::new(task_id),
+        DriftCheckPurpose::parse(&purpose),
+    ) else {
+        return DriftReportProvenance::uncorrelated();
+    };
+    if policy_version < 0 {
+        return DriftReportProvenance::uncorrelated();
+    }
+    DriftReportProvenance::verified(job_id, task_id, policy_id, policy_version as u32, purpose)
 }
 
 #[cfg(feature = "postgres")]
@@ -8284,8 +9637,9 @@ fn postgres_save_remediation_request(
         .execute(
             "INSERT INTO remediation_requests (
                 id, policy_id, policy_name, agent_id, runbook_ref, status,
-                approval_required, risk_summary, job_id, created_at, updated_at
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                approval_required, risk_summary, job_id, origin_drift_report_id, policy_version,
+                created_at, updated_at
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
             &[
                 &request.id,
                 &request.policy_id,
@@ -8296,6 +9650,8 @@ fn postgres_save_remediation_request(
                 &request.approval_required,
                 &request.risk_summary,
                 &request.job_id,
+                &request.origin_drift_report_id.map(DriftReportId::as_i64),
+                &request.policy_version.map(i64::from),
                 &system_time_to_unix_secs(request.created_at),
                 &system_time_to_unix_secs(request.updated_at),
             ],
@@ -8307,6 +9663,313 @@ fn postgres_save_remediation_request(
 }
 
 #[cfg(feature = "postgres")]
+fn postgres_save_remediation_proposal(
+    store: &PostgresStore,
+    request: &AppRemediationRequestRecord,
+    audit: &AuditEvent,
+) -> Result<AppRemediationProposalSave, StoreError> {
+    let mut client = store.checkout_client()?;
+    let mut transaction = client
+        .transaction()
+        .map_err(|_| postgres_error("postgres remediation proposal transaction failed"))?;
+    let existing = transaction
+        .query_opt(
+            "SELECT id, policy_id, policy_name, agent_id, runbook_ref, status,
+                    approval_required, risk_summary, job_id, origin_drift_report_id,
+                    policy_version, created_at, updated_at
+             FROM remediation_requests
+             WHERE agent_id = $1 AND policy_id = $2
+               AND origin_drift_report_id IS NOT NULL
+               AND status NOT IN ('resolved', 'failed', 'rejected', 'expired', 'canceled')
+             ORDER BY created_at, id
+             LIMIT 1",
+            &[&request.agent_id, &request.policy_id],
+        )
+        .map_err(|_| postgres_error("postgres remediation proposal lookup failed"))?;
+    if let Some(row) = existing {
+        let remediation = postgres_row_to_remediation_request_record(&row)?;
+        transaction
+            .commit()
+            .map_err(|_| postgres_error("postgres remediation proposal commit failed"))?;
+        return Ok(AppRemediationProposalSave {
+            remediation,
+            created: false,
+        });
+    }
+    let insert = transaction.execute(
+        "INSERT INTO remediation_requests (
+                id, policy_id, policy_name, agent_id, runbook_ref, status,
+                approval_required, risk_summary, job_id, origin_drift_report_id, policy_version,
+                created_at, updated_at
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+        &[
+            &request.id,
+            &request.policy_id,
+            &request.policy_name,
+            &request.agent_id,
+            &request.runbook_ref,
+            &request.status,
+            &request.approval_required,
+            &request.risk_summary,
+            &request.job_id,
+            &request.origin_drift_report_id.map(DriftReportId::as_i64),
+            &request.policy_version.map(i64::from),
+            &system_time_to_unix_secs(request.created_at),
+            &system_time_to_unix_secs(request.updated_at),
+        ],
+    );
+    if let Err(error) = insert {
+        let _ = transaction.rollback();
+        if let Some(remediation) =
+            postgres_find_active_remediation_request(store, &request.agent_id, &request.policy_id)?
+        {
+            return Ok(AppRemediationProposalSave {
+                remediation,
+                created: false,
+            });
+        }
+        return Err(postgres_constraint_or_context(
+            error,
+            "postgres remediation proposal insert failed",
+        ));
+    }
+    let (value_kind, value_text) = encode_audit_value(&audit.value);
+    transaction
+        .execute(
+            "INSERT INTO audit_events (
+                category, action, actor, target, value_kind, value_text, occurred_at
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            &[
+                &audit.category.as_str(),
+                &audit.action,
+                &audit.actor.as_str(),
+                &audit.target.as_str(),
+                &value_kind,
+                &value_text,
+                &system_time_to_unix_secs(audit.occurred_at),
+            ],
+        )
+        .map_err(|_| postgres_error("postgres remediation proposal audit insert failed"))?;
+    transaction
+        .commit()
+        .map_err(|_| postgres_error("postgres remediation proposal commit failed"))?;
+    Ok(AppRemediationProposalSave {
+        remediation: request.clone(),
+        created: true,
+    })
+}
+
+#[cfg(feature = "postgres")]
+fn postgres_save_verified_drift_proposal(
+    store: &PostgresStore,
+    input: &AppPersistVerifiedDriftProposalInput,
+) -> Result<AppPersistVerifiedDriftProposalOutput, StoreError> {
+    let job_id = input
+        .provenance
+        .job_id
+        .as_ref()
+        .ok_or_else(|| StoreError::Domain("verified drift requires job id".to_owned()))?;
+    let task_id = input
+        .provenance
+        .task_id
+        .as_ref()
+        .ok_or_else(|| StoreError::Domain("verified drift requires task id".to_owned()))?;
+    let mut client = store.checkout_client()?;
+    let mut transaction = client
+        .transaction()
+        .map_err(|_| postgres_error("postgres verified drift proposal transaction failed"))?;
+    let existing = transaction
+        .query_opt(
+            "SELECT id, agent_id, policy_name, status, expected, actual, checked_at,
+                    severity, acknowledged_at, acknowledged_by, resolved_at, resolution_job_id,
+                    job_id, task_id, policy_id, policy_version, purpose
+             FROM drift_reports WHERE job_id = $1 AND task_id = $2",
+            &[&job_id.as_str(), &task_id.as_str()],
+        )
+        .map_err(|_| postgres_error("postgres verified drift lookup failed"))?;
+    if let Some(row) = existing {
+        let report = postgres_row_to_drift_report_record(&row)?;
+        let remediation = transaction
+            .query_opt(
+                "SELECT id, policy_id, policy_name, agent_id, runbook_ref, status,
+                        approval_required, risk_summary, job_id, origin_drift_report_id,
+                        policy_version, created_at, updated_at
+                 FROM remediation_requests WHERE origin_drift_report_id = $1
+                 ORDER BY created_at, id LIMIT 1",
+                &[&report.id.as_i64()],
+            )
+            .map_err(|_| postgres_error("postgres verified remediation lookup failed"))?
+            .map(|row| postgres_row_to_remediation_request_record(&row))
+            .transpose()?
+            .ok_or_else(|| {
+                StoreError::Domain("verified drift has no remediation proposal".to_owned())
+            })?;
+        transaction
+            .commit()
+            .map_err(|_| postgres_error("postgres verified drift proposal commit failed"))?;
+        return Ok(AppPersistVerifiedDriftProposalOutput {
+            report,
+            proposal: AppRemediationProposalSave {
+                remediation,
+                created: false,
+            },
+        });
+    }
+    let row = transaction
+        .query_one(
+            "INSERT INTO drift_reports (
+                agent_id, policy_name, status, severity, expected, actual, checked_at,
+                job_id, task_id, policy_id, policy_version, purpose
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id",
+            &[
+                &input.agent_id,
+                &input.report.policy_name,
+                &drift_status_to_str(&input.report.status),
+                &drift_severity_to_str(input.report.severity),
+                &input.report.expected,
+                &input.report.actual,
+                &system_time_to_unix_secs(input.checked_at),
+                &job_id.as_str(),
+                &task_id.as_str(),
+                &input.provenance.policy_id,
+                &input.provenance.policy_version.map(i64::from),
+                &input.provenance.purpose.map(DriftCheckPurpose::as_str),
+            ],
+        )
+        .map_err(|error| {
+            postgres_constraint_or_context(error, "postgres verified drift insert failed")
+        })?;
+    let report_id =
+        DriftReportId::new(row.get(0)).map_err(|error| StoreError::Domain(format!("{error:?}")))?;
+    postgres_insert_audit_in_transaction(&mut transaction, &input.drift_audit)?;
+    let mut remediation = input.remediation.clone();
+    remediation.origin_drift_report_id = Some(report_id);
+    let existing = transaction
+        .query_opt(
+            "SELECT id, policy_id, policy_name, agent_id, runbook_ref, status,
+                    approval_required, risk_summary, job_id, origin_drift_report_id,
+                    policy_version, created_at, updated_at
+             FROM remediation_requests
+             WHERE agent_id = $1 AND policy_id = $2
+               AND origin_drift_report_id IS NOT NULL
+               AND status NOT IN ('resolved', 'failed', 'rejected', 'expired', 'canceled')
+             ORDER BY created_at, id LIMIT 1",
+            &[&remediation.agent_id, &remediation.policy_id],
+        )
+        .map_err(|_| postgres_error("postgres active remediation lookup failed"))?;
+    let proposal = if let Some(row) = existing {
+        AppRemediationProposalSave {
+            remediation: postgres_row_to_remediation_request_record(&row)?,
+            created: false,
+        }
+    } else {
+        postgres_insert_remediation_in_transaction(&mut transaction, &remediation)?;
+        postgres_insert_audit_in_transaction(&mut transaction, &input.proposal_audit)?;
+        AppRemediationProposalSave {
+            remediation,
+            created: true,
+        }
+    };
+    transaction
+        .commit()
+        .map_err(|_| postgres_error("postgres verified drift proposal commit failed"))?;
+    Ok(AppPersistVerifiedDriftProposalOutput {
+        report: AppDriftReportRecord {
+            id: report_id,
+            agent_id: input.agent_id.clone(),
+            report: input.report.clone(),
+            provenance: input.provenance.clone(),
+            checked_at: input.checked_at,
+        },
+        proposal,
+    })
+}
+
+#[cfg(feature = "postgres")]
+fn postgres_insert_audit_in_transaction(
+    transaction: &mut postgres::Transaction<'_>,
+    audit: &AuditEvent,
+) -> Result<(), StoreError> {
+    let (value_kind, value_text) = encode_audit_value(&audit.value);
+    transaction
+        .execute(
+            "INSERT INTO audit_events (
+                category, action, actor, target, value_kind, value_text, occurred_at
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            &[
+                &audit.category.as_str(),
+                &audit.action,
+                &audit.actor.as_str(),
+                &audit.target.as_str(),
+                &value_kind,
+                &value_text,
+                &system_time_to_unix_secs(audit.occurred_at),
+            ],
+        )
+        .map(|_| ())
+        .map_err(|_| postgres_error("postgres verified drift audit insert failed"))
+}
+
+#[cfg(feature = "postgres")]
+fn postgres_insert_remediation_in_transaction(
+    transaction: &mut postgres::Transaction<'_>,
+    request: &AppRemediationRequestRecord,
+) -> Result<(), StoreError> {
+    transaction
+        .execute(
+            "INSERT INTO remediation_requests (
+                id, policy_id, policy_name, agent_id, runbook_ref, status,
+                approval_required, risk_summary, job_id, origin_drift_report_id, policy_version,
+                created_at, updated_at
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+            &[
+                &request.id,
+                &request.policy_id,
+                &request.policy_name,
+                &request.agent_id,
+                &request.runbook_ref,
+                &request.status,
+                &request.approval_required,
+                &request.risk_summary,
+                &request.job_id,
+                &request.origin_drift_report_id.map(DriftReportId::as_i64),
+                &request.policy_version.map(i64::from),
+                &system_time_to_unix_secs(request.created_at),
+                &system_time_to_unix_secs(request.updated_at),
+            ],
+        )
+        .map(|_| ())
+        .map_err(|error| {
+            postgres_constraint_or_context(error, "postgres verified remediation insert failed")
+        })
+}
+
+#[cfg(feature = "postgres")]
+fn postgres_find_active_remediation_request(
+    store: &PostgresStore,
+    agent_id: &str,
+    policy_id: &str,
+) -> Result<Option<AppRemediationRequestRecord>, StoreError> {
+    store
+        .checkout_client()?
+        .query_opt(
+            "SELECT id, policy_id, policy_name, agent_id, runbook_ref, status,
+                    approval_required, risk_summary, job_id, origin_drift_report_id,
+                    policy_version, created_at, updated_at
+             FROM remediation_requests
+             WHERE agent_id = $1 AND policy_id = $2
+               AND origin_drift_report_id IS NOT NULL
+               AND status NOT IN ('resolved', 'failed', 'rejected', 'expired', 'canceled')
+             ORDER BY created_at, id
+             LIMIT 1",
+            &[&agent_id, &policy_id],
+        )
+        .map_err(|_| postgres_error("postgres remediation proposal conflict lookup failed"))?
+        .map(|row| postgres_row_to_remediation_request_record(&row))
+        .transpose()
+}
+
+#[cfg(feature = "postgres")]
 fn postgres_find_remediation_request(
     store: &PostgresStore,
     request_id: &str,
@@ -8315,7 +9978,8 @@ fn postgres_find_remediation_request(
         .checkout_client()?
         .query_opt(
             "SELECT id, policy_id, policy_name, agent_id, runbook_ref, status,
-                    approval_required, risk_summary, job_id, created_at, updated_at
+                    approval_required, risk_summary, job_id, origin_drift_report_id, policy_version,
+                    created_at, updated_at
              FROM remediation_requests
              WHERE id = $1",
             &[&request_id],
@@ -8337,7 +10001,8 @@ fn postgres_list_remediation_requests(
         .checkout_client()?
         .query(
             "SELECT id, policy_id, policy_name, agent_id, runbook_ref, status,
-                    approval_required, risk_summary, job_id, created_at, updated_at
+                    approval_required, risk_summary, job_id, origin_drift_report_id, policy_version,
+                    created_at, updated_at
              FROM remediation_requests
              WHERE ($1::TEXT IS NULL OR agent_id = $1)
                AND ($2::TEXT IS NULL OR policy_id = $2)
@@ -8346,6 +10011,33 @@ fn postgres_list_remediation_requests(
             &[&agent_id, &policy_id, &limit],
         )
         .map_err(|_| postgres_error("postgres remediation request list failed"))?;
+    rows.into_iter()
+        .map(|row| postgres_row_to_remediation_request_record(&row))
+        .collect()
+}
+
+#[cfg(feature = "postgres")]
+fn postgres_list_pending_remediation_verification_recovery(
+    store: &PostgresStore,
+    limit: usize,
+) -> Result<Vec<AppRemediationRequestRecord>, StoreError> {
+    let limit = limit.clamp(1, 100) as i64;
+    let rows = store
+        .checkout_client()?
+        .query(
+            "SELECT remediation_requests.id, policy_id, policy_name, agent_id, runbook_ref, status,
+                    approval_required, risk_summary, job_id, origin_drift_report_id, policy_version,
+                    remediation_requests.created_at, remediation_requests.updated_at
+             FROM remediation_requests
+             LEFT JOIN remediation_verification_jobs
+               ON remediation_verification_jobs.remediation_id = remediation_requests.id
+             WHERE remediation_requests.status = 'succeeded_pending_verify'
+               AND remediation_verification_jobs.remediation_id IS NULL
+             ORDER BY remediation_requests.created_at, remediation_requests.id
+             LIMIT $1",
+            &[&limit],
+        )
+        .map_err(|_| postgres_error("postgres remediation verification recovery list failed"))?;
     rows.into_iter()
         .map(|row| postgres_row_to_remediation_request_record(&row))
         .collect()
@@ -8393,8 +10085,16 @@ fn postgres_row_to_remediation_request_record(
         approval_required: row.get(6),
         risk_summary: row.get(7),
         job_id: row.get(8),
-        created_at: unix_secs_to_system_time(row.get(9)),
-        updated_at: unix_secs_to_system_time(row.get(10)),
+        origin_drift_report_id: row
+            .get::<_, Option<i64>>(9)
+            .map(DriftReportId::new)
+            .transpose()
+            .map_err(|_| postgres_error("invalid remediation origin id"))?,
+        policy_version: row
+            .get::<_, Option<i64>>(10)
+            .and_then(|value| u32::try_from(value).ok()),
+        created_at: unix_secs_to_system_time(row.get(11)),
+        updated_at: unix_secs_to_system_time(row.get(12)),
     })
 }
 
@@ -9957,6 +11657,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     command_args_json TEXT NOT NULL DEFAULT '[]',
     command_max_output_bytes INTEGER NOT NULL DEFAULT 1048576,
     drift_policy_document TEXT,
+    drift_policy_id TEXT,
+    drift_policy_version INTEGER,
+    drift_purpose TEXT,
     runbook_document TEXT,
     selector_kind TEXT NOT NULL DEFAULT 'explicit_ids',
     selector_source TEXT NOT NULL DEFAULT '',
@@ -10026,9 +11729,16 @@ CREATE TABLE IF NOT EXISTS remediation_requests (
     approval_required INTEGER NOT NULL,
     risk_summary TEXT NOT NULL,
     job_id TEXT,
+    origin_drift_report_id INTEGER,
+    policy_version INTEGER,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS remediation_requests_active_policy_unique_idx
+    ON remediation_requests (agent_id, policy_id)
+    WHERE origin_drift_report_id IS NOT NULL
+      AND status NOT IN ('resolved', 'failed', 'rejected', 'expired', 'canceled');
 
 CREATE TABLE IF NOT EXISTS approval_decisions (
     id TEXT PRIMARY KEY,
@@ -10312,7 +12022,20 @@ mod tests {
         store.migrate().unwrap();
 
         assert!(store.has_column("jobs", "drift_policy_document").unwrap());
+        assert!(store.has_column("jobs", "drift_policy_id").unwrap());
+        assert!(store.has_column("jobs", "drift_policy_version").unwrap());
+        assert!(store.has_column("jobs", "drift_purpose").unwrap());
         assert!(store.has_column("jobs", "runbook_document").unwrap());
+        assert!(
+            store
+                .has_column("remediation_requests", "origin_drift_report_id")
+                .unwrap()
+        );
+        assert!(
+            store
+                .has_column("remediation_requests", "policy_version")
+                .unwrap()
+        );
         assert!(
             store
                 .has_column("controller_signing_key_rotation", "state")
@@ -10331,6 +12054,90 @@ mod tests {
             )
             .unwrap();
         assert_eq!(job_count, 1);
+    }
+
+    #[test]
+    fn migration_preserves_legacy_drift_report_without_provenance() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "
+                CREATE TABLE schema_migrations (
+                    name TEXT PRIMARY KEY,
+                    version INTEGER NOT NULL,
+                    applied_at INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT INTO schema_migrations (name, version, applied_at)
+                VALUES ('fleet_store', 15, 1710000000);
+                CREATE TABLE drift_reports (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    agent_id TEXT NOT NULL,
+                    policy_name TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    severity TEXT NOT NULL DEFAULT 'unknown',
+                    expected TEXT NOT NULL,
+                    actual TEXT NOT NULL,
+                    checked_at INTEGER NOT NULL,
+                    acknowledged_at INTEGER,
+                    acknowledged_by TEXT,
+                    resolved_at INTEGER,
+                    resolution_job_id TEXT
+                );
+                INSERT INTO drift_reports (
+                    agent_id, policy_name, status, severity, expected, actual, checked_at
+                ) VALUES (
+                    'legacy-agent', 'legacy-policy', 'drifted', 'warning',
+                    'expected', 'actual', 1710000000
+                );
+                ",
+            )
+            .unwrap();
+
+        let store = SqliteStore { connection };
+        store.migrate().unwrap();
+
+        let record = store.latest_drift_report("legacy-agent").unwrap().unwrap();
+        assert_eq!(record.report.policy_name, "legacy-policy");
+        assert_eq!(record.provenance, DriftReportProvenance::uncorrelated());
+        assert!(!record.provenance.is_automation_eligible());
+    }
+
+    #[test]
+    fn correlated_drift_report_persists_provenance_and_rejects_duplicate_correlation() {
+        let store = SqliteStore::in_memory().unwrap();
+        store.save_agent(agent()).unwrap();
+        let report = DriftReport::drifted("nginx-running", "expected", "actual");
+        let provenance = DriftReportProvenance::verified(
+            JobId::new("job-drift").unwrap(),
+            TaskId::new("task-drift").unwrap(),
+            "policy-nginx",
+            7,
+            DriftCheckPurpose::Evaluation,
+        );
+
+        store
+            .insert_drift_report_with_provenance(
+                "a1",
+                &report,
+                &provenance,
+                SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+            )
+            .unwrap();
+
+        let record = store.latest_drift_report("a1").unwrap().unwrap();
+        assert!(record.id.as_i64() > 0);
+        assert_eq!(record.provenance, provenance);
+        assert!(record.provenance.is_automation_eligible());
+
+        assert!(matches!(
+            store.insert_drift_report_with_provenance(
+                "a1",
+                &report,
+                &provenance,
+                SystemTime::UNIX_EPOCH + Duration::from_secs(2),
+            ),
+            Err(StoreError::ConstraintViolation(_))
+        ));
     }
 
     #[test]
@@ -14631,6 +16438,302 @@ mod tests {
     }
 
     #[test]
+    fn remediation_verification_job_is_atomic_and_idempotent() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        store.save_agent(agent()).unwrap();
+        let request = remediation_request_record("remediation-verify", "a1", "nginx-running");
+        <SqliteStore as RemediationRequestRepository>::save_remediation_request(
+            &mut store, request,
+        )
+        .unwrap();
+        let task = DriftCheckTask::new(
+            "apiVersion: fleet.sponzey.dev/v1alpha1",
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let mut job = Job::new(
+            JobId::new("job-remediation-verify").unwrap(),
+            task.risk(),
+            fleet_domain::ApprovalRequirement::NotRequired,
+            Duration::from_secs(30),
+        );
+        job.queue(false).unwrap();
+        let input = AppRemediationVerificationJobPersistenceInput {
+            remediation_id: "remediation-verify".to_owned(),
+            job,
+            task,
+            assignment: task_envelope_for_job(
+                "job-remediation-verify",
+                "a1",
+                "nonce-remediation-verify",
+                "task-remediation-verify",
+            ),
+            provenance: DriftJobProvenance::remediation_verification("nginx-running", 1),
+            audit: AuditEvent {
+                category: AuditCategory::Policy,
+                action: "remediation_verification_created".to_owned(),
+                actor: AuditActor::new("controller"),
+                target: AuditTarget::new("a1"),
+                value: AuditValue::Plain(
+                    "remediation_id=remediation-verify,policy_id=nginx-running".to_owned(),
+                ),
+                occurred_at: SystemTime::UNIX_EPOCH,
+            },
+        };
+
+        let first = store
+            .save_remediation_verification_job_record(&input)
+            .unwrap();
+        let duplicate = store
+            .save_remediation_verification_job_record(&input)
+            .unwrap();
+
+        assert!(first.created);
+        assert!(!duplicate.created);
+        assert_eq!(first.job_id, "job-remediation-verify");
+        assert_eq!(duplicate.job_id, first.job_id);
+        assert_eq!(
+            store
+                .find_remediation_verification_job_id("remediation-verify")
+                .unwrap(),
+            Some(first.job_id),
+        );
+        assert_eq!(row_count(&store, "jobs"), 1);
+        assert_eq!(row_count(&store, "task_assignments"), 1);
+        assert_eq!(row_count(&store, "audit_events"), 1);
+    }
+
+    #[test]
+    fn remediation_verification_job_rolls_back_when_assignment_insert_fails() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        store.save_agent(agent()).unwrap();
+        let existing_job = Job::new(
+            JobId::new("job-existing").unwrap(),
+            fleet_domain::TaskRisk::Low,
+            fleet_domain::ApprovalRequirement::NotRequired,
+            Duration::from_secs(30),
+        );
+        store.save_job_record(&existing_job).unwrap();
+        store
+            .save_task_assignment_record(&task_envelope_for_job(
+                "job-existing",
+                "a1",
+                "nonce-existing",
+                "task-conflict",
+            ))
+            .unwrap();
+        <SqliteStore as RemediationRequestRepository>::save_remediation_request(
+            &mut store,
+            remediation_request_record("remediation-rollback", "a1", "nginx-running"),
+        )
+        .unwrap();
+        let task = DriftCheckTask::new(
+            "apiVersion: fleet.sponzey.dev/v1alpha1",
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let mut job = Job::new(
+            JobId::new("job-remediation-rollback").unwrap(),
+            task.risk(),
+            fleet_domain::ApprovalRequirement::NotRequired,
+            Duration::from_secs(30),
+        );
+        job.queue(false).unwrap();
+
+        let result = store.save_remediation_verification_job_record(
+            &AppRemediationVerificationJobPersistenceInput {
+                remediation_id: "remediation-rollback".to_owned(),
+                job,
+                task,
+                assignment: task_envelope_for_job(
+                    "job-remediation-rollback",
+                    "a1",
+                    "nonce-rollback",
+                    "task-conflict",
+                ),
+                provenance: DriftJobProvenance::remediation_verification("nginx-running", 1),
+                audit: AuditEvent {
+                    category: AuditCategory::Policy,
+                    action: "remediation_verification_created".to_owned(),
+                    actor: AuditActor::new("controller"),
+                    target: AuditTarget::new("a1"),
+                    value: AuditValue::Redacted,
+                    occurred_at: SystemTime::UNIX_EPOCH,
+                },
+            },
+        );
+
+        assert!(matches!(result, Err(StoreError::ConstraintViolation(_))));
+        assert_eq!(row_count(&store, "jobs"), 1);
+        assert_eq!(row_count(&store, "task_assignments"), 1);
+        assert_eq!(row_count(&store, "audit_events"), 0);
+        assert_eq!(
+            store
+                .find_remediation_verification_job_id("remediation-rollback")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn remediation_verification_resolution_requires_persisted_evidence_and_is_atomic() {
+        let store = SqliteStore::in_memory().unwrap();
+        store.save_agent(agent()).unwrap();
+        let origin_report = DriftReport {
+            policy_name: "nginx-running".to_owned(),
+            status: DriftStatus::Drifted,
+            severity: DriftSeverity::Warning,
+            acknowledgement: DriftAcknowledgement::Open,
+            expected: "running".to_owned(),
+            actual: "stopped".to_owned(),
+        };
+        store
+            .insert_drift_report("a1", &origin_report, SystemTime::UNIX_EPOCH)
+            .unwrap();
+        let origin_drift_report_id = store.latest_drift_report("a1").unwrap().unwrap().id;
+        let mut remediation =
+            remediation_request_record("remediation-resolution", "a1", "nginx-running");
+        remediation.status = "succeeded_pending_verify".to_owned();
+        remediation.job_id = Some("job-remediation".to_owned());
+        remediation.origin_drift_report_id = Some(origin_drift_report_id);
+        remediation.policy_version = Some(1);
+        store.save_remediation_request_record(&remediation).unwrap();
+        let verification_job = Job::new(
+            JobId::new("job-verification-resolution").unwrap(),
+            fleet_domain::TaskRisk::Low,
+            fleet_domain::ApprovalRequirement::NotRequired,
+            Duration::from_secs(30),
+        );
+        store.save_job_record(&verification_job).unwrap();
+        store
+            .save_remediation_verification_job(
+                "remediation-resolution",
+                "job-verification-resolution",
+                SystemTime::UNIX_EPOCH,
+            )
+            .unwrap();
+        let evidence_report = DriftReport {
+            policy_name: "nginx-running".to_owned(),
+            status: DriftStatus::Compliant,
+            severity: DriftSeverity::for_status(DriftStatus::Compliant),
+            acknowledgement: DriftAcknowledgement::Open,
+            expected: "running".to_owned(),
+            actual: "running".to_owned(),
+        };
+        store
+            .insert_drift_report_with_provenance(
+                "a1",
+                &evidence_report,
+                &DriftReportProvenance::verified(
+                    JobId::new("job-verification-resolution").unwrap(),
+                    TaskId::new("task-verification-resolution").unwrap(),
+                    "nginx-running",
+                    1,
+                    DriftCheckPurpose::RemediationVerification,
+                ),
+                SystemTime::UNIX_EPOCH + Duration::from_secs(20),
+            )
+            .unwrap();
+        let evidence_report_id = store.latest_drift_report("a1").unwrap().unwrap().id;
+        let resolved = AppRemediationRequestRecord {
+            status: "resolved".to_owned(),
+            updated_at: SystemTime::UNIX_EPOCH + Duration::from_secs(20),
+            ..remediation.clone()
+        };
+        let audit = AuditEvent {
+            category: AuditCategory::Policy,
+            action: "remediation_resolved_by_verification".to_owned(),
+            actor: AuditActor::new("controller"),
+            target: AuditTarget::new("a1"),
+            value: AuditValue::Plain("remediation_id=remediation-resolution".to_owned()),
+            occurred_at: SystemTime::UNIX_EPOCH + Duration::from_secs(20),
+        };
+
+        let missing_evidence = store.resolve_remediation_verification_evidence_record(
+            &resolved,
+            &origin_drift_report_id,
+            &DriftReportId::new(999).unwrap(),
+            "job-verification-resolution",
+            "task-verification-resolution",
+            &audit,
+        );
+        assert!(matches!(missing_evidence, Err(StoreError::NotFound)));
+        assert_eq!(
+            store
+                .find_remediation_request_record("remediation-resolution")
+                .unwrap()
+                .unwrap()
+                .status,
+            "succeeded_pending_verify"
+        );
+        assert_eq!(row_count(&store, "audit_events"), 0);
+
+        store
+            .resolve_remediation_verification_evidence_record(
+                &resolved,
+                &origin_drift_report_id,
+                &evidence_report_id,
+                "job-verification-resolution",
+                "task-verification-resolution",
+                &audit,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .find_remediation_request_record("remediation-resolution")
+                .unwrap()
+                .unwrap()
+                .status,
+            "resolved"
+        );
+        assert_eq!(row_count(&store, "audit_events"), 1);
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT resolution_job_id FROM drift_reports WHERE id = ?1",
+                    params![origin_drift_report_id.as_i64()],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .unwrap(),
+            Some("job-verification-resolution".to_owned())
+        );
+    }
+
+    #[test]
+    fn verification_recovery_list_is_bounded_and_omits_existing_correlations() {
+        let store = SqliteStore::in_memory().unwrap();
+        store.save_agent(agent()).unwrap();
+        for remediation_id in ["remediation-1", "remediation-2", "remediation-3"] {
+            let mut request = remediation_request_record(remediation_id, "a1", "nginx-running");
+            request.status = "succeeded_pending_verify".to_owned();
+            store.save_remediation_request_record(&request).unwrap();
+        }
+        let job = Job::new(
+            JobId::new("job-existing-verification").unwrap(),
+            fleet_domain::TaskRisk::Low,
+            fleet_domain::ApprovalRequirement::NotRequired,
+            Duration::from_secs(30),
+        );
+        store.save_job_record(&job).unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO remediation_verification_jobs (remediation_id, job_id, created_at)
+                 VALUES (?1, ?2, ?3)",
+                params!["remediation-1", "job-existing-verification", 0_i64],
+            )
+            .unwrap();
+
+        let records = store
+            .list_pending_remediation_verification_recovery_records(1)
+            .unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, "remediation-2");
+    }
+
+    #[test]
     fn remediation_requests_list_in_deterministic_order_and_update_status() {
         let mut store = SqliteStore::in_memory().unwrap();
         store
@@ -14696,6 +16799,202 @@ mod tests {
             ),
             Err(StoreError::NotFound)
         ));
+    }
+
+    #[test]
+    fn remediation_execution_transition_rolls_back_assignment_and_audit_when_request_is_missing() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .save_agent(agent_with_id("agent-1", "agent-1", "1111111111111111"))
+            .unwrap();
+        let job = Job::new(
+            JobId::new("job-execution").unwrap(),
+            fleet_domain::TaskRisk::Low,
+            fleet_domain::ApprovalRequirement::NotRequired,
+            Duration::from_secs(60),
+        );
+        store.save_job_record(&job).unwrap();
+        store
+            .save_task_assignment_record(&task_envelope_for_job(
+                "job-execution",
+                "agent-1",
+                "nonce-execution",
+                "task-execution",
+            ))
+            .unwrap();
+        let mut missing = remediation_request_record("missing-remediation", "agent-1", "policy-1");
+        missing.status = "running".to_owned();
+        missing.job_id = Some("job-execution".to_owned());
+        let input = AppRemediationExecutionPersistenceInput {
+            task_id: "task-execution".to_owned(),
+            assignment_status: "started".to_owned(),
+            assignment_last_error: None,
+            occurred_at: SystemTime::UNIX_EPOCH,
+            remediation: Some(missing),
+            remediation_audit: Some(AuditEvent {
+                category: AuditCategory::Policy,
+                action: "remediation_job_running".to_owned(),
+                actor: AuditActor::new("agent-1".to_owned()),
+                target: AuditTarget::new("agent-1".to_owned()),
+                value: AuditValue::Plain("remediation_id=missing-remediation".to_owned()),
+                occurred_at: SystemTime::UNIX_EPOCH,
+            }),
+        };
+
+        assert!(
+            store
+                .persist_remediation_execution_transition_record(&input)
+                .is_err()
+        );
+        assert_eq!(
+            store.find_task_assignment_status("task-execution").unwrap(),
+            Some("queued".to_owned())
+        );
+        assert_eq!(row_count(&store, "audit_events"), 0);
+    }
+
+    #[test]
+    fn remediation_proposal_transaction_is_idempotent_and_allows_terminal_new_episode() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        store
+            .save_agent(agent_with_id("agent-1", "agent-1", "1111111111111111"))
+            .unwrap();
+        let mut first = remediation_request_record("rem-1", "agent-1", "nginx-running");
+        first.origin_drift_report_id = Some(DriftReportId::new(1).unwrap());
+        first.policy_version = Some(1);
+        let audit = AuditEvent {
+            category: AuditCategory::Policy,
+            action: "remediation_requested".to_owned(),
+            actor: AuditActor::new("operator-1"),
+            target: AuditTarget::new("agent-1"),
+            value: AuditValue::Plain("remediation_id=rem-1,policy_id=nginx-running".to_owned()),
+            occurred_at: SystemTime::UNIX_EPOCH,
+        };
+
+        let created = <SqliteStore as RemediationProposalRepository>::save_remediation_proposal(
+            &mut store,
+            first.clone(),
+            audit.clone(),
+        )
+        .unwrap();
+        let duplicate = <SqliteStore as RemediationProposalRepository>::save_remediation_proposal(
+            &mut store,
+            first.clone(),
+            audit.clone(),
+        )
+        .unwrap();
+
+        assert!(created.created);
+        assert!(!duplicate.created);
+        assert_eq!(duplicate.remediation.id, "rem-1");
+        assert_eq!(row_count(&store, "remediation_requests"), 1);
+        assert_eq!(
+            store
+                .list_audit_events_by_category(AuditCategory::Policy, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let mut active_conflict = first.clone();
+        active_conflict.id = "rem-conflict".to_owned();
+        active_conflict.origin_drift_report_id = Some(DriftReportId::new(99).unwrap());
+        let active_conflict =
+            <SqliteStore as RemediationProposalRepository>::save_remediation_proposal(
+                &mut store,
+                active_conflict,
+                audit.clone(),
+            )
+            .unwrap();
+        assert!(!active_conflict.created);
+        assert_eq!(active_conflict.remediation.id, "rem-1");
+        assert_eq!(row_count(&store, "remediation_requests"), 1);
+        assert_eq!(
+            store
+                .list_audit_events_by_category(AuditCategory::Policy, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        store
+            .update_remediation_request_status_record(
+                "rem-1",
+                "resolved",
+                None,
+                SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+            )
+            .unwrap();
+        let mut next = first;
+        next.id = "rem-2".to_owned();
+        next.origin_drift_report_id = Some(DriftReportId::new(2).unwrap());
+        let next = <SqliteStore as RemediationProposalRepository>::save_remediation_proposal(
+            &mut store, next, audit,
+        )
+        .unwrap();
+        assert!(next.created);
+        assert_eq!(row_count(&store, "remediation_requests"), 2);
+    }
+
+    #[test]
+    fn remediation_proposal_failure_rolls_back_request_and_audit() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        let mut request =
+            remediation_request_record("rem-missing", "missing-agent", "nginx-running");
+        request.origin_drift_report_id = Some(DriftReportId::new(1).unwrap());
+        request.policy_version = Some(1);
+        let audit = AuditEvent::security("remediation_requested", "missing-agent");
+
+        assert!(
+            <SqliteStore as RemediationProposalRepository>::save_remediation_proposal(
+                &mut store, request, audit,
+            )
+            .is_err()
+        );
+        assert_eq!(row_count(&store, "remediation_requests"), 0);
+        assert!(
+            store
+                .list_audit_events_by_category(AuditCategory::Security, 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn verified_drift_proposal_failure_rolls_back_report_remediation_and_audits() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        let input = AppPersistVerifiedDriftProposalInput {
+            agent_id: "missing-agent".to_owned(),
+            report: DriftReport::drifted("nginx-running", "running", "stopped"),
+            provenance: DriftReportProvenance::verified(
+                JobId::new("job-drift").unwrap(),
+                TaskId::new("task-drift").unwrap(),
+                "nginx-running",
+                1,
+                DriftCheckPurpose::Evaluation,
+            ),
+            remediation: remediation_request_record("rem-1", "missing-agent", "nginx-running"),
+            drift_audit: AuditEvent {
+                category: AuditCategory::Drift,
+                action: "drift_report_received".to_owned(),
+                actor: AuditActor::new("agent"),
+                target: AuditTarget::new("missing-agent"),
+                value: AuditValue::Plain("policy_name=nginx-running,status=drifted".to_owned()),
+                occurred_at: SystemTime::UNIX_EPOCH,
+            },
+            proposal_audit: AuditEvent::security("remediation_requested", "missing-agent"),
+            checked_at: SystemTime::UNIX_EPOCH,
+        };
+
+        assert!(
+            <SqliteStore as VerifiedDriftProposalRepository>::save_verified_drift_proposal(
+                &mut store, input,
+            )
+            .is_err()
+        );
+        assert_eq!(row_count(&store, "drift_reports"), 0);
+        assert_eq!(row_count(&store, "remediation_requests"), 0);
+        assert_eq!(row_count(&store, "audit_events"), 0);
     }
 
     #[test]
@@ -14995,6 +17294,8 @@ mod tests {
             approval_required: true,
             risk_summary: "drifted policy requires approved remediation".to_owned(),
             job_id: None,
+            origin_drift_report_id: None,
+            policy_version: None,
             created_at: SystemTime::UNIX_EPOCH,
             updated_at: SystemTime::UNIX_EPOCH,
         }

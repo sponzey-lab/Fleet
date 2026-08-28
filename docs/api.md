@@ -1,6 +1,6 @@
 # Sponzey Fleet Controller API
 
-이 문서는 현재 구현된 Controller API 범위를 기록한다. API는 `sponzey controller start`로 실행되는 Controller process가 제공한다.
+이 문서는 현재 구현된 Controller API 범위를 기록한다. API는 `fleet controller start`로 실행되는 Controller process가 제공한다.
 
 구현 상태 표기는 [docs/feature-matrix.md](feature-matrix.md)를 기준으로 한다.
 이 문서의 endpoint는 현재 구현된 API를 우선 설명하고, 아직 제품화 단계가
@@ -18,7 +18,7 @@ HTTP 사용으로 발생하는 token 노출, command 탈취, 데이터 유출, �
 기타 위험이 있을 수 있다.
 
 ```bash
-sponzey controller start --host 127.0.0.1 --port 7700 --data-dir .sponzey --external-url http://127.0.0.1:7700
+fleet controller start --host 127.0.0.1 --port 7700 --data-dir .sponzey --external-url http://127.0.0.1:7700
 ```
 
 SQLite DB 경로를 명시하려면 bootstrap 시점에 `--db sqlite://...`를 전달한다.
@@ -27,7 +27,7 @@ SQLite DB 경로를 명시하려면 bootstrap 시점에 `--db sqlite://...`를 �
 request handler가 열리기 전에 bootstrap 오류로 실패한다.
 
 ```bash
-sponzey controller start --host 127.0.0.1 --port 7700 --data-dir .sponzey --db sqlite:///tmp/sponzey-fleet.db --external-url http://127.0.0.1:7700
+fleet controller start --host 127.0.0.1 --port 7700 --data-dir .sponzey --db sqlite:///tmp/sponzey-fleet.db --external-url http://127.0.0.1:7700
 ```
 
 ## Swagger / OpenAPI 지원 기준
@@ -98,7 +98,7 @@ OpenAPI 문서 범위:
 인증 표기:
 
 - 보호 API는 OpenAPI `bearerAuth` security scheme으로 admin token을 요구한다고 명시한다.
-- Swagger UI에서 보호 API를 호출하려면 `Authorize`에 `sponzey controller init`이 출력한 admin token을 넣는다.
+- Swagger UI에서 보호 API를 호출하려면 `Authorize`에 `fleet controller init`이 출력한 admin token을 넣는다.
 - `/api/agents/enroll`은 admin token을 쓰지 않는다. enrollment token은 request body의 `token` 필드로 전달한다.
 - `/healthz`, `/api/controller/identity`, `/openapi.json`, `/swagger-ui`는 문서와 readiness 접근을 위해 public endpoint로 둔다.
 
@@ -326,8 +326,8 @@ Readiness 값:
 CLI:
 
 ```bash
-sponzey controller signing-rotation-status --controller-url https://fleet.example.com --admin-token <admin-token>
-sponzey controller signing-rotation-status --controller-url https://fleet.example.com --admin-token <admin-token> --json
+fleet controller signing-rotation-status --controller-url https://fleet.example.com --admin-token <admin-token>
+fleet controller signing-rotation-status --controller-url https://fleet.example.com --admin-token <admin-token> --json
 ```
 
 CLI는 controller API만 호출한다. CLI가 controller store, signing key files, process
@@ -358,8 +358,8 @@ Authorization: Bearer <admin-token>
   "selected_signing_fingerprint_prefix": "new-fp-12345678",
   "blocked_reason": "active signer does not match persisted selected signer; restart controller with validated signing material and verify status before retiring old key",
   "verification_commands": [
-    "sponzey controller signing-rotation-status --controller-url <controller-url>",
-    "sponzey controller signing-rotation restart-plan --controller-url <controller-url>"
+    "fleet controller signing-rotation-status --controller-url <controller-url>",
+    "fleet controller signing-rotation restart-plan --controller-url <controller-url>"
   ],
   "safety_notes": [
     "this version does not support in-process controller signing key reload",
@@ -372,11 +372,11 @@ Authorization: Bearer <admin-token>
 CLI:
 
 ```bash
-sponzey controller signing-rotation restart-plan \
+fleet controller signing-rotation restart-plan \
   --controller-url https://fleet.example.com \
   --admin-token <admin-token>
 
-sponzey controller signing-rotation restart-plan \
+fleet controller signing-rotation restart-plan \
   --controller-url https://fleet.example.com \
   --admin-token <admin-token> \
   --json
@@ -424,10 +424,10 @@ Authorization: Bearer <admin-token>
   "bootstrap_guard": "active_mismatch_selected",
   "active_signing_fingerprint_prefix": "old-fp-12345678",
   "selected_signing_fingerprint_prefix": "new-fp-12345678",
-  "service_command": "sponzey controller restart-service --dry-run",
+  "service_command": "fleet controller restart-service --dry-run",
   "verification_commands": [
-    "sponzey controller signing-rotation-status --controller-url <controller-url>",
-    "sponzey controller signing-rotation restart-plan --controller-url <controller-url>"
+    "fleet controller signing-rotation-status --controller-url <controller-url>",
+    "fleet controller signing-rotation restart-plan --controller-url <controller-url>"
   ],
   "safety_notes": [
     "controller restart is executed outside the HTTP handler through an explicit service-manager command",
@@ -440,14 +440,14 @@ Authorization: Bearer <admin-token>
 CLI:
 
 ```bash
-sponzey controller signing-rotation restart-action \
+fleet controller signing-rotation restart-action \
   --controller-url https://fleet.example.com \
   --admin-token <admin-token> \
   --confirm-external-restart \
   --reason "approved maintenance window"
 
-sponzey controller restart-service --dry-run
-sudo sponzey controller restart-service
+fleet controller restart-service --dry-run
+sudo fleet controller restart-service
 ```
 
 ## Controller Signing Rotation Mutations
@@ -489,8 +489,8 @@ Authorization: Bearer <admin-token>
 
 ```json
 {
-  "candidate_public_key_path": "/var/lib/sponzey-fleet/controller/candidate_public.key",
-  "candidate_private_key_path": "/var/lib/sponzey-fleet/controller/candidate_private.key",
+  "candidate_public_key_path": "/var/lib/fleet/controller/candidate_public.key",
+  "candidate_private_key_path": "/var/lib/fleet/controller/candidate_private.key",
   "reason": "candidate keypair validated on controller host"
 }
 ```
@@ -524,21 +524,21 @@ Authorization: Bearer <admin-token>
 CLI:
 
 ```bash
-sponzey controller signing-rotation request \
+fleet controller signing-rotation request \
   --controller-url https://fleet.example.com \
   --admin-token <admin-token> \
   --new-fingerprint <candidate-signing-fingerprint> \
   --old-key-verifies-for-seconds 3600
 
-sponzey controller signing-rotation validate \
+fleet controller signing-rotation validate \
   --controller-url https://fleet.example.com \
   --admin-token <admin-token> \
-  --candidate-public-key-path /var/lib/sponzey-fleet/controller/candidate_public.key \
-  --candidate-private-key-path /var/lib/sponzey-fleet/controller/candidate_private.key
+  --candidate-public-key-path /var/lib/fleet/controller/candidate_public.key \
+  --candidate-private-key-path /var/lib/fleet/controller/candidate_private.key
 
-sponzey controller signing-rotation activate --controller-url https://fleet.example.com --admin-token <admin-token>
-sponzey controller signing-rotation retire --controller-url https://fleet.example.com --admin-token <admin-token>
-sponzey controller signing-rotation fail --controller-url https://fleet.example.com --admin-token <admin-token> --reason "candidate validation failed"
+fleet controller signing-rotation activate --controller-url https://fleet.example.com --admin-token <admin-token>
+fleet controller signing-rotation retire --controller-url https://fleet.example.com --admin-token <admin-token>
+fleet controller signing-rotation fail --controller-url https://fleet.example.com --admin-token <admin-token> --reason "candidate validation failed"
 ```
 
 Audited restart action이 현재 지원되는 rotation restart 경로다. HTTP handler
@@ -562,7 +562,7 @@ Authorization: Bearer <admin-token>
 
 ```json
 {
-  "previous_public_key_path": "/var/lib/sponzey-fleet/controller/controller_public.key.bak",
+  "previous_public_key_path": "/var/lib/fleet/controller/controller_public.key.bak",
   "agent_ids": ["agent-1", "agent-2"],
   "max_agent_count": 50
 }
@@ -618,7 +618,7 @@ Authorization: Bearer <admin-token>
 
 ```json
 {
-  "previous_public_key_path": "/var/lib/sponzey-fleet/controller/controller_public.key.bak",
+  "previous_public_key_path": "/var/lib/fleet/controller/controller_public.key.bak",
   "agent_ids": ["agent-1", "agent-2", "agent-3"],
   "batch_size": 10,
   "max_failures": 1,
@@ -676,10 +676,10 @@ Authorization: Bearer <admin-token>
 Staged coordinator CLI:
 
 ```bash
-sponzey controller signing-rotation staged-trust-bundle \
+fleet controller signing-rotation staged-trust-bundle \
   --controller-url https://fleet.example.com \
   --admin-token <admin-token> \
-  --previous-public-key-path /var/lib/sponzey-fleet/controller/controller_public.key.bak \
+  --previous-public-key-path /var/lib/fleet/controller/controller_public.key.bak \
   --agent-id agent-1 \
   --batch-size 10 \
   --max-failures 1 \
@@ -689,10 +689,10 @@ sponzey controller signing-rotation staged-trust-bundle \
 Manual rollout CLI:
 
 ```bash
-sponzey controller signing-rotation rollout-trust-bundle \
+fleet controller signing-rotation rollout-trust-bundle \
   --controller-url https://fleet.example.com \
   --admin-token <admin-token> \
-  --previous-public-key-path /var/lib/sponzey-fleet/controller/controller_public.key.bak \
+  --previous-public-key-path /var/lib/fleet/controller/controller_public.key.bak \
   --agent-id agent-1
 ```
 
@@ -701,10 +701,10 @@ response schema를 사용하되, operator가 `max_agent_count`와 `agent_ids`로
 batch를 명시하는 bounded retry coordinator surface다.
 
 ```bash
-sponzey controller signing-rotation retry-trust-bundle \
+fleet controller signing-rotation retry-trust-bundle \
   --controller-url https://fleet.example.com \
   --admin-token <admin-token> \
-  --previous-public-key-path /var/lib/sponzey-fleet/controller/controller_public.key.bak \
+  --previous-public-key-path /var/lib/fleet/controller/controller_public.key.bak \
   --max-agent-count 25
 ```
 
@@ -715,10 +715,10 @@ background scheduler는 별도 hardening task다.
 
 ## Admin Token
 
-`sponzey controller init`은 최초 실행 시 admin token을 1회 출력한다.
+`fleet controller init`은 최초 실행 시 admin token을 1회 출력한다.
 
 ```bash
-sponzey controller init --data-dir .sponzey
+fleet controller init --data-dir .sponzey
 ```
 
 출력 예:
@@ -963,7 +963,7 @@ Command risk는 domain classifier가 판정한다. `uptime`, `hostname`, `whoami
 CLI에서 controller API로 job을 생성하려면 admin token을 명시 인자로 전달한다. token은 command payload나 job output에 섞지 않는다.
 
 ```bash
-sponzey run \
+fleet run \
   --controller-url http://127.0.0.1:7700 \
   --admin-token <admin-token> \
   --selector role=web \
@@ -1042,7 +1042,7 @@ Job 생성 후 target snapshot:
 
 ## Runbook Job API
 
-Runbook job API는 admin token 인증 후 runbook 문서를 validation하고, controller-signed task assignment를 생성한다. 실제 package/service/file/check/snapshot primitive 실행은 agent가 signed envelope를 검증한 뒤 수행한다. `sponzey apply`는 local validation-only 명령이며, privileged execution path가 아니다.
+Runbook job API는 admin token 인증 후 runbook 문서를 validation하고, controller-signed task assignment를 생성한다. 실제 package/service/file/check/snapshot primitive 실행은 agent가 signed envelope를 검증한 뒤 수행한다. `fleet apply`는 local validation-only 명령이며, privileged execution path가 아니다.
 
 ```http
 POST /api/jobs/runbook
@@ -1271,8 +1271,8 @@ Remediation status:
 - `approved`: approval decision이 승인되었고 signed job creation 직전 상태다.
 - `job_created`: signed runbook job과 assignment metadata가 저장되었다. active agent session이 있으면 저장 이후 dispatch 대상이 된다.
 - `running`: linked job이 실행을 시작했다.
-- `succeeded_pending_verify`: job result는 성공이지만 latest drift evidence 검증 전이다.
-- `resolved`: agent id, policy id, policy name, job id가 latest drift evidence와 일치해 resolved 처리되었다.
+- `succeeded_pending_verify`: remediation execution은 성공했지만 persisted successful verification Job과 fresh correlated compliant evidence 검증 전이다.
+- `resolved`: persisted successful verification Job과 remediation execution 뒤의 fresh compliant evidence가 remediation과 origin drift를 함께 resolve했다.
 - `failed`, `rejected`, `expired`, `canceled`: terminal 상태다.
 
 List remediation metadata:
@@ -1296,6 +1296,8 @@ Authorization: Bearer <admin-token>
     "approval_required": true,
     "risk_summary": "drifted policy requires approved remediation",
     "job_id": null,
+    "lifecycle_source": "persisted",
+    "legacy_state": "legacy_unverified",
     "created_at_ms": 1710000000000,
     "updated_at_ms": 1710000000000
   }
@@ -1341,7 +1343,7 @@ Content-Type: application/json
 
 응답은 remediation metadata, approval metadata, job id, assignment count만 포함한다. `runbook_document` 원문은 response와 audit value에 포함하지 않는다.
 
-Record running/result and verify:
+Deprecated manual running/result/verify endpoints:
 
 ```http
 POST /api/remediations/{remediation_id}/running
@@ -1369,14 +1371,16 @@ Authorization: Bearer <admin-token>
 }
 ```
 
-검증 규칙:
+Read model and validation rules:
 
 - approval request 생성은 job row를 만들지 않는다. approval request의 `job_id`는 reserved id다.
 - approve endpoint는 approval을 승인한 뒤 signed runbook job과 assignment를 store에 저장한다.
 - WebSocket dispatch는 job/assignment 저장 이후에만 가능하다.
-- result success는 `resolved`가 아니라 `succeeded_pending_verify`로 기록한다.
-- verify endpoint는 agent id, policy id, policy name, job id가 remediation request와 latest drift evidence에 모두 맞을 때만 `resolved`로 전이한다.
-- controller handler는 remediation 상태 전이를 계산하지 않고 application use case 결과를 반환한다.
+- 수동 `running`, `result`, `verify` endpoint와 동명 CLI command는 호환성 기간 동안 남지만 항상 `409 Conflict`를 반환하며 lifecycle state를 변경하지 않는다.
+- authenticated agent task event가 execution lifecycle을 기록한다. successful verification TaskResult와 remediation execution 뒤의 fresh compliant persisted evidence만 application transaction을 통해 remediation과 origin drift를 `resolved`로 바꾼다.
+- list/detail 응답의 `lifecycle_source`는 항상 `persisted`다. `verification_job_id`, `verification_assignment_status`, `verification_evidence_status`는 존재하는 correlated row만 표시한다. `verification_assignment_status=failed`는 remediation을 성공으로 표시하지 않는다.
+- `origin_drift_report_id`가 없는 historical row는 `legacy_state=legacy_unverified`로 표시하며 자동으로 verified로 승격하지 않는다. recovery가 막힌 row의 `legacy_blocked` reason은 audit에서 확인한다.
+- Web Admin은 수동 lifecycle 버튼을 제공하지 않고 persisted remediation metadata를 표시한다. CLI의 deprecated command는 요청 전 warning을 출력한 뒤 같은 `409` compatibility response를 전달한다.
 
 CLI surface:
 
@@ -1390,7 +1394,7 @@ sponzey remediations result remediation-nginx-running-agent-web-01 --job-id job-
 sponzey remediations verify remediation-nginx-running-agent-web-01 --agent-id agent-web-01 --policy-id nginx-running --policy-name nginx-running --job-id job-remediation-01
 ```
 
-CLI와 Web Admin은 remediation metadata만 표시한다. Web Admin의 approved runbook YAML 입력은 approve request body로만 사용하고 list/detail/result surface에 다시 렌더링하지 않는다.
+CLI와 Web Admin은 persisted remediation lifecycle metadata만 표시한다. Web Admin의 approved runbook YAML 입력은 approve request body로만 사용하고 list/detail/result surface에 다시 렌더링하지 않는다.
 
 ### List Jobs
 
@@ -1968,7 +1972,7 @@ Authorization: Bearer <admin-token>
 }
 ```
 
-Metrics snapshot도 persistent session에서 전송되지만 heartbeat 주기와는 독립적이다. 기본 agent start 설정에서는 initial session snapshot 이후 `--metrics-interval-seconds` 기준으로 전송되며 기본값은 30초다. `collected_at_ms`는 저장된 snapshot 시각이고, `agent_system_time_ms`는 agent가 metrics를 만든 시스템 시각이다. Metrics는 CPU 사용률, 메모리 사용량/사용률, 디스크 사용량/사용률, process count, service failure count처럼 시간에 따라 변하는 사용량 telemetry를 담는다. MVP는 lightweight snapshot만 저장하며 time-series observability platform으로 확장하지 않는다. `service.status_available=false`는 systemd가 없거나 조회가 불가능한 환경을 의미하며, collector 실패로 process를 중단하지 않는다. Retention cleanup은 controller-managed worker와 `sponzey retention cleanup` explicit command가 같은 application use case를 사용한다.
+Metrics snapshot도 persistent session에서 전송되지만 heartbeat 주기와는 독립적이다. 기본 agent start 설정에서는 initial session snapshot 이후 `--metrics-interval-seconds` 기준으로 전송되며 기본값은 30초다. `collected_at_ms`는 저장된 snapshot 시각이고, `agent_system_time_ms`는 agent가 metrics를 만든 시스템 시각이다. Metrics는 CPU 사용률, 메모리 사용량/사용률, 디스크 사용량/사용률, process count, service failure count처럼 시간에 따라 변하는 사용량 telemetry를 담는다. MVP는 lightweight snapshot만 저장하며 time-series observability platform으로 확장하지 않는다. `service.status_available=false`는 systemd가 없거나 조회가 불가능한 환경을 의미하며, collector 실패로 process를 중단하지 않는다. Retention cleanup은 controller-managed worker와 `fleet retention cleanup` explicit command가 같은 application use case를 사용한다.
 
 ### Metrics Snapshot Pages
 
@@ -2060,7 +2064,7 @@ Authorization: Bearer <admin-token>
 }
 ```
 
-Agent가 WebSocket task-data channel로 보낸 drift report는 `drift_reports`에 저장되고 `drift_report_received` audit event를 남긴다. `checked_at_ms`와 `agent_system_time_ms`는 agent가 drift report message를 보낸 시스템 시각을 기준으로 한다. Local `sponzey drift check --policy`는 service running, package present, file SHA-256 check engine을 사용한다. Controller는 `/api/jobs/drift-check`로 signed drift check assignment를 생성할 수 있으며, agent는 signed envelope 검증 이후 drift check를 수행한다.
+Agent가 WebSocket task-data channel로 보낸 drift report는 `drift_reports`에 저장되고 `drift_report_received` audit event를 남긴다. `checked_at_ms`와 `agent_system_time_ms`는 agent가 drift report message를 보낸 시스템 시각을 기준으로 한다. Local `fleet drift check --policy`는 service running, package present, file SHA-256 check engine을 사용한다. Controller는 `/api/jobs/drift-check`로 signed drift check assignment를 생성할 수 있으며, agent는 signed envelope 검증 이후 drift check를 수행한다.
 
 ### Drift Report Pages
 
@@ -2263,7 +2267,7 @@ Audit category registry:
 CLI export:
 
 ```bash
-sponzey audit export --category security --limit 100 > audit-security.jsonl
+fleet audit export --category security --limit 100 > audit-security.jsonl
 ```
 
 CLI는 controller 응답의 `items`를 한 줄에 하나의 JSON object로 출력한다. Raw
@@ -2286,7 +2290,7 @@ Audit mutation 정책:
 - Controller HTTP/WebSocket layer는 Axum 기반으로 제공한다.
 - Controller accept loop는 명시적 shutdown signal 경계를 갖지만, process signal integration은 CLI/runtime 후속 작업이다.
 - controller key pair rotation은 아직 구현하지 않았다.
-- CLI login/profile 저장 방식은 구현되어 있다. 기본 profile은 `.sponzey/cli-profile.json`이며 protected remote command는 insecure permission을 거부한다.
+- CLI login/profile 저장 방식은 구현되어 있다. 기본 profile은 `.fleet/cli-profile.json`이며 protected remote command는 insecure permission을 거부한다.
 - Persistent WebSocket session 이후 queued command assignment dispatch, ack/start/reject/result 상태 저장, cancel/timeout terminal 구분, completed output/result 수신은 동작한다. Web Admin UI는 command job 생성, polling 기반 output viewer, target별 assignment table을 제공한다. CLI live renderer와 true streaming subscribe는 후속 task 범위다.
 - Approval request lifecycle API와 최소 admin role/permission check는 구현되어 있다. Web Admin approval queue 화면은 pending approvals 조회, approve/reject, expire due action을 제공한다. CLI login/profile과 최소 remote approval commands는 구현되어 있다. OIDC/SSO, full multi-admin lifecycle은 후속 task 범위다.
 - Facts/metrics/drift page API는 cursor paging을 제공한다. Generated SDK 배포는 후속 task 범위다.

@@ -9,7 +9,7 @@ fi
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 REPO_ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)"
-BIN="$REPO_ROOT/target/debug/sponzey"
+BIN="$REPO_ROOT/target/debug/fleet"
 SMOKE_TMPDIR="${SPONZEY_SMOKE_TMPDIR:-/private/tmp}"
 if [ ! -d "$SMOKE_TMPDIR" ]; then
   SMOKE_TMPDIR="${TMPDIR:-/tmp}"

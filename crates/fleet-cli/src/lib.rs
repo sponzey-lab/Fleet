@@ -19,13 +19,15 @@ use std::process::{Command as ProcessCommand, ExitCode};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
-    mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio_rustls::rustls::{ClientConfig as RustlsClientConfig, RootCertStore};
 use tungstenite::client::IntoClientRequest;
 use tungstenite::{Connector, Message};
+
+#[cfg(test)]
+use std::sync::mpsc;
 
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -36,14 +38,14 @@ const LOG_TAIL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const REMOTE_RUN_EXPIRES_IN_SECONDS: u64 = 300;
 const AGENT_SESSION_OUTBOUND_QUEUE_CAPACITY: usize = 64;
 const AGENT_SESSION_READ_POLL_INTERVAL: Duration = Duration::from_millis(250);
-const DEFAULT_CLI_PROFILE_PATH: &str = ".sponzey/cli-profile.json";
+const DEFAULT_CLI_PROFILE_PATH: &str = ".fleet/cli-profile.json";
 const CONTROLLER_SIGNING_STAGED_TRUST_BUNDLE_PATH: &str =
     "/api/controller/signing-rotation/rollout-trust-bundle/staged";
 const AGENT_CERTIFICATE_LIFECYCLE_RUNTIME_NOT_IMPLEMENTED: &str =
     "certificate_lifecycle_runtime_not_implemented";
 
 #[derive(Debug, Parser)]
-#[command(name = "sponzey")]
+#[command(name = "fleet")]
 #[command(about = "Sponzey Fleet command line interface")]
 #[command(version = env!("CARGO_PKG_VERSION"))]
 pub struct Cli {
@@ -131,13 +133,13 @@ pub struct ControllerCommand {
 #[derive(Debug, Subcommand)]
 pub enum ControllerSubcommand {
     Init {
-        #[arg(long, default_value = ".sponzey")]
+        #[arg(long, default_value = ".fleet")]
         data_dir: PathBuf,
     },
     #[command(
         about = "Start the Sponzey Fleet controller",
         long_about = "Start the Sponzey Fleet controller API, Web Admin UI, and agent gateway.\n\nThe bind host controls where the process listens. The external URL is the public URL agents and operators should use. Do not use 0.0.0.0 as an agent URL. HTTP URLs are allowed for tests only, but every HTTP use prints a warning because traffic is not encrypted. Product and production environments must use HTTPS.",
-        after_help = "Examples:\n  Local loopback demo:\n    sponzey controller start --host 127.0.0.1 --port 7700 --data-dir .sponzey --external-url http://127.0.0.1:7700\n\n  Test-only HTTP remote controller with warning:\n    sponzey controller start --host 0.0.0.0 --port 7700 --data-dir /var/lib/sponzey-fleet --external-url http://192.168.0.10:7700\n\n  HTTPS behind DNS/reverse proxy:\n    sponzey controller start --host 127.0.0.1 --port 7700 --data-dir /var/lib/sponzey-fleet --external-url https://fleet.example.com\n\n  Built-in HTTPS listener:\n    sponzey controller start --host 0.0.0.0 --port 7700 --data-dir /var/lib/sponzey-fleet --external-url https://fleet.example.com --tls-cert /etc/sponzey/tls/fullchain.pem --tls-key /etc/sponzey/tls/privkey.pem"
+        after_help = "Examples:\n  Local loopback demo:\n    fleet controller start --host 127.0.0.1 --port 7700 --data-dir .fleet --external-url http://127.0.0.1:7700\n\n  Test-only HTTP remote controller with warning:\n    fleet controller start --host 0.0.0.0 --port 7700 --data-dir /var/lib/fleet --external-url http://192.168.0.10:7700\n\n  HTTPS behind DNS/reverse proxy:\n    fleet controller start --host 127.0.0.1 --port 7700 --data-dir /var/lib/fleet --external-url https://fleet.example.com\n\n  Built-in HTTPS listener:\n    fleet controller start --host 0.0.0.0 --port 7700 --data-dir /var/lib/fleet --external-url https://fleet.example.com --tls-cert /etc/fleet/tls/fullchain.pem --tls-key /etc/fleet/tls/privkey.pem"
     )]
     Start {
         #[arg(long, default_value = "127.0.0.1")]
@@ -163,13 +165,13 @@ pub enum ControllerSubcommand {
             help = "PEM CA certificate for future agent client-certificate mTLS; currently rejected until enforcement is implemented"
         )]
         agent_client_ca_cert: Option<PathBuf>,
-        #[arg(long, default_value = ".sponzey")]
+        #[arg(long, default_value = ".fleet")]
         data_dir: PathBuf,
     },
     InstallService {
         #[arg(long)]
         binary: Option<PathBuf>,
-        #[arg(long, default_value = "/var/lib/sponzey-fleet")]
+        #[arg(long, default_value = "/var/lib/fleet")]
         data_dir: PathBuf,
         #[arg(long)]
         user: Option<String>,
@@ -217,7 +219,7 @@ pub enum ControllerSubcommand {
         long_about = "Create a JSON backup archive for the controller data under <data-dir>/controller.\n\nThe archive contains controller keys, SQLite data, metadata, and checksums. Treat it as sensitive because it contains enough controller state to restore the fleet."
     )]
     Backup {
-        #[arg(long, default_value = ".sponzey")]
+        #[arg(long, default_value = ".fleet")]
         data_dir: PathBuf,
         #[arg(long, help = "Backup archive path to create")]
         output: PathBuf,
@@ -227,7 +229,7 @@ pub enum ControllerSubcommand {
         long_about = "Restore a JSON backup archive into <data-dir>/controller.\n\nDry-run validates format, checksums, schema compatibility, and SQLite integrity without writing. Actual restore refuses to overwrite existing controller data unless --force is provided."
     )]
     Restore {
-        #[arg(long, default_value = ".sponzey")]
+        #[arg(long, default_value = ".fleet")]
         data_dir: PathBuf,
         #[arg(long, help = "Backup archive path to restore")]
         input: PathBuf,
@@ -365,7 +367,7 @@ pub enum AgentSubcommand {
         about = "Enroll this host as an agent",
         long_about = "Enroll this host with a controller using a one-time enrollment token.\n\nEnrollment writes the local agent identity, private key, labels, and pinned controller fingerprint under the selected data directory. Run this once before starting the agent.",
         visible_alias = "enroll",
-        after_help = "Examples:\n  Local loopback development:\n    sponzey agent init --url http://127.0.0.1:7700 --token <token> --name web-01 --labels role=web,env=dev\n\n  Test-only remote HTTP with warning:\n    sponzey agent init --data-dir /var/lib/sponzey-fleet --url http://192.168.0.10:7700 --token <token> --name test-web-01 --labels role=web,env=test\n\n  HTTPS:\n    sponzey agent init --data-dir /var/lib/sponzey-fleet --url https://fleet.example.com --token <token> --name prod-web-01 --labels role=web,env=prod\n\n  HTTPS with a private CA:\n    sponzey agent init --data-dir /var/lib/sponzey-fleet --url https://fleet.example.com --tls-ca-cert /etc/sponzey/tls/ca.pem --token <token> --name prod-web-01"
+        after_help = "Examples:\n  Local loopback development:\n    fleet agent init --url http://127.0.0.1:7700 --token <token> --name web-01 --labels role=web,env=dev\n\n  Test-only remote HTTP with warning:\n    fleet agent init --data-dir /var/lib/fleet --url http://192.168.0.10:7700 --token <token> --name test-web-01 --labels role=web,env=test\n\n  HTTPS:\n    fleet agent init --data-dir /var/lib/fleet --url https://fleet.example.com --token <token> --name prod-web-01 --labels role=web,env=prod\n\n  HTTPS with a private CA:\n    fleet agent init --data-dir /var/lib/fleet --url https://fleet.example.com --tls-ca-cert /etc/fleet/tls/ca.pem --token <token> --name prod-web-01"
     )]
     Init {
         #[arg(long, help = "Controller URL to enroll against")]
@@ -385,18 +387,18 @@ pub enum AgentSubcommand {
             help = "Additional PEM CA certificate used to trust a private/self-signed controller TLS endpoint"
         )]
         tls_ca_cert: Option<PathBuf>,
-        #[arg(long, default_value = ".sponzey", help = "Agent data directory")]
+        #[arg(long, default_value = ".fleet", help = "Agent data directory")]
         data_dir: PathBuf,
     },
     #[command(
         about = "Start the enrolled local agent",
         long_about = "Start the enrolled local agent persistent session loop.\n\nThe agent reads its local identity from <data-dir>/agent/agent.conf, verifies the pinned controller fingerprint before opening the session, sends heartbeat liveness ticks, static facts inventory, metrics snapshots, and product-safe agent operational logs through one outbound writer queue, and receives controller-signed tasks on the same session. Heartbeat is only a liveness signal; facts, metrics, and logs each have their own bootstrap CLI interval. Connection failures are retried indefinitely by default. The agent must be enrolled before this command can run.",
-        after_help = "Examples:\n  sponzey agent start --data-dir .sponzey\n  sponzey agent start --data-dir /var/lib/sponzey-fleet\n  sponzey agent start --data-dir .sponzey --once\n  sponzey agent start --data-dir .sponzey --facts-interval-seconds 300 --metrics-interval-seconds 30 --log-upload-interval-seconds 30\n\nLocal development flow:\n  sponzey controller init --data-dir .sponzey\n  sponzey enroll-token create --data-dir .sponzey --labels role=web,env=dev\n  sponzey agent init --data-dir .sponzey --url http://127.0.0.1:7700 --token <token> --name web-01 --labels role=web,env=dev\n  sponzey agent start --data-dir .sponzey"
+        after_help = "Examples:\n  fleet agent start --data-dir .fleet\n  fleet agent start --data-dir /var/lib/fleet\n  fleet agent start --data-dir .fleet --once\n  fleet agent start --data-dir .fleet --facts-interval-seconds 300 --metrics-interval-seconds 30 --log-upload-interval-seconds 30\n\nLocal development flow:\n  fleet controller init --data-dir .fleet\n  fleet enroll-token create --data-dir .fleet --labels role=web,env=dev\n  fleet agent init --data-dir .fleet --url http://127.0.0.1:7700 --token <token> --name web-01 --labels role=web,env=dev\n  fleet agent start --data-dir .fleet"
     )]
     Start {
         #[arg(
             long,
-            default_value = ".sponzey",
+            default_value = ".fleet",
             help = "Directory containing agent/agent.conf and agent/agent_private.key"
         )]
         data_dir: PathBuf,
@@ -440,14 +442,14 @@ pub enum AgentSubcommand {
     },
     #[command(
         about = "Install the agent as a systemd service",
-        long_about = "Render or install the Linux systemd unit for running 'sponzey agent start'.\n\nDry-run is safe on every platform. Writing service files requires Linux and root privileges."
+        long_about = "Render or install the Linux systemd unit for running 'fleet agent start'.\n\nDry-run is safe on every platform. Writing service files requires Linux and root privileges."
     )]
     InstallService {
-        #[arg(long, help = "Absolute sponzey binary path to pin in the service unit")]
+        #[arg(long, help = "Absolute fleet binary path to pin in the service unit")]
         binary: Option<PathBuf>,
         #[arg(
             long,
-            default_value = "/var/lib/sponzey-fleet",
+            default_value = "/var/lib/fleet",
             help = "Persistent agent data directory used by the service"
         )]
         data_dir: PathBuf,
@@ -491,7 +493,7 @@ pub struct AgentsCommand {
 #[derive(Debug, Subcommand)]
 pub enum AgentsSubcommand {
     List {
-        #[arg(long, default_value = ".sponzey")]
+        #[arg(long, default_value = ".fleet")]
         data_dir: PathBuf,
     },
     RemoteList {
@@ -719,16 +721,16 @@ pub enum EnrollTokenSubcommand {
         name: Option<String>,
         #[arg(long)]
         print_init_command: bool,
-        #[arg(long, default_value = ".sponzey")]
+        #[arg(long, default_value = ".fleet")]
         data_dir: PathBuf,
     },
     List {
-        #[arg(long, default_value = ".sponzey")]
+        #[arg(long, default_value = ".fleet")]
         data_dir: PathBuf,
     },
     Revoke {
         id: String,
-        #[arg(long, default_value = ".sponzey")]
+        #[arg(long, default_value = ".fleet")]
         data_dir: PathBuf,
     },
 }
@@ -786,7 +788,7 @@ pub struct RetentionCommand {
 #[derive(Debug, Subcommand)]
 pub enum RetentionSubcommand {
     Cleanup {
-        #[arg(long, default_value = ".sponzey")]
+        #[arg(long, default_value = ".fleet")]
         data_dir: PathBuf,
         #[arg(long, default_value_t = 30)]
         older_than_days: u64,
@@ -885,7 +887,7 @@ impl Display for CliError {
             Self::ControllerNotInitialized { data_dir } => {
                 write!(
                     formatter,
-                    "controller is not initialized for data dir: {}\n\nInitialize it once before starting the controller:\n\n  sponzey controller init --data-dir \"{}\"\n  sponzey controller start --host 127.0.0.1 --port 7700 --data-dir \"{}\" --external-url http://127.0.0.1:7700\n\nIf you use local scripts:\n\n  ./scripts/run_controller.sh --host 127.0.0.1 --port 7700 --data-dir \"{}\" --external-url http://127.0.0.1:7700",
+                    "controller is not initialized for data dir: {}\n\nInitialize it once before starting the controller:\n\n  fleet controller init --data-dir \"{}\"\n  fleet controller start --host 127.0.0.1 --port 7700 --data-dir \"{}\" --external-url http://127.0.0.1:7700\n\nIf you use local scripts:\n\n  ./scripts/run_controller.sh --host 127.0.0.1 --port 7700 --data-dir \"{}\" --external-url http://127.0.0.1:7700",
                     data_dir.display(),
                     data_dir.display(),
                     data_dir.display(),
@@ -1052,7 +1054,7 @@ fn ensure_secure_profile_permissions(path: &Path) -> Result<(), CliError> {
     let metadata = fs::metadata(path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             CliError::Http(format!(
-                "CLI profile not found: {}; run `sponzey login --controller-url <url> --admin-token <token>` or pass --controller-url and --admin-token",
+                "CLI profile not found: {}; run `fleet login --controller-url <url> --admin-token <token>` or pass --controller-url and --admin-token",
                 path.display()
             ))
         } else {
@@ -2095,7 +2097,7 @@ fn restore_temp_dir(data_dir: &Path) -> PathBuf {
     let name = data_dir
         .file_name()
         .and_then(|value| value.to_str())
-        .unwrap_or("sponzey-fleet");
+        .unwrap_or("fleet");
     parent.join(format!(".{name}-restore-tmp-{}", epoch_millis()))
 }
 
@@ -2182,7 +2184,7 @@ fn execute_enroll_token(command: EnrollTokenCommand) -> Result<(), CliError> {
                 })?;
                 let name = name.unwrap_or_else(|| "<agent-name>".to_owned());
                 println!(
-                    "sponzey agent init --url {} --token {} --name {} --labels {}",
+                    "fleet agent init --url {} --token {} --name {} --labels {}",
                     shell_arg(&controller_url),
                     shell_arg(&token),
                     shell_arg(&name),
@@ -2628,6 +2630,7 @@ fn execute_remediations(command: RemediationsCommand) -> Result<(), CliError> {
             job_id,
             api,
         } => {
+            warn_deprecated_manual_remediation_lifecycle("running");
             let client = resolve_protected_api(&api)?;
             let body = serde_json::json!({ "job_id": job_id }).to_string();
             let response = client.post(
@@ -2645,6 +2648,7 @@ fn execute_remediations(command: RemediationsCommand) -> Result<(), CliError> {
             status,
             api,
         } => {
+            warn_deprecated_manual_remediation_lifecycle("result");
             let client = resolve_protected_api(&api)?;
             let body = serde_json::json!({ "job_id": job_id, "status": status }).to_string();
             let response = client.post(
@@ -2661,6 +2665,7 @@ fn execute_remediations(command: RemediationsCommand) -> Result<(), CliError> {
             job_id,
             api,
         } => {
+            warn_deprecated_manual_remediation_lifecycle("verify");
             let client = resolve_protected_api(&api)?;
             let body = serde_json::json!({
                 "agent_id": agent_id,
@@ -3008,6 +3013,16 @@ fn print_remediation_response(body: &str) -> Result<(), CliError> {
     Ok(())
 }
 
+/// Warns before retaining a compatibility call that the Controller will reject.
+fn warn_deprecated_manual_remediation_lifecycle(command: &str) {
+    eprintln!(
+        "{}",
+        format_warning_message(format!(
+            "remediations {command} is deprecated and will return 409; wait for authenticated agent task events and persisted verification evidence"
+        ))
+    );
+}
+
 fn render_remediation_api_for_cli(body: &str) -> Result<Vec<String>, CliError> {
     let json: serde_json::Value =
         serde_json::from_str(body).map_err(|error| CliError::Http(error.to_string()))?;
@@ -3039,13 +3054,18 @@ fn render_remediation_api_for_cli(body: &str) -> Result<Vec<String>, CliError> {
 
 fn remediation_summary_line(value: &serde_json::Value) -> String {
     format!(
-        "remediation_id={}\tpolicy_id={}\tagent_id={}\tstatus={}\trunbook_ref={}\tjob_id={}",
+        "remediation_id={}\tpolicy_id={}\tagent_id={}\tstatus={}\trunbook_ref={}\tjob_id={}\tlifecycle_source={}\tverification_job_id={}\tverification_assignment_status={}\tverification_evidence_status={}\tlegacy_state={}",
         json_field(value, "id"),
         json_field(value, "policy_id"),
         json_field(value, "agent_id"),
         json_field(value, "status"),
         json_field(value, "runbook_ref"),
-        json_field(value, "job_id")
+        json_field(value, "job_id"),
+        json_field(value, "lifecycle_source"),
+        json_field(value, "verification_job_id"),
+        json_field(value, "verification_assignment_status"),
+        json_field(value, "verification_evidence_status"),
+        json_field(value, "legacy_state")
     )
 }
 
@@ -3354,11 +3374,11 @@ fn upgrade_dry_run_lines(command: &UpgradeCommand) -> Vec<String> {
         format!("channel={}", command.channel.as_str()),
         format!("target_version={target_version}"),
         "backup_required=true".to_owned(),
-        "recommended_backup_command=sponzey controller backup --data-dir <controller-data-dir> --output ./sponzey-controller-before-upgrade.backup.json".to_owned(),
+        "recommended_backup_command=fleet controller backup --data-dir <controller-data-dir> --output ./fleet-controller-before-upgrade.backup.json".to_owned(),
         "artifact_integrity_required=true".to_owned(),
         "artifact_integrity_command=./scripts/verify_standalone_artifacts.sh dist/release".to_owned(),
         "artifact_signature_command=./scripts/verify_release_signature.sh dist/release <release-public-key.pem>".to_owned(),
-        "recovery_policy=restore the previous sponzey binary; if controller data was migrated or changed, restore the controller backup before restarting services".to_owned(),
+        "recovery_policy=restore the previous fleet binary; if controller data was migrated or changed, restore the controller backup before restarting services".to_owned(),
         "service_policy=stop services before binary replacement, then restart and verify with status-service".to_owned(),
     ]
 }
@@ -3622,7 +3642,7 @@ fn ensure_loopback_port_available(port: u16) -> Result<(), CliError> {
 
 fn unique_demo_dir() -> PathBuf {
     std::env::temp_dir().join(format!(
-        "sponzey-fleet-demo-{}-{}",
+        "fleet-demo-{}-{}",
         std::process::id(),
         epoch_millis()
     ))
@@ -3735,8 +3755,8 @@ fn render_service_unit(
 
 fn service_unit_name(role: ServiceRole) -> &'static str {
     match role {
-        ServiceRole::Controller => "sponzey-fleet-controller.service",
-        ServiceRole::Agent => "sponzey-fleet-agent.service",
+        ServiceRole::Controller => "fleet-controller.service",
+        ServiceRole::Agent => "fleet-agent.service",
     }
 }
 
@@ -4615,9 +4635,11 @@ fn run_agent_session_loop(
     config: &LocalAgentConfig,
     options: AgentHeartbeatOptions,
 ) -> Result<(), CliError> {
-    run_agent_session_loop_with(
+    let mut session_runtime = agent_session_runtime(config)?;
+    run_agent_session_loop_with_state(
+        &mut session_runtime,
         options,
-        || run_agent_session_once(config, options),
+        |runtime| run_agent_session_once(config, options, runtime),
         std::thread::sleep,
     )
 }
@@ -4661,6 +4683,33 @@ where
             }
         }
     }
+}
+
+fn run_agent_session_loop_with_state<T, F, S>(
+    state: &mut T,
+    options: AgentHeartbeatOptions,
+    mut session_once: F,
+    sleep: S,
+) -> Result<(), CliError>
+where
+    F: FnMut(&mut T) -> Result<AgentSessionEnd, CliError>,
+    S: FnMut(Duration),
+{
+    run_agent_session_loop_with(options, || session_once(state), sleep)
+}
+
+#[cfg(test)]
+fn run_agent_session_loop_with_state_for_test<T, F, S>(
+    state: &mut T,
+    options: AgentHeartbeatOptions,
+    session_once: F,
+    sleep: S,
+) -> Result<(), CliError>
+where
+    F: FnMut(&mut T) -> Result<AgentSessionEnd, CliError>,
+    S: FnMut(Duration),
+{
+    run_agent_session_loop_with_state(state, options, session_once, sleep)
 }
 
 fn is_fatal_agent_session_error(error: &CliError) -> bool {
@@ -4838,8 +4887,8 @@ fn run_agent_heartbeat_once(
 }
 
 type AgentWebSocket = tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>;
-type AgentOutboundSender = SyncSender<fleet_protocol::WireMessage>;
-type AgentOutboundReceiver = Receiver<fleet_protocol::WireMessage>;
+type AgentOutboundQueue =
+    Arc<Mutex<fleet_agent::AgentSessionSupervisor<fleet_protocol::WireMessage>>>;
 
 #[derive(Default)]
 struct AgentTaskRuntimeState {
@@ -4853,6 +4902,12 @@ struct AgentTaskSessionState {
     runtime: Arc<AgentTaskRuntimeState>,
     replay_guard: Arc<Mutex<fleet_runner::NonceReplayGuard>>,
     controller_trust_bundle: Arc<Mutex<Option<fleet_domain::ControllerSigningTrustBundle>>>,
+}
+
+struct AgentSessionRuntime {
+    task_state: AgentTaskSessionState,
+    connection: fleet_agent::AgentSessionSupervisor<()>,
+    outbound_queue: AgentOutboundQueue,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4943,6 +4998,16 @@ fn agent_task_session_state(config: &LocalAgentConfig) -> Result<AgentTaskSessio
     })
 }
 
+fn agent_session_runtime(config: &LocalAgentConfig) -> Result<AgentSessionRuntime, CliError> {
+    Ok(AgentSessionRuntime {
+        task_state: agent_task_session_state(config)?,
+        connection: fleet_agent::AgentSessionSupervisor::new(0),
+        outbound_queue: Arc::new(Mutex::new(fleet_agent::AgentSessionSupervisor::new(
+            AGENT_SESSION_OUTBOUND_QUEUE_CAPACITY,
+        ))),
+    })
+}
+
 fn agent_controller_signing_trust_bundle(
     task_state: &AgentTaskSessionState,
     config: &LocalAgentConfig,
@@ -4993,6 +5058,21 @@ fn verify_agent_task_envelope_once_with_session_trust(
 fn run_agent_session_once(
     config: &LocalAgentConfig,
     options: AgentHeartbeatOptions,
+    runtime: &mut AgentSessionRuntime,
+) -> Result<AgentSessionEnd, CliError> {
+    runtime
+        .connection
+        .begin_connect()
+        .map_err(|_| CliError::Http("invalid agent session connection transition".to_owned()))?;
+    let result = run_agent_session_connected_once(config, options, runtime);
+    runtime.connection.connection_lost();
+    result
+}
+
+fn run_agent_session_connected_once(
+    config: &LocalAgentConfig,
+    options: AgentHeartbeatOptions,
+    runtime: &mut AgentSessionRuntime,
 ) -> Result<AgentSessionEnd, CliError> {
     let identity = controller_identity_via_controller(&config.url, config.tls_ca_cert.as_deref())?;
     validate_pinned_controller_identity(config, &identity)?;
@@ -5004,11 +5084,16 @@ fn run_agent_session_once(
     let correlation_id = prefixed_ulid("corr")?;
 
     perform_agent_session_handshake(&mut socket, config, &correlation_id)?;
+    runtime.connection.mark_authenticated().map_err(|_| {
+        CliError::Http("invalid agent session authentication transition".to_owned())
+    })?;
 
-    let (outbound_sender, outbound_receiver) =
-        mpsc::sync_channel(AGENT_SESSION_OUTBOUND_QUEUE_CAPACITY);
-    let task_state = agent_task_session_state(config)?;
-    enqueue_initial_agent_session_messages(&outbound_sender, config, &correlation_id, options)?;
+    enqueue_initial_agent_session_messages(
+        &runtime.outbound_queue,
+        config,
+        &correlation_id,
+        options,
+    )?;
 
     let mut last_heartbeat = Instant::now();
     let mut last_facts = Instant::now();
@@ -5020,7 +5105,7 @@ fn run_agent_session_once(
     };
 
     loop {
-        flush_agent_outbound_queue(&mut socket, &outbound_receiver)?;
+        flush_agent_outbound_queue(&mut socket, &runtime.outbound_queue)?;
 
         match read_agent_session_message(&mut socket)? {
             AgentSessionInbound::Message(message) => handle_agent_session_message(
@@ -5028,8 +5113,8 @@ fn run_agent_session_once(
                 config,
                 controller_signing_public_key(&identity),
                 &correlation_id,
-                &outbound_sender,
-                &task_state,
+                &runtime.outbound_queue,
+                &runtime.task_state,
             )?,
             AgentSessionInbound::Idle => {}
             AgentSessionInbound::Closed => return Ok(AgentSessionEnd::ControllerClosed),
@@ -5043,7 +5128,12 @@ fn run_agent_session_once(
             now.saturating_duration_since(last_log),
             options,
         );
-        enqueue_agent_session_tick_messages(&outbound_sender, config, &correlation_id, actions)?;
+        enqueue_agent_session_tick_messages(
+            &runtime.outbound_queue,
+            config,
+            &correlation_id,
+            actions,
+        )?;
         if actions.heartbeat {
             last_heartbeat = now;
         }
@@ -5056,12 +5146,12 @@ fn run_agent_session_once(
         if actions.log {
             last_log = now;
         }
-        flush_agent_outbound_queue(&mut socket, &outbound_receiver)?;
+        flush_agent_outbound_queue(&mut socket, &runtime.outbound_queue)?;
     }
 }
 
 fn enqueue_agent_session_tick_messages(
-    outbound_sender: &AgentOutboundSender,
+    outbound_sender: &AgentOutboundQueue,
     config: &LocalAgentConfig,
     correlation_id: &str,
     actions: AgentSessionTickActions,
@@ -5139,7 +5229,7 @@ fn perform_agent_session_handshake(
 }
 
 fn enqueue_initial_agent_session_messages(
-    outbound_sender: &AgentOutboundSender,
+    outbound_sender: &AgentOutboundQueue,
     config: &LocalAgentConfig,
     correlation_id: &str,
     options: AgentHeartbeatOptions,
@@ -5171,18 +5261,36 @@ fn enqueue_initial_agent_session_messages(
 
 fn flush_agent_outbound_queue(
     socket: &mut AgentWebSocket,
-    outbound_receiver: &AgentOutboundReceiver,
+    outbound_queue: &AgentOutboundQueue,
 ) -> Result<(), CliError> {
+    flush_agent_outbound_queue_with(outbound_queue, |message| {
+        send_wire_message_to_socket(socket, message)
+    })
+}
+
+/// Gives the sole socket writer each queued report and removes it only after a successful write.
+fn flush_agent_outbound_queue_with<F>(
+    outbound_queue: &AgentOutboundQueue,
+    mut write_message: F,
+) -> Result<(), CliError>
+where
+    F: FnMut(&fleet_protocol::WireMessage) -> Result<(), CliError>,
+{
     loop {
-        match outbound_receiver.try_recv() {
-            Ok(message) => send_wire_message_to_socket(socket, &message)?,
-            Err(TryRecvError::Empty) => return Ok(()),
-            Err(TryRecvError::Disconnected) => {
-                return Err(CliError::Http(
-                    "agent session outbound queue disconnected".to_owned(),
-                ));
-            }
-        }
+        let message = outbound_queue
+            .lock()
+            .map_err(|_| CliError::Http("agent outbound queue lock poisoned".to_owned()))?
+            .pending_report()
+            .cloned();
+        let Some(message) = message else {
+            return Ok(());
+        };
+        write_message(&message)?;
+        let removed = outbound_queue
+            .lock()
+            .map_err(|_| CliError::Http("agent outbound queue lock poisoned".to_owned()))?
+            .remove_pending_report();
+        debug_assert!(removed.is_some());
     }
 }
 
@@ -5202,16 +5310,23 @@ fn read_agent_session_message(
         Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => {
             Ok(AgentSessionInbound::Closed)
         }
-        Err(tungstenite::Error::Io(error))
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-            ) =>
-        {
-            Ok(AgentSessionInbound::Idle)
-        }
+        Err(error) if agent_session_read_error_is_idle(&error) => Ok(AgentSessionInbound::Idle),
         Err(error) => Err(CliError::Http(error.to_string())),
     }
+}
+
+/// Classifies recoverable socket read interruptions without ending the Agent session.
+fn agent_session_read_error_is_idle(error: &tungstenite::Error) -> bool {
+    matches!(
+        error,
+        tungstenite::Error::Io(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::Interrupted
+            )
+    )
 }
 
 fn handle_agent_session_message(
@@ -5219,7 +5334,7 @@ fn handle_agent_session_message(
     config: &LocalAgentConfig,
     controller_public_key: &str,
     correlation_id: &str,
-    outbound_sender: &AgentOutboundSender,
+    outbound_sender: &AgentOutboundQueue,
     task_state: &AgentTaskSessionState,
 ) -> Result<(), CliError> {
     let (envelope, task) = match message.payload {
@@ -5395,16 +5510,18 @@ fn send_wire_message_to_socket(
 }
 
 fn enqueue_wire_message(
-    outbound_sender: &AgentOutboundSender,
+    outbound_sender: &AgentOutboundQueue,
     message: fleet_protocol::WireMessage,
 ) -> Result<(), CliError> {
     outbound_sender
-        .try_send(message)
+        .lock()
+        .map_err(|_| CliError::Http("agent outbound queue lock poisoned".to_owned()))?
+        .enqueue_report(message)
         .map_err(|error| match error {
-            TrySendError::Full(_) => CliError::Http("agent outbound queue is full".to_owned()),
-            TrySendError::Disconnected(_) => {
-                CliError::Http("agent outbound queue disconnected".to_owned())
+            fleet_agent::AgentSessionSupervisorError::PendingReportsFull => {
+                CliError::Http("agent outbound queue is full".to_owned())
             }
+            _ => CliError::Http("invalid agent outbound queue transition".to_owned()),
         })
 }
 
@@ -5734,7 +5851,7 @@ fn collect_local_facts() -> serde_json::Value {
             .or_else(|| read_optional_trimmed("/etc/hostname")),
         "runtime": {
             "pid": std::process::id(),
-            "executable": "sponzey",
+            "executable": "fleet",
         },
         "cpu": {
             "logical_count": std::thread::available_parallelism()
@@ -6291,7 +6408,7 @@ fn read_and_handle_task_assignment(
 }
 
 fn handle_task_assignment_with_queue(
-    outbound_sender: &AgentOutboundSender,
+    outbound_sender: &AgentOutboundQueue,
     config: &LocalAgentConfig,
     controller_public_key: &str,
     correlation_id: &str,
@@ -6366,7 +6483,7 @@ fn handle_task_assignment_with_queue(
 }
 
 fn run_signed_command_task_queue(
-    outbound_sender: &AgentOutboundSender,
+    outbound_sender: &AgentOutboundQueue,
     config: &LocalAgentConfig,
     correlation_id: &str,
     envelope: &fleet_domain::TaskEnvelope,
@@ -6472,7 +6589,7 @@ fn command_execution_result(
 }
 
 fn run_signed_drift_check_task_queue(
-    outbound_sender: &AgentOutboundSender,
+    outbound_sender: &AgentOutboundQueue,
     config: &LocalAgentConfig,
     correlation_id: &str,
     envelope: &fleet_domain::TaskEnvelope,
@@ -6513,12 +6630,13 @@ fn run_signed_drift_check_task_queue(
             correlation_id.to_owned(),
             Some(config.agent_id.clone()),
             epoch_millis() as u64,
-            fleet_protocol::WirePayload::DriftReport {
-                agent_id: config.agent_id.clone(),
-                status: drift_status_to_cli(&report.status).to_owned(),
-                expected: report.expected,
-                actual: report.actual,
-            },
+            drift_report_payload_for_envelope(
+                &config.agent_id,
+                envelope,
+                drift_status_to_cli(&report.status).to_owned(),
+                report.expected,
+                report.actual,
+            ),
         ),
     )?;
     send_agent_task_result_queue(
@@ -6533,8 +6651,25 @@ fn run_signed_drift_check_task_queue(
     Ok(())
 }
 
+fn drift_report_payload_for_envelope(
+    agent_id: &str,
+    envelope: &fleet_domain::TaskEnvelope,
+    status: String,
+    expected: String,
+    actual: String,
+) -> fleet_protocol::WirePayload {
+    fleet_protocol::WirePayload::DriftReport {
+        agent_id: agent_id.to_owned(),
+        job_id: Some(envelope.job_id.as_str().to_owned()),
+        task_id: Some(envelope.task_id.as_str().to_owned()),
+        status,
+        expected,
+        actual,
+    }
+}
+
 fn run_signed_runbook_task_queue(
-    outbound_sender: &AgentOutboundSender,
+    outbound_sender: &AgentOutboundQueue,
     config: &LocalAgentConfig,
     correlation_id: &str,
     envelope: &fleet_domain::TaskEnvelope,
@@ -6827,12 +6962,13 @@ fn run_signed_drift_check_task(
         correlation_id.to_owned(),
         Some(config.agent_id.clone()),
         epoch_millis() as u64,
-        fleet_protocol::WirePayload::DriftReport {
-            agent_id: config.agent_id.clone(),
-            status: drift_status_to_cli(&report.status).to_owned(),
-            expected: report.expected,
-            actual: report.actual,
-        },
+        drift_report_payload_for_envelope(
+            &config.agent_id,
+            envelope,
+            drift_status_to_cli(&report.status).to_owned(),
+            report.expected,
+            report.actual,
+        ),
     );
     socket
         .send(Message::Text(
@@ -7154,7 +7290,7 @@ fn send_agent_task_ack(
 }
 
 fn send_agent_task_ack_queue(
-    outbound_sender: &AgentOutboundSender,
+    outbound_sender: &AgentOutboundQueue,
     config: &LocalAgentConfig,
     correlation_id: &str,
     envelope: &fleet_domain::TaskEnvelope,
@@ -7178,7 +7314,7 @@ fn send_agent_task_started(
 }
 
 fn send_agent_task_started_queue(
-    outbound_sender: &AgentOutboundSender,
+    outbound_sender: &AgentOutboundQueue,
     config: &LocalAgentConfig,
     correlation_id: &str,
     envelope: &fleet_domain::TaskEnvelope,
@@ -7211,7 +7347,7 @@ fn send_agent_task_rejected(
 }
 
 fn send_agent_task_rejected_queue(
-    outbound_sender: &AgentOutboundSender,
+    outbound_sender: &AgentOutboundQueue,
     config: &LocalAgentConfig,
     correlation_id: &str,
     envelope: &fleet_domain::TaskEnvelope,
@@ -7398,7 +7534,7 @@ fn send_agent_task_result_report(
 }
 
 fn send_agent_task_result_queue(
-    outbound_sender: &AgentOutboundSender,
+    outbound_sender: &AgentOutboundQueue,
     config: &LocalAgentConfig,
     correlation_id: &str,
     envelope: &fleet_domain::TaskEnvelope,
@@ -7416,7 +7552,7 @@ fn send_agent_task_result_queue(
 }
 
 fn send_agent_task_result_queue_report(
-    outbound_sender: &AgentOutboundSender,
+    outbound_sender: &AgentOutboundQueue,
     config: &LocalAgentConfig,
     correlation_id: &str,
     envelope: &fleet_domain::TaskEnvelope,
@@ -7470,7 +7606,7 @@ fn send_agent_output_chunk(
 }
 
 fn send_agent_output_chunk_queue(
-    outbound_sender: &AgentOutboundSender,
+    outbound_sender: &AgentOutboundQueue,
     config: &LocalAgentConfig,
     correlation_id: &str,
     envelope: &fleet_domain::TaskEnvelope,
@@ -7495,7 +7631,7 @@ fn send_agent_output_chunk_queue(
 }
 
 fn send_agent_security_event_queue(
-    outbound_sender: &AgentOutboundSender,
+    outbound_sender: &AgentOutboundQueue,
     config: &LocalAgentConfig,
     correlation_id: &str,
     action: &str,
@@ -7549,13 +7685,27 @@ fn output_stream_to_wire(
 fn read_ws_message(
     socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<TcpStream>>,
 ) -> Result<fleet_protocol::WireMessage, CliError> {
-    let message = socket
-        .read()
-        .map_err(|error| CliError::Http(error.to_string()))?;
-    let body = message
-        .to_text()
-        .map_err(|error| CliError::Http(error.to_string()))?;
-    fleet_protocol::decode_message(body).map_err(|error| CliError::Http(error.to_string()))
+    loop {
+        match socket.read() {
+            Ok(message) => {
+                let body = message
+                    .to_text()
+                    .map_err(|error| CliError::Http(error.to_string()))?;
+                return fleet_protocol::decode_message(body)
+                    .map_err(|error| CliError::Http(error.to_string()));
+            }
+            Err(error) if handshake_read_error_is_retryable(&error) => continue,
+            Err(error) => return Err(CliError::Http(error.to_string())),
+        }
+    }
+}
+
+/// Retries only an OS-interrupted handshake read; timeouts and protocol failures stay fatal.
+fn handshake_read_error_is_retryable(error: &tungstenite::Error) -> bool {
+    matches!(
+        error,
+        tungstenite::Error::Io(error) if error.kind() == std::io::ErrorKind::Interrupted
+    )
 }
 
 fn prefixed_ulid(prefix: &str) -> Result<String, CliError> {
@@ -7587,6 +7737,24 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
 
+    fn test_outbound_queue(capacity: usize) -> AgentOutboundQueue {
+        Arc::new(Mutex::new(fleet_agent::AgentSessionSupervisor::new(
+            capacity,
+        )))
+    }
+
+    fn take_outbound_message(queue: &AgentOutboundQueue) -> Option<fleet_protocol::WireMessage> {
+        queue.lock().unwrap().remove_pending_report()
+    }
+
+    struct TestOutboundReceiver(AgentOutboundQueue);
+
+    impl TestOutboundReceiver {
+        fn try_recv(&self) -> Result<fleet_protocol::WireMessage, mpsc::TryRecvError> {
+            take_outbound_message(&self.0).ok_or(mpsc::TryRecvError::Empty)
+        }
+    }
+
     #[derive(Debug)]
     struct OuterHttpTestError {
         source: InnerHttpTestError,
@@ -7617,7 +7785,7 @@ mod tests {
 
     #[test]
     fn parses_controller_init() {
-        let cli = Cli::try_parse_from(["sponzey", "controller", "init"]).expect("valid command");
+        let cli = Cli::try_parse_from(["fleet", "controller", "init"]).expect("valid command");
         assert!(matches!(
             cli.command,
             Command::Controller(ControllerCommand {
@@ -7649,7 +7817,7 @@ mod tests {
     #[test]
     fn parses_controller_start_sqlite_db_url() {
         let cli = Cli::try_parse_from([
-            "sponzey",
+            "fleet",
             "controller",
             "start",
             "--db",
@@ -7797,7 +7965,7 @@ steps:
     #[test]
     fn parses_controller_start_postgres_db_url_as_typed_backend() {
         let cli = Cli::try_parse_from([
-            "sponzey",
+            "fleet",
             "controller",
             "start",
             "--db",
@@ -7836,7 +8004,7 @@ steps:
     #[test]
     fn parses_controller_backup_and_restore_commands() {
         let backup = Cli::try_parse_from([
-            "sponzey",
+            "fleet",
             "controller",
             "backup",
             "--data-dir",
@@ -7855,7 +8023,7 @@ steps:
         assert_eq!(output, PathBuf::from("/tmp/fleet.backup.json"));
 
         let restore = Cli::try_parse_from([
-            "sponzey",
+            "fleet",
             "controller",
             "restore",
             "--data-dir",
@@ -7887,7 +8055,7 @@ steps:
     #[test]
     fn parses_controller_start_external_https_url() {
         let cli = Cli::try_parse_from([
-            "sponzey",
+            "fleet",
             "controller",
             "start",
             "--host",
@@ -7914,15 +8082,15 @@ steps:
     #[test]
     fn parses_controller_start_builtin_tls_paths() {
         let cli = Cli::try_parse_from([
-            "sponzey",
+            "fleet",
             "controller",
             "start",
             "--external-url",
             "https://fleet.example.com",
             "--tls-cert",
-            "/etc/sponzey/tls/fullchain.pem",
+            "/etc/fleet/tls/fullchain.pem",
             "--tls-key",
-            "/etc/sponzey/tls/privkey.pem",
+            "/etc/fleet/tls/privkey.pem",
         ])
         .expect("valid command");
 
@@ -7938,24 +8106,24 @@ steps:
 
         assert_eq!(
             tls_cert.as_deref(),
-            Some(Path::new("/etc/sponzey/tls/fullchain.pem"))
+            Some(Path::new("/etc/fleet/tls/fullchain.pem"))
         );
         assert_eq!(
             tls_key.as_deref(),
-            Some(Path::new("/etc/sponzey/tls/privkey.pem"))
+            Some(Path::new("/etc/fleet/tls/privkey.pem"))
         );
     }
 
     #[test]
     fn parses_controller_start_agent_client_ca_cert() {
         let cli = Cli::try_parse_from([
-            "sponzey",
+            "fleet",
             "controller",
             "start",
             "--external-url",
             "https://fleet.example.com",
             "--agent-client-ca-cert",
-            "/etc/sponzey/agent-client-ca.pem",
+            "/etc/fleet/agent-client-ca.pem",
         ])
         .expect("valid command");
 
@@ -7972,7 +8140,7 @@ steps:
 
         assert_eq!(
             agent_client_ca_cert.as_deref(),
-            Some(Path::new("/etc/sponzey/agent-client-ca.pem"))
+            Some(Path::new("/etc/fleet/agent-client-ca.pem"))
         );
     }
 
@@ -7988,7 +8156,7 @@ steps:
             CliError::ControllerNotInitialized { data_dir: _ }
         ));
         assert!(message.contains("controller is not initialized"));
-        assert!(message.contains("sponzey controller init --data-dir"));
+        assert!(message.contains("fleet controller init --data-dir"));
         assert!(message.contains("./scripts/run_controller.sh"));
     }
 
@@ -7996,7 +8164,7 @@ steps:
     fn enroll_token_create_persists_scope_and_audit() {
         let data_dir = unique_test_dir("enroll-token-create");
         let cli = Cli::try_parse_from([
-            "sponzey",
+            "fleet",
             "enroll-token",
             "create",
             "--data-dir",
@@ -8056,7 +8224,7 @@ steps:
         drop(store);
 
         let cli = Cli::try_parse_from([
-            "sponzey",
+            "fleet",
             "enroll-token",
             "revoke",
             "et-1",
@@ -8094,27 +8262,29 @@ steps:
     fn renders_controller_service_unit_with_absolute_binary() {
         let unit = render_service_unit(
             ServiceRole::Controller,
-            Path::new("/usr/local/bin/sponzey"),
-            Path::new("/var/lib/sponzey-fleet"),
-            Some("sponzey"),
-            Some("sponzey"),
+            Path::new("/usr/local/bin/fleet"),
+            Path::new("/var/lib/fleet"),
+            Some("fleet"),
+            Some("fleet"),
         )
         .unwrap();
 
         assert!(unit.contains("Description=Sponzey Fleet Controller"));
-        assert!(unit.contains(
-            "ExecStart=/usr/local/bin/sponzey controller start --data-dir /var/lib/sponzey-fleet"
-        ));
-        assert!(unit.contains("User=sponzey"));
-        assert!(unit.contains("Group=sponzey"));
+        assert!(
+            unit.contains(
+                "ExecStart=/usr/local/bin/fleet controller start --data-dir /var/lib/fleet"
+            )
+        );
+        assert!(unit.contains("User=fleet"));
+        assert!(unit.contains("Group=fleet"));
     }
 
     #[test]
     fn renders_agent_service_unit_with_quoted_paths() {
         let unit = render_service_unit(
             ServiceRole::Agent,
-            Path::new("/opt/Sponzey Fleet/bin/sponzey"),
-            Path::new("/var/lib/sponzey fleet"),
+            Path::new("/opt/Fleet/bin/fleet"),
+            Path::new("/var/lib/fleet path"),
             None,
             None,
         )
@@ -8122,7 +8292,7 @@ steps:
 
         assert!(unit.contains("Description=Sponzey Fleet Agent"));
         assert!(unit.contains(
-            "ExecStart=\"/opt/Sponzey Fleet/bin/sponzey\" agent start --data-dir \"/var/lib/sponzey fleet\""
+            "ExecStart=/opt/Fleet/bin/fleet agent start --data-dir \"/var/lib/fleet path\""
         ));
     }
 
@@ -8131,8 +8301,8 @@ steps:
         assert!(matches!(
             render_service_unit(
                 ServiceRole::Agent,
-                Path::new("target/debug/sponzey"),
-                Path::new("/var/lib/sponzey-fleet"),
+                Path::new("target/debug/fleet"),
+                Path::new("/var/lib/fleet"),
                 None,
                 None,
             ),
@@ -8145,8 +8315,8 @@ steps:
         assert!(matches!(
             render_service_unit(
                 ServiceRole::Controller,
-                Path::new("/usr/local/bin/sponzey"),
-                Path::new("/var/lib/sponzey-fleet"),
+                Path::new("/usr/local/bin/fleet"),
+                Path::new("/var/lib/fleet"),
                 Some("bad user"),
                 None,
             ),
@@ -8164,33 +8334,33 @@ steps:
 
     #[test]
     fn agent_start_service_dry_run_renders_systemctl_command() {
-        let cli = Cli::try_parse_from(["sponzey", "agent", "start-service", "--dry-run"]).unwrap();
+        let cli = Cli::try_parse_from(["fleet", "agent", "start-service", "--dry-run"]).unwrap();
 
         assert!(execute(cli).is_ok());
         assert_eq!(
             render_systemctl_command("start", ServiceRole::Agent),
-            "systemctl start sponzey-fleet-agent.service"
+            "systemctl start fleet-agent.service"
         );
     }
 
     #[test]
     fn controller_restart_service_dry_run_renders_systemctl_command() {
         let cli =
-            Cli::try_parse_from(["sponzey", "controller", "restart-service", "--dry-run"]).unwrap();
+            Cli::try_parse_from(["fleet", "controller", "restart-service", "--dry-run"]).unwrap();
 
         assert!(execute(cli).is_ok());
         assert_eq!(
             render_systemctl_command("restart", ServiceRole::Controller),
-            "systemctl restart sponzey-fleet-controller.service"
+            "systemctl restart fleet-controller.service"
         );
     }
 
     #[test]
     fn service_status_and_logs_dry_run_render_commands() {
         let status =
-            Cli::try_parse_from(["sponzey", "controller", "status-service", "--dry-run"]).unwrap();
+            Cli::try_parse_from(["fleet", "controller", "status-service", "--dry-run"]).unwrap();
         let logs = Cli::try_parse_from([
-            "sponzey",
+            "fleet",
             "agent",
             "logs-service",
             "--lines",
@@ -8203,25 +8373,25 @@ steps:
         assert!(execute(logs).is_ok());
         assert_eq!(
             render_service_status_command(ServiceRole::Controller),
-            "systemctl status sponzey-fleet-controller.service --no-pager"
+            "systemctl status fleet-controller.service --no-pager"
         );
         assert_eq!(
             render_service_logs_command(ServiceRole::Agent, 25),
-            "journalctl -u sponzey-fleet-agent.service --no-pager -n 25"
+            "journalctl -u fleet-agent.service --no-pager -n 25"
         );
     }
 
     #[test]
     fn agent_uninstall_service_dry_run_renders_safe_commands() {
         let cli =
-            Cli::try_parse_from(["sponzey", "agent", "uninstall-service", "--dry-run"]).unwrap();
+            Cli::try_parse_from(["fleet", "agent", "uninstall-service", "--dry-run"]).unwrap();
 
         assert!(execute(cli).is_ok());
         assert_eq!(
             render_uninstall_service_commands(ServiceRole::Agent),
             vec![
-                "systemctl disable --now sponzey-fleet-agent.service".to_owned(),
-                "rm /etc/systemd/system/sponzey-fleet-agent.service".to_owned(),
+                "systemctl disable --now fleet-agent.service".to_owned(),
+                "rm /etc/systemd/system/fleet-agent.service".to_owned(),
                 "systemctl daemon-reload".to_owned(),
             ]
         );
@@ -8231,7 +8401,7 @@ steps:
     fn controller_service_unit_path_is_systemd_path() {
         assert_eq!(
             systemd_unit_path(ServiceRole::Controller),
-            PathBuf::from("/etc/systemd/system/sponzey-fleet-controller.service")
+            PathBuf::from("/etc/systemd/system/fleet-controller.service")
         );
     }
 
@@ -8250,7 +8420,7 @@ steps:
     #[test]
     fn parses_upgrade_dry_run_and_rejects_automatic_upgrade() {
         let cli = Cli::try_parse_from([
-            "sponzey",
+            "fleet",
             "upgrade",
             "--channel",
             "beta",
@@ -8271,7 +8441,7 @@ steps:
         assert_eq!(version.as_deref(), Some("0.2.0-beta.1"));
         assert!(dry_run);
 
-        let cli = Cli::try_parse_from(["sponzey", "upgrade"]).expect("valid upgrade command");
+        let cli = Cli::try_parse_from(["fleet", "upgrade"]).expect("valid upgrade command");
         assert!(matches!(execute(cli), Err(CliError::UpgradeRequiresDryRun)));
 
         let lines = upgrade_dry_run_lines(&UpgradeCommand {
@@ -8302,7 +8472,7 @@ steps:
     #[test]
     fn parses_run_command() {
         let cli = Cli::try_parse_from([
-            "sponzey",
+            "fleet",
             "run",
             "--selector",
             "role=web",
@@ -8323,7 +8493,7 @@ steps:
     #[test]
     fn parses_remote_run_command_with_explicit_admin_token() {
         let cli = Cli::try_parse_from([
-            "sponzey",
+            "fleet",
             "run",
             "--controller-url",
             "http://127.0.0.1:7700",
@@ -8360,7 +8530,7 @@ steps:
     #[test]
     fn parses_login_and_remote_operator_commands() {
         let login = Cli::try_parse_from([
-            "sponzey",
+            "fleet",
             "login",
             "--controller-url",
             "https://fleet.example.com",
@@ -8379,7 +8549,7 @@ steps:
         );
 
         let preview =
-            Cli::try_parse_from(["sponzey", "selectors", "preview", "--selector", "role=web"])
+            Cli::try_parse_from(["fleet", "selectors", "preview", "--selector", "role=web"])
                 .expect("valid selector preview command");
         let Command::Selectors(command) = preview.command else {
             panic!("expected selectors command");
@@ -8388,8 +8558,8 @@ steps:
         assert_eq!(selector, "role=web");
         assert_eq!(api.profile_path, PathBuf::from(DEFAULT_CLI_PROFILE_PATH));
 
-        let jobs = Cli::try_parse_from(["sponzey", "jobs", "output", "job-1"])
-            .expect("valid jobs command");
+        let jobs =
+            Cli::try_parse_from(["fleet", "jobs", "output", "job-1"]).expect("valid jobs command");
         assert!(matches!(
             jobs.command,
             Command::Jobs(JobsCommand {
@@ -8398,7 +8568,7 @@ steps:
         ));
 
         let remediations = Cli::try_parse_from([
-            "sponzey",
+            "fleet",
             "remediations",
             "list",
             "--agent-id",
@@ -8417,7 +8587,7 @@ steps:
         ));
 
         let remediation_approve = Cli::try_parse_from([
-            "sponzey",
+            "fleet",
             "remediations",
             "approve",
             "rem-1",
@@ -8437,7 +8607,7 @@ steps:
         ));
 
         let audit = Cli::try_parse_from([
-            "sponzey",
+            "fleet",
             "audit",
             "export",
             "--category",
@@ -8465,7 +8635,7 @@ steps:
     #[test]
     fn parses_agent_certificate_issuance_request_command() {
         let cli = Cli::try_parse_from([
-            "sponzey",
+            "fleet",
             "agents",
             "request-certificate-issuance",
             "agent-1",
@@ -8531,7 +8701,7 @@ steps:
     #[test]
     fn parses_agent_certificate_lifecycle_status_command() {
         let cli = Cli::try_parse_from([
-            "sponzey",
+            "fleet",
             "agents",
             "certificate-status",
             "agent-1",
@@ -8598,7 +8768,7 @@ steps:
     #[test]
     fn parses_controller_signing_rotation_status_command() {
         let cli = Cli::try_parse_from([
-            "sponzey",
+            "fleet",
             "controller",
             "signing-rotation-status",
             "--controller-url",
@@ -8627,7 +8797,7 @@ steps:
     #[test]
     fn parses_controller_signing_rotation_mutation_commands() {
         let request = Cli::try_parse_from([
-            "sponzey",
+            "fleet",
             "controller",
             "signing-rotation",
             "request",
@@ -8668,7 +8838,7 @@ steps:
         assert!(json);
 
         let validate = Cli::try_parse_from([
-            "sponzey",
+            "fleet",
             "controller",
             "signing-rotation",
             "validate",
@@ -8677,9 +8847,9 @@ steps:
             "--admin-token",
             "admin-secret",
             "--candidate-public-key-path",
-            "/var/lib/sponzey-fleet/controller/candidate_public.key",
+            "/var/lib/fleet/controller/candidate_public.key",
             "--candidate-private-key-path",
-            "/var/lib/sponzey-fleet/controller/candidate_private.key",
+            "/var/lib/fleet/controller/candidate_private.key",
         ])
         .expect("valid signing rotation validate command");
         assert!(matches!(
@@ -8693,7 +8863,7 @@ steps:
 
         for action in ["activate", "retire", "fail"] {
             let parsed = Cli::try_parse_from([
-                "sponzey",
+                "fleet",
                 "controller",
                 "signing-rotation",
                 action,
@@ -8714,7 +8884,7 @@ steps:
         }
 
         let rollout = Cli::try_parse_from([
-            "sponzey",
+            "fleet",
             "controller",
             "signing-rotation",
             "rollout-trust-bundle",
@@ -8723,7 +8893,7 @@ steps:
             "--admin-token",
             "admin-secret",
             "--previous-public-key-path",
-            "/var/lib/sponzey-fleet/controller/controller_public.key.bak",
+            "/var/lib/fleet/controller/controller_public.key.bak",
             "--agent-id",
             "agent-1",
             "--json",
@@ -8739,7 +8909,7 @@ steps:
         ));
 
         let retry = Cli::try_parse_from([
-            "sponzey",
+            "fleet",
             "controller",
             "signing-rotation",
             "retry-trust-bundle",
@@ -8748,7 +8918,7 @@ steps:
             "--admin-token",
             "admin-secret",
             "--previous-public-key-path",
-            "/var/lib/sponzey-fleet/controller/controller_public.key.bak",
+            "/var/lib/fleet/controller/controller_public.key.bak",
             "--agent-id",
             "agent-1",
             "--max-agent-count",
@@ -8766,7 +8936,7 @@ steps:
         ));
 
         let staged = Cli::try_parse_from([
-            "sponzey",
+            "fleet",
             "controller",
             "signing-rotation",
             "staged-trust-bundle",
@@ -8775,7 +8945,7 @@ steps:
             "--admin-token",
             "admin-secret",
             "--previous-public-key-path",
-            "/var/lib/sponzey-fleet/controller/controller_public.key.bak",
+            "/var/lib/fleet/controller/controller_public.key.bak",
             "--agent-id",
             "agent-1",
             "--batch-size",
@@ -8813,7 +8983,7 @@ steps:
         assert_eq!(
             previous_public_key_path.as_deref(),
             Some(Path::new(
-                "/var/lib/sponzey-fleet/controller/controller_public.key.bak"
+                "/var/lib/fleet/controller/controller_public.key.bak"
             ))
         );
         assert_eq!(agent_ids, ["agent-1"]);
@@ -8823,7 +8993,7 @@ steps:
         assert!(json);
 
         let restart_action = Cli::try_parse_from([
-            "sponzey",
+            "fleet",
             "controller",
             "signing-rotation",
             "restart-action",
@@ -8850,7 +9020,7 @@ steps:
     #[test]
     fn parses_controller_signing_rotation_restart_plan_command() {
         let parsed = Cli::try_parse_from([
-            "sponzey",
+            "fleet",
             "controller",
             "signing-rotation",
             "restart-plan",
@@ -8945,8 +9115,8 @@ steps:
             "selected_signing_fingerprint_prefix": "new-fp-12345678",
             "blocked_reason": "active signer does not match selected signer",
             "verification_commands": [
-                "sponzey controller signing-rotation-status --controller-url <controller-url>",
-                "sponzey controller signing-rotation restart-plan --controller-url <controller-url>"
+                "fleet controller signing-rotation-status --controller-url <controller-url>",
+                "fleet controller signing-rotation restart-plan --controller-url <controller-url>"
             ],
             "safety_notes": [
                 "controller signing reload is not supported by this version",
@@ -8968,9 +9138,7 @@ steps:
         assert!(rendered.contains("restart_required=true"));
         assert!(rendered.contains("reload_supported=false"));
         assert!(rendered.contains("recommended_action=restart_controller_process"));
-        assert!(
-            rendered.contains("verification_command=sponzey controller signing-rotation-status")
-        );
+        assert!(rendered.contains("verification_command=fleet controller signing-rotation-status"));
         for forbidden in [
             "controller_private.key",
             "private-key-secret",
@@ -8998,9 +9166,9 @@ steps:
             "bootstrap_guard": "active_mismatch_selected",
             "active_signing_fingerprint_prefix": "old-fp-12345678",
             "selected_signing_fingerprint_prefix": "new-fp-12345678",
-            "service_command": "sponzey controller restart-service --dry-run",
+            "service_command": "fleet controller restart-service --dry-run",
             "verification_commands": [
-                "sponzey controller signing-rotation restart-plan --controller-url <controller-url>"
+                "fleet controller signing-rotation restart-plan --controller-url <controller-url>"
             ],
             "safety_notes": [
                 "restart is executed outside the HTTP handler"
@@ -9020,7 +9188,7 @@ steps:
         assert!(rendered.contains("controller_id=default-controller"));
         assert!(rendered.contains("action=external_service_manager_restart"));
         assert!(rendered.contains("action_status=audit_recorded_external_restart_required"));
-        assert!(rendered.contains("service_command=sponzey controller restart-service --dry-run"));
+        assert!(rendered.contains("service_command=fleet controller restart-service --dry-run"));
         for forbidden in [
             "controller_private.key",
             "private-key-secret",
@@ -9142,7 +9310,7 @@ steps:
     fn controller_signing_staged_trust_bundle_request_uses_explicit_body() {
         let body = controller_signing_staged_trust_bundle_request_body(
             Some(PathBuf::from(
-                "/var/lib/sponzey-fleet/controller/controller_public.key.bak",
+                "/var/lib/fleet/controller/controller_public.key.bak",
             )),
             vec!["agent-1".to_owned(), "agent-2".to_owned()],
             10,
@@ -9157,7 +9325,7 @@ steps:
         );
         assert_eq!(
             json["previous_public_key_path"],
-            "/var/lib/sponzey-fleet/controller/controller_public.key.bak"
+            "/var/lib/fleet/controller/controller_public.key.bak"
         );
         assert_eq!(json["agent_ids"], serde_json::json!(["agent-1", "agent-2"]));
         assert_eq!(json["batch_size"], 10);
@@ -9170,7 +9338,7 @@ steps:
     #[test]
     fn parses_remediation_cli_commands() {
         let remediations = Cli::try_parse_from([
-            "sponzey",
+            "fleet",
             "remediations",
             "list",
             "--agent-id",
@@ -9198,7 +9366,7 @@ steps:
         assert_eq!(limit, 10);
 
         let remediation_approve = Cli::try_parse_from([
-            "sponzey",
+            "fleet",
             "remediations",
             "approve",
             "rem-1",
@@ -9480,6 +9648,9 @@ steps:
                 "runbook_ref": "runbooks/remediate.yml",
                 "status": "proposed",
                 "job_id": null,
+                "lifecycle_source": "persisted",
+                "verification_assignment_status": "failed",
+                "legacy_state": "legacy_unverified",
                 "runbook_document": "kind: Runbook\n# secret-value-should-not-leak",
                 "command_output": "secret-value-should-not-leak",
                 "rendered_body": "secret-value-should-not-leak"
@@ -9492,6 +9663,9 @@ steps:
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("remediation_id=rem-1"));
         assert!(lines[0].contains("policy_id=nginx-running"));
+        assert!(lines[0].contains("lifecycle_source=persisted"));
+        assert!(lines[0].contains("verification_assignment_status=failed"));
+        assert!(lines[0].contains("legacy_state=legacy_unverified"));
         assert!(!lines.join("\n").contains("kind: Runbook"));
         assert!(!lines.join("\n").contains("runbook_document"));
         assert!(!lines.join("\n").contains("secret-value-should-not-leak"));
@@ -9562,7 +9736,7 @@ steps:
 
     #[test]
     fn run_without_selector_uses_local_context() {
-        let cli = Cli::try_parse_from(["sponzey", "run", "--confirm-risk", "uptime"])
+        let cli = Cli::try_parse_from(["fleet", "run", "--confirm-risk", "uptime"])
             .expect("valid local run command");
 
         let Command::Run(command) = cli.command else {
@@ -9579,7 +9753,7 @@ steps:
 
     #[test]
     fn parses_apply_command() {
-        let cli = Cli::try_parse_from(["sponzey", "apply", "examples/runbooks/nginx-basic.yml"])
+        let cli = Cli::try_parse_from(["fleet", "apply", "examples/runbooks/nginx-basic.yml"])
             .expect("valid command");
 
         let Command::Apply(command) = cli.command else {
@@ -9595,7 +9769,7 @@ steps:
     #[test]
     fn parses_retention_cleanup_command() {
         let cli = Cli::try_parse_from([
-            "sponzey",
+            "fleet",
             "retention",
             "cleanup",
             "--data-dir",
@@ -9630,7 +9804,7 @@ steps:
         fleet_store::SqliteStore::open(controller_db_path(&data_dir)).unwrap();
 
         let cli = Cli::try_parse_from([
-            "sponzey",
+            "fleet",
             "retention",
             "cleanup",
             "--data-dir",
@@ -9807,7 +9981,7 @@ steps:
 
     #[test]
     fn parses_demo_command() {
-        let cli = Cli::try_parse_from(["sponzey", "demo", "--keep-temp", "--port", "17700"])
+        let cli = Cli::try_parse_from(["fleet", "demo", "--keep-temp", "--port", "17700"])
             .expect("valid command");
 
         let Command::Demo(command) = cli.command else {
@@ -10212,7 +10386,7 @@ steps:
 
     #[test]
     fn rejects_invalid_command() {
-        let error = Cli::try_parse_from(["sponzey", "unknown"]).expect_err("invalid command");
+        let error = Cli::try_parse_from(["fleet", "unknown"]).expect_err("invalid command");
         assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
     }
 
@@ -10246,8 +10420,13 @@ steps:
 
         assert_eq!(
             version.trim(),
-            format!("sponzey {}", env!("CARGO_PKG_VERSION"))
+            format!("fleet {}", env!("CARGO_PKG_VERSION"))
         );
+    }
+
+    #[test]
+    fn local_facts_identify_the_fleet_executable() {
+        assert_eq!(collect_local_facts()["runtime"]["executable"], "fleet");
     }
 
     #[test]
@@ -10290,11 +10469,11 @@ steps:
     #[test]
     fn agent_start_parses_log_upload_options() {
         let cli = Cli::try_parse_from([
-            "sponzey",
+            "fleet",
             "agent",
             "start",
             "--data-dir",
-            ".sponzey",
+            ".fleet",
             "--facts-interval-seconds",
             "600",
             "--metrics-interval-seconds",
@@ -10322,7 +10501,7 @@ steps:
     #[test]
     fn agent_init_parses_enrollment() {
         let cli = Cli::try_parse_from([
-            "sponzey",
+            "fleet",
             "agent",
             "init",
             "--url",
@@ -10356,13 +10535,13 @@ steps:
     #[test]
     fn agent_init_parses_tls_ca_cert() {
         let cli = Cli::try_parse_from([
-            "sponzey",
+            "fleet",
             "agent",
             "init",
             "--url",
             "https://fleet.example.com",
             "--tls-ca-cert",
-            "/etc/sponzey/tls/ca.pem",
+            "/etc/fleet/tls/ca.pem",
             "--token",
             "token-1",
             "--name",
@@ -10379,14 +10558,14 @@ steps:
 
         assert_eq!(
             tls_ca_cert.as_deref(),
-            Some(Path::new("/etc/sponzey/tls/ca.pem"))
+            Some(Path::new("/etc/fleet/tls/ca.pem"))
         );
     }
 
     #[test]
     fn agent_enroll_remains_alias_for_init() {
         let cli = Cli::try_parse_from([
-            "sponzey",
+            "fleet",
             "agent",
             "enroll",
             "--url",
@@ -10408,7 +10587,7 @@ steps:
 
     #[test]
     fn high_risk_run_requires_confirmation() {
-        let cli = Cli::try_parse_from(["sponzey", "run", "uptime"]).expect("valid command");
+        let cli = Cli::try_parse_from(["fleet", "run", "uptime"]).expect("valid command");
         assert!(matches!(
             execute(cli),
             Err(CliError::HighRiskConfirmationRequired)
@@ -10573,7 +10752,7 @@ steps:
     #[test]
     fn missing_log_file_is_reported_as_io_error() {
         let cli = Cli::try_parse_from([
-            "sponzey",
+            "fleet",
             "logs",
             "web-01",
             "--file",
@@ -10700,6 +10879,44 @@ steps:
 
         assert!(result.is_ok());
         assert_eq!(upload_flags, vec![false]);
+    }
+
+    #[test]
+    fn agent_session_loop_preserves_runtime_state_across_reconnect() {
+        let mut attempts = 0;
+        let mut runtime_markers = Vec::new();
+        let mut shared_runtime = 0_u8;
+
+        run_agent_session_loop_with_state_for_test(
+            &mut shared_runtime,
+            AgentHeartbeatOptions {
+                once: false,
+                heartbeat_interval: Duration::from_secs(30),
+                facts_interval: Duration::from_secs(300),
+                metrics_interval: Duration::from_secs(30),
+                log_upload: AgentLogUploadOptions {
+                    enabled: false,
+                    interval: Duration::from_secs(30),
+                },
+                max_reconnect_attempts: 1,
+            },
+            |runtime| {
+                *runtime += 1;
+                runtime_markers.push(*runtime);
+                attempts += 1;
+                if attempts == 1 {
+                    Err(CliError::Http("temporary socket failure".to_owned()))
+                } else {
+                    Err(CliError::Http(
+                        "controller signing fingerprint changed".to_owned(),
+                    ))
+                }
+            },
+            |_| {},
+        )
+        .unwrap_err();
+
+        assert_eq!(runtime_markers, [1, 2]);
     }
 
     #[test]
@@ -11051,7 +11268,7 @@ steps:
 
     #[test]
     fn agent_session_outbound_queue_full_is_bounded() {
-        let (sender, _receiver) = mpsc::sync_channel(1);
+        let sender = test_outbound_queue(1);
         let config = test_agent_config();
 
         enqueue_wire_message(
@@ -11067,6 +11284,52 @@ steps:
         assert!(
             matches!(result, Err(CliError::Http(message)) if message.contains("queue is full"))
         );
+    }
+
+    #[test]
+    fn failed_outbound_write_keeps_front_report_for_reconnect() {
+        let queue = test_outbound_queue(1);
+        let config = test_agent_config();
+        enqueue_wire_message(
+            &queue,
+            agent_heartbeat_message(&config, "corr-test").unwrap(),
+        )
+        .unwrap();
+
+        let failed = flush_agent_outbound_queue_with(&queue, |_| {
+            Err(CliError::Http("socket write failed".to_owned()))
+        });
+
+        assert!(failed.is_err());
+        assert!(queue.lock().unwrap().pending_report().is_some());
+
+        let mut replayed_message_ids = Vec::new();
+        flush_agent_outbound_queue_with(&queue, |message| {
+            replayed_message_ids.push(message.message_id.clone());
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(replayed_message_ids.len(), 1);
+        assert!(queue.lock().unwrap().pending_report().is_none());
+    }
+
+    #[test]
+    fn agent_session_read_interrupt_is_idle_not_a_session_failure() {
+        let interrupted =
+            tungstenite::Error::Io(std::io::Error::from(std::io::ErrorKind::Interrupted));
+
+        assert!(agent_session_read_error_is_idle(&interrupted));
+    }
+
+    #[test]
+    fn handshake_read_interrupt_is_retryable_but_timeout_is_not() {
+        let interrupted =
+            tungstenite::Error::Io(std::io::Error::from(std::io::ErrorKind::Interrupted));
+        let timed_out = tungstenite::Error::Io(std::io::Error::from(std::io::ErrorKind::TimedOut));
+
+        assert!(handshake_read_error_is_retryable(&interrupted));
+        assert!(!handshake_read_error_is_retryable(&timed_out));
     }
 
     #[test]
@@ -11089,7 +11352,8 @@ steps:
 
     #[test]
     fn agent_session_busy_task_rejects_new_assignment() {
-        let (sender, receiver) = mpsc::sync_channel(4);
+        let sender = test_outbound_queue(4);
+        let receiver = TestOutboundReceiver(sender.clone());
         let config = test_agent_config();
         let task_state = AgentTaskSessionState {
             busy: Arc::new(AtomicBool::new(true)),
@@ -11164,8 +11428,24 @@ steps:
     }
 
     #[test]
+    fn command_execution_result_preserves_program_start_failure_for_agent_output() {
+        let (output, status, reason) = command_execution_result(Err(
+            fleet_runner::RunnerError::Io("No such file or directory (os error 2)".to_owned()),
+        ));
+
+        assert_eq!(status, fleet_protocol::TaskResultStatus::Failed);
+        assert_eq!(output.exit_code, -1);
+        assert_eq!(
+            output.stderr,
+            "runner io error: No such file or directory (os error 2)"
+        );
+        assert_eq!(reason, output.stderr);
+    }
+
+    #[test]
     fn agent_session_due_telemetry_does_not_precede_inbound_task_handling() {
-        let (sender, receiver) = mpsc::sync_channel(8);
+        let sender = test_outbound_queue(8);
+        let receiver = TestOutboundReceiver(sender.clone());
         let config = test_agent_config();
         let task_state = AgentTaskSessionState {
             busy: Arc::new(AtomicBool::new(true)),
@@ -11224,7 +11504,8 @@ steps:
 
     #[test]
     fn agent_session_task_worker_output_uses_outbound_queue() {
-        let (sender, receiver) = mpsc::sync_channel(4);
+        let sender = test_outbound_queue(4);
+        let receiver = TestOutboundReceiver(sender.clone());
         let config = test_agent_config();
         let envelope = test_task_envelope(&config.agent_id);
 
@@ -11264,6 +11545,54 @@ steps:
         assert!(matches!(
             receiver.try_recv().unwrap().payload,
             fleet_protocol::WirePayload::SecurityEvent { ref action, .. } if action == "task_checked"
+        ));
+    }
+
+    #[test]
+    fn missing_program_task_reports_stderr_then_failed_result_through_outbound_queue() {
+        let sender = test_outbound_queue(4);
+        let receiver = TestOutboundReceiver(sender.clone());
+        let config = test_agent_config();
+        let envelope = test_task_envelope(&config.agent_id);
+        let runtime = AgentTaskRuntimeState::default();
+
+        run_signed_command_task_queue(
+            &sender,
+            &config,
+            "corr-test",
+            &envelope,
+            fleet_protocol::CommandTaskWire {
+                program: "fleet-program-that-does-not-exist".to_owned(),
+                args: Vec::new(),
+                timeout_ms: 1_000,
+                max_output_bytes: 1_024,
+            },
+            &runtime,
+        )
+        .expect("failed program should report a task result");
+
+        assert!(matches!(
+            receiver.try_recv().unwrap().payload,
+            fleet_protocol::WirePayload::TaskStarted { .. }
+        ));
+        let output = receiver.try_recv().expect("stderr output event");
+        assert!(matches!(
+            output.payload,
+            fleet_protocol::WirePayload::OutputChunk {
+                stream: fleet_protocol::OutputStream::Stderr,
+                sequence: 0,
+                ref data,
+                ..
+            } if data.contains("runner io error")
+        ));
+        assert!(matches!(
+            receiver.try_recv().unwrap().payload,
+            fleet_protocol::WirePayload::TaskResult {
+                exit_code: -1,
+                status: Some(fleet_protocol::TaskResultStatus::Failed),
+                ref reason,
+                ..
+            } if reason.contains("runner io error")
         ));
     }
 
@@ -11411,7 +11740,8 @@ steps:
 
     #[test]
     fn agent_controller_signing_trust_bundle_update_emits_ack_without_material() {
-        let (sender, receiver) = mpsc::sync_channel(4);
+        let sender = test_outbound_queue(4);
+        let receiver = TestOutboundReceiver(sender.clone());
         let config = test_agent_config();
         fs::create_dir_all(config.controller_trust_bundle_path.parent().unwrap()).unwrap();
         let task_state = test_task_session_state();
@@ -11474,7 +11804,8 @@ steps:
 
     #[test]
     fn agent_controller_signing_trust_bundle_update_rejection_ack_is_bounded() {
-        let (sender, receiver) = mpsc::sync_channel(4);
+        let sender = test_outbound_queue(4);
+        let receiver = TestOutboundReceiver(sender.clone());
         let config = test_agent_config();
         fs::create_dir_all(config.controller_trust_bundle_path.parent().unwrap()).unwrap();
         let task_state = test_task_session_state();
@@ -11548,7 +11879,8 @@ steps:
 
     #[test]
     fn agent_certificate_lifecycle_update_rejects_until_runtime_support_exists() {
-        let (sender, receiver) = mpsc::sync_channel(4);
+        let sender = test_outbound_queue(4);
+        let receiver = TestOutboundReceiver(sender.clone());
         let config = test_agent_config();
         let task_state = test_task_session_state();
         let message = fleet_protocol::WireMessage::new(
@@ -12110,6 +12442,34 @@ steps:
             payload_hash: "hash-queue".to_owned(),
             signature: Some(fleet_domain::TaskSignature::new("signature-queue").unwrap()),
         }
+    }
+
+    #[test]
+    fn drift_report_payload_echoes_signed_task_envelope_correlation() {
+        let config = test_agent_config();
+        let envelope = test_task_envelope(&config.agent_id);
+
+        let payload = drift_report_payload_for_envelope(
+            &config.agent_id,
+            &envelope,
+            "drifted".to_owned(),
+            "package nginx present".to_owned(),
+            "package nginx missing".to_owned(),
+        );
+
+        assert!(matches!(
+            payload,
+            fleet_protocol::WirePayload::DriftReport {
+                agent_id,
+                job_id: Some(job_id),
+                task_id: Some(task_id),
+                status,
+                ..
+            } if agent_id == config.agent_id
+                && job_id == "job-queue"
+                && task_id == "task-queue"
+                && status == "drifted"
+        ));
     }
 
     fn signed_test_task_envelope(

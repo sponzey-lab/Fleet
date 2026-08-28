@@ -12,7 +12,7 @@ raw product logs.
 ## Validation
 
 ```bash
-sponzey apply examples/runbooks/nginx-basic.yml
+fleet apply examples/runbooks/nginx-basic.yml
 ```
 
 Current `apply` behavior remains validation-only:
@@ -236,7 +236,7 @@ The `file.template` primitive uses the same file write path after rendering:
   request state,
 - agent runbook execution passes the selected provider as an explicit resolver
   closure to the runner. The runner does not discover providers itself,
-- `sponzey apply` validates runbook structure and primitive planning only. It
+- `fleet apply` validates runbook structure and primitive planning only. It
   does not resolve `secretRefs`, read provider configuration, or prove that a
   secret-backed template can execute in a running agent context,
 - unsupported Mustache control expressions such as sections, partials, comments,

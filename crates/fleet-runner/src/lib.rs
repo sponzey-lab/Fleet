@@ -2150,6 +2150,7 @@ where
                         return;
                     }
                 }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(error) => {
                     let _ = sender.send(Err(RunnerError::Io(error.to_string())));
                     return;
@@ -3902,6 +3903,46 @@ spec:
                 .iter()
                 .any(|chunk| chunk.stream == CommandOutputStream::Stderr && chunk.data == "err")
         );
+    }
+
+    #[test]
+    fn output_reader_retries_interrupted_read_before_emitting_chunk() {
+        struct InterruptedThenData {
+            state: u8,
+        }
+
+        impl Read for InterruptedThenData {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                match self.state {
+                    0 => {
+                        self.state = 1;
+                        Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
+                    }
+                    1 => {
+                        self.state = 2;
+                        buffer[..2].copy_from_slice(b"ok");
+                        Ok(2)
+                    }
+                    _ => Ok(0),
+                }
+            }
+        }
+
+        let (sender, receiver) = mpsc::channel();
+        let reader = spawn_output_reader(
+            InterruptedThenData { state: 0 },
+            CommandOutputStream::Stdout,
+            sender,
+        );
+
+        let event = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("reader should emit a chunk");
+        reader.join().expect("reader thread should finish");
+
+        let event = event.expect("interrupted read should not be terminal");
+        assert_eq!(event.stream, CommandOutputStream::Stdout);
+        assert_eq!(event.bytes, b"ok");
     }
 
     #[test]

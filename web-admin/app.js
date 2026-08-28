@@ -11,6 +11,32 @@ const state = {
   lastJobId: "",
   createdEnrollmentToken: null,
   metricsWindowMs: 5 * 60 * 1000,
+  auditCursor: "",
+  auditItems: [],
+};
+
+const ADMIN_ROUTES = new Set([
+  "overview",
+  "agents",
+  "run",
+  "runbooks",
+  "policies",
+  "remediations",
+  "audit",
+  "settings",
+]);
+
+const ADMIN_ROUTE_ALIASES = { approvals: "run", jobs: "run" };
+
+const ADMIN_ROUTE_PRESENTATION = {
+  overview: ["Overview", "Live operational state from the Controller — no inferred health."],
+  agents: ["Agents", "Inventory, facts, metrics, and the most recent agent activity."],
+  run: ["Run", "Create signed commands, review pending approvals, and inspect assignment state."],
+  runbooks: ["Runbooks", "Create signed runbook jobs and review pending approvals."],
+  policies: ["Policies & Drift", "Manage policy sources, assignments, and observed drift."],
+  remediations: ["Remediations", "Approve policy-driven fixes through their persisted lifecycle."],
+  audit: ["Audit", "Review durable product and security events."],
+  settings: ["Settings", "Enrollment and Controller signing trust administration."],
 };
 
 const DEFAULT_TELEMETRY_WINDOW_MS = 5 * 60 * 1000;
@@ -26,6 +52,55 @@ const api = createApiClient({
   tokenProvider: () => state.token,
   formatError: formatApiError,
 });
+
+function currentAdminRoute() {
+  const route = globalThis.location?.hash?.slice(1).toLowerCase() || "overview";
+  const canonicalRoute = ADMIN_ROUTE_ALIASES[route] || route;
+  return ADMIN_ROUTES.has(canonicalRoute) ? canonicalRoute : "overview";
+}
+
+/// Applies a hash route without persisting token or view state in browser storage.
+export function applyAdminRoute({ focus = false } = {}) {
+  if (typeof document === "undefined") {
+    return "overview";
+  }
+  const route = currentAdminRoute();
+  document.querySelectorAll("[data-route]").forEach((element) => {
+    element.hidden = !element.dataset.route.split(" ").includes(route);
+  });
+  document.querySelectorAll("[data-route-link]").forEach((link) => {
+    const active = link.dataset.routeLink === route;
+    link.classList.toggle("active", active);
+    if (active) {
+      link.setAttribute("aria-current", "page");
+    } else {
+      link.removeAttribute("aria-current");
+    }
+  });
+  const [title, subtitle] = ADMIN_ROUTE_PRESENTATION[route];
+  const pageTitle = document.querySelector("#page-title");
+  const pageSubtitle = document.querySelector("#page-subtitle");
+  if (pageTitle) pageTitle.textContent = title;
+  if (pageSubtitle) pageSubtitle.textContent = subtitle;
+  if (focus) {
+    document.querySelector(`[data-route-focus="${route}"]`)?.focus({ preventScroll: true });
+  }
+  return route;
+}
+
+function renderOverviewSummary({ agents, jobs, approvals, remediations }) {
+  const summary = [
+    ["Known agents", Array.isArray(agents) ? agents.length : 0],
+    ["Recent jobs", Array.isArray(jobs) ? jobs.length : 0],
+    ["Pending approvals", Array.isArray(approvals) ? approvals.length : 0],
+    ["Remediation requests", Array.isArray(remediations) ? remediations.length : 0],
+  ];
+  return `<div class="overview-grid">${summary
+    .map(
+      ([label, value]) => `<div class="overview-card"><small>${escapeHtml(label)}</small><strong>${escapeHtml(value)}</strong></div>`,
+    )
+    .join("")}</div>`;
+}
 
 const METRICS_CHARTS = [
   {
@@ -106,6 +181,9 @@ export function renderAgents(agents, selectedAgentId = "") {
 export function agentDisplayStatus(agent) {
   if (agent?.revoked) {
     return "offline";
+  }
+  if (agent?.connected) {
+    return "online";
   }
   if (agent?.status === "reconnecting") {
     return "stale";
@@ -739,6 +817,15 @@ export function renderRemediations(remediations, selectedRemediationId = "") {
       const selectedClass = remediation.id === selectedRemediationId ? " selected" : "";
       const updated = formatUnixMillis(remediation.updated_at_ms) || "unknown time";
       const job = remediation.job_id ? `job ${remediation.job_id}` : "no job";
+      const verification = remediation.verification_assignment_status
+        ? `verification ${remediation.verification_assignment_status}`
+        : "verification not scheduled";
+      const evidence = remediation.verification_evidence_status
+        ? `evidence ${remediation.verification_evidence_status}`
+        : "no verification evidence";
+      const legacy = remediation.legacy_state || remediation.lifecycle_source !== "persisted"
+        ? remediation.legacy_state || "legacy read model"
+        : "persisted lifecycle";
       return `
         <button class="compact-row${selectedClass}" type="button" data-remediation-id="${escapeHtml(remediation.id)}">
           <span class="status-pill ${escapeHtml(remediation.status || "unknown")}">${escapeHtml(remediation.status || "unknown")}</span>
@@ -747,6 +834,7 @@ export function renderRemediations(remediations, selectedRemediationId = "") {
             <small>${escapeHtml(remediation.agent_id || "agent")} · ${escapeHtml(job)} · ${escapeHtml(updated)}</small>
             <small>${escapeHtml(remediation.runbook_ref || "no runbook ref")}</small>
             <small>${escapeHtml(remediation.risk_summary || "approval required")}</small>
+            <small>${escapeHtml(verification)} · ${escapeHtml(evidence)} · ${escapeHtml(legacy)}</small>
           </span>
         </button>
       `;
@@ -913,7 +1001,7 @@ export function renderCreatedEnrollmentToken(result, controllerUrl = "", agentNa
     result.token,
     "",
     "Agent init command:",
-    `sponzey agent init --url ${url} --token ${result.token} --name ${name}`,
+    `fleet agent init --url ${url} --token ${result.token} --name ${name}`,
   ].join("\n");
 }
 
@@ -1312,6 +1400,18 @@ function setStatus(message, kind = "") {
   element.className = `status ${kind}`.trim();
 }
 
+async function loadAuditPage({ append = false } = {}) {
+  syncAdminTokenFromInput({ requireToken: true });
+  const category = document.querySelector("#audit-category")?.value || "";
+  const page = await api.exportAudit({ category, limit: 50, before: append ? state.auditCursor : "" });
+  const items = Array.isArray(page?.items) ? page.items : [];
+  state.auditItems = append ? [...state.auditItems, ...items] : items;
+  state.auditCursor = String(page?.next_cursor || "");
+  document.querySelector("#audit-list").innerHTML = renderAudit(state.auditItems);
+  const more = document.querySelector("#load-more-audit");
+  if (more) more.disabled = !state.auditCursor;
+}
+
 function readAdminTokenInput() {
   return normalizeAdminToken(document.querySelector("#admin-token")?.value || "");
 }
@@ -1462,9 +1562,8 @@ async function refreshAll() {
   }
   setStatus("Loading controller data...");
   await loadAgents();
-  const [jobs, audit, enrollmentTokens, approvals, policies, remediations, signingStatus] = await Promise.all([
+  const [jobs, enrollmentTokens, approvals, policies, remediations, signingStatus] = await Promise.all([
     api.listJobs(),
-    api.listAudit(),
     api.listEnrollmentTokens(),
     api.listApprovals("pending"),
     api.listPolicies(),
@@ -1496,9 +1595,19 @@ async function refreshAll() {
       revokeEnrollmentToken(button.dataset.revokeTokenId).catch((error) => setStatus(error.message, "error"));
     });
   });
-  document.querySelector("#audit-list").innerHTML = renderAudit(audit);
+  await loadAuditPage();
   document.querySelector("#signing-rotation-status").innerHTML =
     renderControllerSigningRotationStatus(signingStatus);
+  const overview = document.querySelector("#overview-summary");
+  if (overview) {
+    overview.classList.remove("empty");
+    overview.innerHTML = renderOverviewSummary({
+      agents: state.agents,
+      jobs,
+      approvals,
+      remediations: state.remediations,
+    });
+  }
   setStatus("Loaded latest controller data.", "ok");
 }
 
@@ -1528,10 +1637,9 @@ function wireApprovalButtons() {
 }
 
 async function loadApprovalsJobsAndAudit() {
-  const [approvals, jobs, audit, remediations] = await Promise.all([
+  const [approvals, jobs, remediations] = await Promise.all([
     api.listApprovals("pending"),
     api.listJobs(),
-    api.listAudit(),
     api.listRemediations({ limit: DETAIL_PAGE_LIMIT }),
   ]);
   document.querySelector("#approvals-list").innerHTML = renderApprovals(approvals, jobs);
@@ -1539,7 +1647,7 @@ async function loadApprovalsJobsAndAudit() {
   document.querySelector("#jobs-list").innerHTML = renderJobs(jobs);
   state.remediations = Array.isArray(remediations) ? remediations : [];
   renderRemediationList();
-  document.querySelector("#audit-list").innerHTML = renderAudit(audit);
+  await loadAuditPage();
 }
 
 function renderRemediationList() {
@@ -1667,51 +1775,6 @@ async function approveRemediationJob() {
   document.querySelector("#remediation-result").textContent = renderRemediationActionResult(response);
   setStatus(`Created remediation job ${state.lastJobId}.`, "ok");
   await loadApprovalsJobsAndAudit();
-}
-
-async function markRemediationRunning() {
-  syncAdminTokenFromInput({ requireToken: true });
-  const form = readRemediationForm();
-  requireRemediationId(form);
-  requireRemediationJobId(form);
-  const response = await api.markRemediationRunning(form.remediationId, { job_id: form.jobId });
-  document.querySelector("#remediation-result").textContent = renderRemediationActionResult(response);
-  setStatus(`Marked remediation ${form.remediationId} running.`, "ok");
-  await loadRemediations();
-}
-
-async function recordRemediationResult(status) {
-  syncAdminTokenFromInput({ requireToken: true });
-  const form = readRemediationForm();
-  requireRemediationId(form);
-  requireRemediationJobId(form);
-  const response = await api.recordRemediationResult(form.remediationId, {
-    job_id: form.jobId,
-    status,
-  });
-  document.querySelector("#remediation-result").textContent = renderRemediationActionResult(response);
-  setStatus(`Recorded remediation ${status}.`, "ok");
-  await loadRemediations();
-}
-
-async function verifyRemediation() {
-  syncAdminTokenFromInput({ requireToken: true });
-  const form = readRemediationForm();
-  requireRemediationId(form);
-  requireRemediationJobId(form);
-  const remediation = selectedRemediation();
-  if (!remediation) {
-    throw new Error("Select a remediation row before verification.");
-  }
-  const response = await api.verifyRemediation(form.remediationId, {
-    agent_id: remediation.agent_id,
-    policy_id: remediation.policy_id,
-    policy_name: remediation.policy_name,
-    job_id: form.jobId,
-  });
-  document.querySelector("#remediation-result").textContent = renderRemediationActionResult(response);
-  setStatus(`Verified remediation ${form.remediationId}.`, "ok");
-  await Promise.all([loadRemediations(), refreshSelectedAgent().catch(() => null)]);
 }
 
 async function decideApproval(id, action) {
@@ -1859,7 +1922,7 @@ async function revokeSelectedAgentKey() {
   document.querySelector("#agents-list").innerHTML = renderAgents(state.agents, state.selectedAgentId);
   syncAgentActions();
   await refreshSelectedAgent();
-  document.querySelector("#audit-list").innerHTML = renderAudit(await api.listAudit());
+  await loadAuditPage();
   setStatus(`Revoked agent ${label}.`, "ok");
 }
 
@@ -1883,9 +1946,7 @@ async function submitStagedTrustBundle(form) {
     `Ran staged signing tick: ${response?.rollout_state || "unknown"} (${response?.attempted_count ?? 0} attempted).`,
     "ok",
   );
-  await Promise.all([loadSigningRotationStatus(), api.listAudit().then((audit) => {
-    document.querySelector("#audit-list").innerHTML = renderAudit(audit);
-  })]);
+  await Promise.all([loadSigningRotationStatus(), loadAuditPage()]);
 }
 
 async function previewTargets(selector, targetSelector) {
@@ -2098,6 +2159,8 @@ async function handleJobArtifactClick(event) {
 }
 
 function boot() {
+  applyAdminRoute();
+  globalThis.addEventListener?.("hashchange", () => applyAdminRoute({ focus: true }));
   const form = document.querySelector("#admin-auth");
   if (!form) {
     return;
@@ -2195,6 +2258,12 @@ function boot() {
   document.querySelector("#expire-approvals")?.addEventListener("click", () => {
     expireDueApprovals().catch((error) => setStatus(error.message, "error"));
   });
+  document.querySelector("#refresh-audit")?.addEventListener("click", () => {
+    loadAuditPage().catch((error) => setStatus(error.message, "error"));
+  });
+  document.querySelector("#load-more-audit")?.addEventListener("click", () => {
+    loadAuditPage({ append: true }).catch((error) => setStatus(error.message, "error"));
+  });
   document.querySelector("#remediations-list")?.addEventListener("click", (event) => {
     const button = event.target?.closest?.("[data-remediation-id]");
     if (!button?.dataset?.remediationId) {
@@ -2214,18 +2283,6 @@ function boot() {
   });
   document.querySelector("#approve-remediation")?.addEventListener("click", () => {
     approveRemediationJob().catch((error) => setStatus(error.message, "error"));
-  });
-  document.querySelector("#mark-remediation-running")?.addEventListener("click", () => {
-    markRemediationRunning().catch((error) => setStatus(error.message, "error"));
-  });
-  document.querySelector("#record-remediation-success")?.addEventListener("click", () => {
-    recordRemediationResult("succeeded").catch((error) => setStatus(error.message, "error"));
-  });
-  document.querySelector("#record-remediation-failed")?.addEventListener("click", () => {
-    recordRemediationResult("failed").catch((error) => setStatus(error.message, "error"));
-  });
-  document.querySelector("#verify-remediation")?.addEventListener("click", () => {
-    verifyRemediation().catch((error) => setStatus(error.message, "error"));
   });
   document.querySelector("#assign-policy")?.addEventListener("click", () => {
     assignSelectedPolicy().catch((error) => setStatus(error.message, "error"));

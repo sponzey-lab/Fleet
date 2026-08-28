@@ -21,9 +21,9 @@ if ! command -v curl >/dev/null 2>&1; then
   exit 1
 fi
 
-BIN="${SPONZEY_BIN:-./target/debug/sponzey}"
-DATA_DIR="${SPONZEY_DATA_DIR:-/var/lib/sponzey-fleet}"
-CONTROLLER_URL="${SPONZEY_CONTROLLER_URL:-http://127.0.0.1:7700}"
+BIN="${FLEET_BIN:-./target/debug/fleet}"
+DATA_DIR="${FLEET_DATA_DIR:-/var/lib/fleet}"
+CONTROLLER_URL="${FLEET_CONTROLLER_URL:-http://127.0.0.1:7700}"
 MODE="${1:-install}"
 
 case "$MODE" in
@@ -53,18 +53,18 @@ case "$MODE" in
       --name local-agent \
       --labels role=local,env=manual
     "$BIN" agent start-service
-    systemctl is-enabled sponzey-fleet-controller.service >/dev/null
-    systemctl is-enabled sponzey-fleet-agent.service >/dev/null
-    systemctl is-active sponzey-fleet-controller.service >/dev/null
-    systemctl is-active sponzey-fleet-agent.service >/dev/null
+    systemctl is-enabled fleet-controller.service >/dev/null
+    systemctl is-enabled fleet-agent.service >/dev/null
+    systemctl is-active fleet-controller.service >/dev/null
+    systemctl is-active fleet-agent.service >/dev/null
     echo "services installed and active. Reboot this host, then run:"
     echo "  sudo $0 verify"
     ;;
   verify)
-    systemctl is-enabled sponzey-fleet-controller.service >/dev/null
-    systemctl is-enabled sponzey-fleet-agent.service >/dev/null
-    systemctl is-active sponzey-fleet-controller.service >/dev/null
-    systemctl is-active sponzey-fleet-agent.service >/dev/null
+    systemctl is-enabled fleet-controller.service >/dev/null
+    systemctl is-enabled fleet-agent.service >/dev/null
+    systemctl is-active fleet-controller.service >/dev/null
+    systemctl is-active fleet-agent.service >/dev/null
     echo "manual systemd reboot smoke ok"
     ;;
   *)

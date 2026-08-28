@@ -6,12 +6,13 @@ license.workspace = true
 repository.workspace = true
 
 [[bin]]
-name = "sponzey"
+name = "fleet"
 path = "src/main.rs"
 
 [dependencies]
 clap = { workspace = true }
 fleet-application = { path = "../fleet-application" }
+fleet-agent = { path = "../fleet-agent" }
 fleet-controller = { path = "../fleet-controller" }
 fleet-core = { path = "../fleet-core" }
 fleet-domain = { path = "../fleet-domain" }

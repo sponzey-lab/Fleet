@@ -29,7 +29,7 @@ if ! command -v apt-get >/dev/null 2>&1 \
   exit 1
 fi
 
-BIN="${SPONZEY_BIN:-./target/debug/sponzey}"
+BIN="${SPONZEY_BIN:-./target/debug/fleet}"
 PORT="${SPONZEY_PORT:-7700}"
 WORK_DIR="${TMPDIR:-/tmp}/sponzey-fleet-nginx-runbook-smoke-$$"
 

@@ -11,7 +11,7 @@ Use this template for beta releases after MVP.
 ## Upgrade Notes
 
 - Re-enroll agents when the controller signing fingerprint changes.
-- Existing loopback demo data directories can be kept, but production agents should use a persistent data directory such as `/var/lib/sponzey-fleet`.
+- Existing loopback demo data directories can be kept, but production agents should use a persistent data directory such as `/var/lib/fleet`.
 - Linux binaries are built on Ubuntu 22.04 and must not require a glibc version newer than `GLIBC_2.35`.
 
 ## Known Limitations

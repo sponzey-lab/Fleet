@@ -33,6 +33,53 @@ const tsconfig = JSON.parse(readFileSync(tsconfigPath, "utf8"));
 const openapi = JSON.parse(readFileSync(openapiPath, "utf8"));
 
 assert(index.includes("Sponzey Fleet Admin"), "index must name the admin UI");
+assert(index.includes('class="admin-shell"'), "index must provide the admin application shell");
+assert(index.includes('class="admin-sidebar"'), "index must provide a left-side navigation region");
+assert(index.indexOf('class="admin-sidebar"') < index.indexOf('<main>'), "sidebar must precede the work area");
+assert(index.includes('id="page-title"'), "index must expose the current route title");
+assert(index.includes('id="page-subtitle"'), "index must expose the current route description");
+for (const fieldId of [
+  "token-labels",
+  "token-max-uses",
+  "token-expiry",
+  "token-controller-url",
+  "token-agent-name",
+  "staged-previous-public-key-path",
+  "staged-agent-ids",
+  "staged-batch-size",
+  "staged-max-failures",
+  "staged-ack-timeout-seconds",
+  "remediation-id",
+  "remediation-approval-id",
+  "remediation-job-id",
+  "remediation-runbook-document",
+  "runbook-document",
+  "runbook-selector",
+  "policy-source",
+  "policy-schedule-interval",
+]) {
+  const fieldPattern = new RegExp(`<div class="form-field[^"\\n]*">\\s*<label[^>]*for="${fieldId}"[\\s\\S]*?id="${fieldId}"`);
+  assert(fieldPattern.test(index), `${fieldId} must keep its label and control in one form field`);
+}
+for (const route of ["overview", "agents", "run", "runbooks", "policies", "remediations", "audit", "settings"]) {
+  assert(index.includes(`data-route-link="${route}"`), `index must expose ${route} navigation`);
+  assert(index.includes(`data-route="${route}"`), `index must expose ${route} route content`);
+  assert(index.includes(`data-route-focus="${route}"`), `index must expose ${route} focus landmark`);
+}
+assert(!index.includes('data-route-link="jobs"'), "jobs must not remain a separate menu item");
+assert(!index.includes('data-route-link="approvals"'), "approvals must not remain a separate menu item");
+assert(index.includes('data-route-link="run"'), "index must expose the run workspace");
+assert(index.includes('data-route-link="runbooks"'), "index must expose the runbooks workspace");
+assert(index.includes('class="panel approval-panel" data-route="run runbooks"'), "approval queue must be shared by run and runbooks workspaces");
+assert(app.includes("applyAdminRoute"), "app must apply the selected admin route");
+assert(app.includes("ADMIN_ROUTE_PRESENTATION"), "app must define a presentation contract for each route");
+assert(app.includes('approvals: "run"'), "legacy approvals hash must resolve to the run workspace");
+assert(app.includes('jobs: "run"'), "legacy jobs hash must resolve to the run workspace");
+assert(app.includes('dataset.route.split(" ").includes(route)'), "a shared panel must be visible from both run workspaces");
+assert(app.includes("hashchange"), "app must respond to browser history route changes");
+assert(app.includes("focus: true"), "hash navigation must request route focus restoration");
+assert(app.includes("preventScroll: true"), "route focus must preserve scroll position");
+assert(!app.includes("localStorage"), "route state must not persist credentials in browser storage");
 assert(index.includes("id=\"agents-list\""), "index must expose the agents surface");
 assert(index.includes("id=\"agent-detail\""), "index must expose selected agent detail");
 assert(index.includes("id=\"revoke-agent-key\""), "index must expose agent key revocation");
@@ -53,6 +100,8 @@ assert(index.includes("id=\"metrics-panel\""), "index must expose the metrics su
 assert(index.includes("id=\"drift-panel\""), "index must expose the drift surface");
 assert(index.includes("id=\"drift-history\""), "index must expose drift history");
 assert(index.includes("id=\"audit-list\""), "index must expose the audit surface");
+assert(index.includes("id=\"audit-category\""), "index must expose audit category filtering");
+assert(index.includes("id=\"load-more-audit\""), "index must expose audit cursor paging");
 assert(index.includes("id=\"run-command-form\""), "index must expose command execution");
 assert(index.includes('value="uptime"'), "run command form must default to a safe probe command");
 assert(index.includes("id=\"command-selector\""), "run command form must expose selector input");
@@ -68,6 +117,17 @@ assert(index.includes("id=\"remediations-list\""), "index must expose remediatio
 assert(index.includes("id=\"remediation-form\""), "index must expose remediation action form");
 assert(index.includes("id=\"remediation-runbook-document\""), "remediation approve form must expose request-only runbook input");
 assert(index.includes("id=\"remediation-result\""), "index must expose remediation action result");
+for (const deprecatedControl of [
+  "mark-remediation-running",
+  "record-remediation-success",
+  "record-remediation-failed",
+  "verify-remediation",
+]) {
+  assert(!index.includes(`id=\"${deprecatedControl}\"`), `UI must not expose deprecated ${deprecatedControl}`);
+}
+assert(!app.includes("async function markRemediationRunning"), "UI must not call deprecated running route");
+assert(!app.includes("async function recordRemediationResult"), "UI must not call deprecated result route");
+assert(!app.includes("async function verifyRemediation"), "UI must not call deprecated verify route");
 assert(index.includes("id=\"runbook-form\""), "index must expose runbook job form");
 assert(index.includes("id=\"runbook-selector\""), "runbook form must expose selector input");
 assert(index.includes("id=\"preview-runbook-targets\""), "runbook form must expose target preview action");
@@ -86,6 +146,10 @@ assert(index.includes('method="post"'), "admin auth form must not leak tokens th
 assert(!index.includes("localStorage"), "UI must not store tokens in localStorage");
 assert(!index.includes("runtime config"), "UI must not expose runtime config mutation");
 assert(styles.includes(".layout"), "styles must include the admin layout");
+assert(styles.includes(".admin-nav {"), "styles must provide a desktop admin navigation surface");
+assert(styles.includes(".admin-nav a.active"), "styles must visibly distinguish the current admin section");
+assert(styles.includes("--surface-raised"), "styles must define reusable elevated surface tokens");
+assert(!styles.includes(".audit-row {\n.approval-row"), "styles must not contain an unclosed audit row rule");
 assert(styles.includes(".warning-banner"), "styles must include HTTP warning banner");
 assert(styles.includes(".snapshot-time"), "styles must include snapshot time metadata");
 assert(styles.includes(".data-table"), "styles must include tabular assignment/inventory views");
@@ -107,6 +171,17 @@ assert(
 );
 assert(tsconfig.compilerOptions.checkJs, "tsconfig must enable JS type checking");
 assert(schema.schema_version === "mvp-1", "API schema version must match MVP client");
+for (const name of ["markRemediationRunning", "recordRemediationResult", "verifyRemediation"]) {
+  assert(schema.endpoints.find((entry) => entry.name === name)?.deprecated === true, `${name} must be marked deprecated`);
+}
+const remediationResponseSchema = openapi.components?.schemas?.RemediationRequestResponse;
+assert(remediationResponseSchema?.properties?.lifecycle_source, "OpenAPI must expose persisted lifecycle source");
+for (const path of ["/api/remediations/{remediation_id}/running", "/api/remediations/{remediation_id}/result", "/api/remediations/{remediation_id}/verify"]) {
+  const operation = openapi.paths?.[path]?.post;
+  assert(operation?.deprecated === true, `${path} must be deprecated in OpenAPI`);
+  assert(operation?.responses?.["409"], `${path} must document its conflict response`);
+  assert(!operation?.responses?.["200"], `${path} must not document a successful lifecycle mutation`);
+}
 for (const endpoint of [
   "listAgents",
   "getLatestFacts",
@@ -143,6 +218,7 @@ for (const endpoint of [
   "getJobArtifact",
   "cancelJob",
   "listAudit",
+  "exportAudit",
   "listEnrollmentTokens",
   "createEnrollmentToken",
   "revokeEnrollmentToken",
@@ -226,6 +302,14 @@ assert(
   normalizeAdminToken("Bearer admin-token") === "admin-token",
   "client must accept pasted bearer tokens",
 );
+assert(
+  agentDisplayStatus({ connected: true, status: "offline" }) === "online",
+  "an active runtime session must render online even before the stored status catches up",
+);
+assert(
+  agentDisplayStatus({ connected: true, revoked: true, status: "online" }) === "offline",
+  "a revoked agent must remain offline even when a stale session response says connected",
+);
 
 const calls = [];
 const client = createApiClient({
@@ -256,7 +340,7 @@ await client.listDueScheduledDrift();
 await client.revokeAgentKey("agent/1");
 await client.getControllerSigningRotationStatus();
 await client.stageControllerSigningTrustBundle({
-  previous_public_key_path: "/var/lib/sponzey-fleet/controller/controller_public.key.bak",
+  previous_public_key_path: "/var/lib/fleet/controller/controller_public.key.bak",
   agent_ids: ["agent-1"],
   batch_size: 1,
   max_failures: 1,
@@ -285,6 +369,7 @@ await client.getJobOutput("job/1");
 await client.getJobArtifact("job/1", "artifact/1");
 await client.cancelJob("job/1", { reason: "operator requested cancel" });
 await client.listAudit();
+await client.exportAudit({ category: "security", limit: 25, before: "3:1" });
 await client.listEnrollmentTokens();
 await client.createEnrollmentToken({ labels: "role=web", max_uses: 1, expires_in_seconds: 60 });
 await client.revokeEnrollmentToken("et/1");
@@ -363,6 +448,10 @@ assert(
   "client must serialize staged signing rollout body",
 );
 assert(findCall("/api/jobs"), "client must call jobs list endpoint");
+assert(
+  findCall("/api/audit/export?category=security&limit=25&before=3%3A1"),
+  "client must call paged audit export with an opaque cursor",
+);
 assert(findCall("/api/approvals?status=pending"), "client must call filtered approvals endpoint");
 assert(
   findCall("/api/approvals/approval%2F1/approve", "POST"),
@@ -727,7 +816,7 @@ const signingStatusHtml = renderControllerSigningRotationStatus({
   failed_at_ms: null,
   bootstrap_guard: "active_matches_selected",
   agent_trust_rollout: "agents_migrating",
-  previous_public_key_path: "/var/lib/sponzey-fleet/controller/controller_public.key.bak",
+  previous_public_key_path: "/var/lib/fleet/controller/controller_public.key.bak",
   controller_public_key: "-----BEGIN PUBLIC KEY-----secret-marker",
   admin_token: "admin-token-secret",
 });
@@ -738,7 +827,7 @@ assert(!signingStatusHtml.includes("BEGIN PUBLIC KEY"), "signing status must not
 assert(!signingStatusHtml.includes("controller_public.key.bak"), "signing status must not render local key paths");
 assert(!signingStatusHtml.includes("admin-token-secret"), "signing status must not render admin tokens");
 const stagedRequest = buildStagedTrustBundleRequest({
-  previousPublicKeyPath: " /var/lib/sponzey-fleet/controller/controller_public.key.bak ",
+  previousPublicKeyPath: " /var/lib/fleet/controller/controller_public.key.bak ",
   agentIds: "agent-1, agent-2\nagent-3",
   batchSize: "2",
   maxFailures: "1",
@@ -773,7 +862,7 @@ const stagedResultHtml = renderStagedTrustBundleResult({
   current_fingerprint_prefix: "new-fp-12345678",
   previous_fingerprint_prefix: "old-fp-12345678",
   agent_results: [{ agent_id: "agent-2", status: "sent" }],
-  previous_public_key_path: "/var/lib/sponzey-fleet/controller/controller_public.key.bak",
+  previous_public_key_path: "/var/lib/fleet/controller/controller_public.key.bak",
   controller_public_key: "-----BEGIN PUBLIC KEY-----secret-marker",
   admin_token: "admin-token-secret",
 });
@@ -911,6 +1000,10 @@ const remediationHtml = renderRemediations([
     status: "proposed",
     risk_summary: "drifted policy requires approved remediation",
     job_id: null,
+    lifecycle_source: "persisted",
+    legacy_state: "legacy_unverified",
+    verification_assignment_status: "failed",
+    verification_evidence_status: "unknown",
     updated_at_ms: 2000,
     runbook_document: "kind: Runbook\n# secret-value-should-not-leak",
     command_output: "secret-value-should-not-leak",
@@ -919,6 +1012,8 @@ const remediationHtml = renderRemediations([
 assert(remediationHtml.includes("rem-1") || remediationHtml.includes("nginx-running"), "remediation list must render metadata");
 assert(remediationHtml.includes("selected"), "remediation list must mark selected row");
 assert(remediationHtml.includes("runbooks/remediate.yml"), "remediation list must render runbook ref");
+assert(remediationHtml.includes("legacy_unverified"), "remediation list must distinguish legacy unverified rows");
+assert(remediationHtml.includes("verification failed"), "remediation list must distinguish verification failure");
 assert(!remediationHtml.includes("kind: Runbook"), "remediation list must not render raw runbook body");
 assert(!remediationHtml.includes("secret-value-should-not-leak"), "remediation list must not render secret marker");
 const remediationResult = renderRemediationActionResult({
@@ -971,7 +1066,7 @@ const tokenSecretText = renderCreatedEnrollmentToken(
   "prod-web-01",
 );
 assert(tokenSecretText.includes("enroll-secret"), "one-time token renderer must show created token");
-assert(tokenSecretText.includes("sponzey agent init"), "one-time token renderer must include init command");
+assert(tokenSecretText.includes("fleet agent init"), "one-time token renderer must include fleet init command");
 const tokenListHtml = renderEnrollmentTokens([
   {
     id: "et-1",

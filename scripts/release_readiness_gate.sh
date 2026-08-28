@@ -89,10 +89,10 @@ if [ -f dist/release/SHA256SUMS.sig ]; then
 else
   echo "release signature verification skipped: dist/release/SHA256SUMS.sig not found."
 fi
-if [ -f target/release/sponzey ]; then
-  run ./scripts/check_linux_glibc_baseline.sh target/release/sponzey
+if [ -f target/release/fleet ]; then
+  run ./scripts/check_linux_glibc_baseline.sh target/release/fleet
 else
-  echo "glibc baseline check skipped: target/release/sponzey not built."
+  echo "glibc baseline check skipped: target/release/fleet not built."
 fi
 run ./scripts/hardening_audit.sh
 

@@ -126,11 +126,11 @@ jobs:
         run: |
           set -euo pipefail
           test -f "dist/npm/${{ matrix.package }}/package.json"
-          "dist/npm/${{ matrix.package }}/bin/sponzey" --help >/dev/null
+          "dist/npm/${{ matrix.package }}/bin/fleet" --help >/dev/null
 
       - name: Check Linux glibc baseline
         if: startsWith(matrix.package, 'fleet-linux-')
-        run: ./scripts/check_linux_glibc_baseline.sh "dist/npm/${{ matrix.package }}/bin/sponzey"
+        run: ./scripts/check_linux_glibc_baseline.sh "dist/npm/${{ matrix.package }}/bin/fleet"
 
       - name: Upload platform package
         uses: actions/upload-artifact@v4
@@ -180,14 +180,14 @@ jobs:
             fleet-linux-x64
           do
             platform="${package#fleet-}"
-            binary="dist/npm/$package/bin/sponzey"
+            binary="dist/npm/$package/bin/fleet"
             test -f "$binary"
             chmod +x "$binary"
-            artifact_dir="dist/release/sponzey-$platform"
+            artifact_dir="dist/release/fleet-$platform"
             mkdir -p "$artifact_dir"
-            cp "$binary" "$artifact_dir/sponzey"
-            chmod +x "$artifact_dir/sponzey"
-            tar -C dist/release -czf "dist/release/sponzey-$platform.tar.gz" "sponzey-$platform"
+            cp "$binary" "$artifact_dir/fleet"
+            chmod +x "$artifact_dir/fleet"
+            tar -C dist/release -czf "dist/release/fleet-$platform.tar.gz" "fleet-$platform"
           done
           (cd dist/release && sha256sum *.tar.gz > SHA256SUMS)
 
@@ -219,7 +219,7 @@ jobs:
             fleet-linux-x64
           do
             test -f "dist/npm/$package/package.json"
-            chmod +x "dist/npm/$package/bin/sponzey"
+            chmod +x "dist/npm/$package/bin/fleet"
             version="$(node -p "require('./dist/npm/$package/package.json').version")"
             package_name="@sponzey/$package"
             if [[ "$DRY_RUN" != "true" ]] && npm view "$package_name@$version" version >/dev/null 2>&1; then

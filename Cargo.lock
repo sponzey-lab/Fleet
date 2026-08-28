@@ -568,6 +568,7 @@ name = "fleet-cli"
 version = "0.0.18"
 dependencies = [
  "clap",
+ "fleet-agent",
  "fleet-application",
  "fleet-controller",
  "fleet-core",

@@ -162,8 +162,8 @@ cargo build --release -p fleet-cli
 
 cp "$PLATFORM_SOURCE_DIR/package.json" "$STAGED_PLATFORM_DIR/package.json"
 cp "$PLATFORM_SOURCE_DIR/README.md" "$STAGED_PLATFORM_DIR/README.md"
-cp "$REPO_ROOT/target/release/sponzey" "$STAGED_PLATFORM_DIR/bin/sponzey"
-chmod +x "$STAGED_PLATFORM_DIR/bin/sponzey"
+cp "$REPO_ROOT/target/release/fleet" "$STAGED_PLATFORM_DIR/bin/fleet"
+chmod +x "$STAGED_PLATFORM_DIR/bin/fleet"
 
 echo "publishing staged platform package: @sponzey/$PLATFORM_PACKAGE"
 npm publish "$STAGED_PLATFORM_DIR" $NPM_ARGS

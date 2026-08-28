@@ -11,22 +11,22 @@ while [ -L "$SELF" ]; do
   esac
 done
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$SELF")" && pwd)"
-REPO_BIN="$SCRIPT_DIR/../../../target/debug/sponzey"
+REPO_BIN="$SCRIPT_DIR/../../../target/debug/fleet"
 
-if [ -n "${SPONZEY_FLEET_BIN:-}" ]; then
-  if [ -x "$SPONZEY_FLEET_BIN" ]; then
-    exec "$SPONZEY_FLEET_BIN" "$@"
+if [ -n "${FLEET_BIN:-}" ]; then
+  if [ -x "$FLEET_BIN" ]; then
+    exec "$FLEET_BIN" "$@"
   fi
-  echo "SPONZEY_FLEET_BIN is set but is not executable: $SPONZEY_FLEET_BIN" >&2
+  echo "FLEET_BIN is set but is not executable: $FLEET_BIN" >&2
   exit 127
 fi
 
-if [ -z "${SPONZEY_FLEET_NPM_OS:-}" ] && [ -z "${SPONZEY_FLEET_NPM_ARCH:-}" ] && [ -x "$REPO_BIN" ]; then
+if [ -z "${FLEET_NPM_OS:-}" ] && [ -z "${FLEET_NPM_ARCH:-}" ] && [ -x "$REPO_BIN" ]; then
   exec "$REPO_BIN" "$@"
 fi
 
-OS="${SPONZEY_FLEET_NPM_OS:-$(uname -s | tr '[:upper:]' '[:lower:]')}"
-ARCH="${SPONZEY_FLEET_NPM_ARCH:-$(uname -m)}"
+OS="${FLEET_NPM_OS:-$(uname -s | tr '[:upper:]' '[:lower:]')}"
+ARCH="${FLEET_NPM_ARCH:-$(uname -m)}"
 
 case "$OS" in
   darwin) PLATFORM_OS="darwin" ;;
@@ -41,17 +41,17 @@ case "$ARCH" in
 esac
 
 if [ -n "$PLATFORM_OS" ] && [ -n "$PLATFORM_ARCH" ]; then
-  NESTED_PLATFORM_BIN="$SCRIPT_DIR/../node_modules/@sponzey/fleet-$PLATFORM_OS-$PLATFORM_ARCH/bin/sponzey"
+  NESTED_PLATFORM_BIN="$SCRIPT_DIR/../node_modules/@sponzey/fleet-$PLATFORM_OS-$PLATFORM_ARCH/bin/fleet"
   if [ -x "$NESTED_PLATFORM_BIN" ]; then
     exec "$NESTED_PLATFORM_BIN" "$@"
   fi
 
-  SIBLING_PLATFORM_BIN="$SCRIPT_DIR/../../fleet-$PLATFORM_OS-$PLATFORM_ARCH/bin/sponzey"
+  SIBLING_PLATFORM_BIN="$SCRIPT_DIR/../../fleet-$PLATFORM_OS-$PLATFORM_ARCH/bin/fleet"
   if [ -x "$SIBLING_PLATFORM_BIN" ]; then
     exec "$SIBLING_PLATFORM_BIN" "$@"
   fi
 
-  echo "sponzey Rust binary for $PLATFORM_OS-$PLATFORM_ARCH was not found." >&2
+  echo "fleet Rust binary for $PLATFORM_OS-$PLATFORM_ARCH was not found." >&2
   echo "For repository development, run: cargo build -p fleet-cli" >&2
   exit 127
 fi

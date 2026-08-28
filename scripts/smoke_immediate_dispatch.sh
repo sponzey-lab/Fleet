@@ -3,7 +3,7 @@ set -eu
 
 cargo build -p fleet-cli
 
-BIN="./target/debug/sponzey"
+BIN="./target/debug/fleet"
 SMOKE_TMPDIR="${TMPDIR:-/tmp}"
 WORK_DIR="$(mktemp -d "$SMOKE_TMPDIR/sponzey-fleet-immediate-dispatch.XXXXXX")"
 if [ -n "${SPONZEY_IMMEDIATE_SMOKE_PORT:-}" ]; then

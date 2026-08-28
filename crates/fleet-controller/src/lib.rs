@@ -24,32 +24,39 @@ use fleet_application::{
     AdminTokenRepository, AgentInventoryRepository, AgentLogRepository, AuthenticateAdminToken,
     CommandJobRepository, CreateCommandJob, CreateCommandJobError, CreateCommandJobInput,
     CreateDriftCheckJob, CreateDriftCheckJobError, CreateDriftCheckJobInput, CreateEnrollmentToken,
-    CreateEnrollmentTokenInput, CreateRunbookJob, CreateRunbookJobError, CreateRunbookJobInput,
-    DispatchAssignmentRepository, DispatchPendingAssignments, DispatchPendingAssignmentsInput,
-    DispatchPendingAssignmentsOutput, DriftRepository, EnrollmentTokenRepository,
-    EnrollmentTokenUseCaseError, EnsureAdminToken, ExpireApprovalRequests, ExpireApprovalsInput,
-    ExportAuditEvents, FactsRepository, GetInventoryAgent, GetJobSummary, GetLatestDrift,
-    GetLatestFacts, GetLatestMetrics, JobDispatchGate, JobOutputChunk, JobOutputRepository,
-    JobOutputStream, JobQueryRepository, JobRepository, ListAgentLogChunks, ListApprovalRequests,
-    ListAuditEvents, ListDriftReports, ListDueScheduledDrift, ListEnrollmentTokens,
-    ListFactsSnapshots, ListInventoryAgents, ListJobOutputForJob, ListJobSummaries,
-    ListMetricsSnapshots, MarkRemediationJobRunning, MarkRemediationJobRunningInput,
+    CreateEnrollmentTokenInput, CreateRemediationVerificationJob,
+    CreateRemediationVerificationJobError, CreateRemediationVerificationJobInput, CreateRunbookJob,
+    CreateRunbookJobError, CreateRunbookJobInput, DispatchAssignmentRepository,
+    DispatchPendingAssignments, DispatchPendingAssignmentsInput, DispatchPendingAssignmentsOutput,
+    DriftRepository, EnrollmentTokenRepository, EnrollmentTokenUseCaseError, EnsureAdminToken,
+    ExpireApprovalRequests, ExpireApprovalsInput, ExportAuditEvents, FactsRepository,
+    GetInventoryAgent, GetJobSummary, GetLatestDrift, GetLatestFacts, GetLatestMetrics,
+    JobDispatchGate, JobOutputChunk, JobOutputRepository, JobOutputStream, JobQueryRepository,
+    JobRepository, ListAgentLogChunks, ListApprovalRequests, ListAuditEvents, ListDriftReports,
+    ListDueScheduledDrift, ListEnrollmentTokens, ListFactsSnapshots, ListInventoryAgents,
+    ListJobOutputForJob, ListJobSummaries, ListMetricsSnapshots,
+    ListPendingRemediationVerificationRecovery, MAX_REMEDIATION_VERIFICATION_RECOVERY_BATCH,
     MetricsRepository, PendingAssignmentDispatcher, PendingTaskAssignment,
-    PolicyRepository as AppPolicyRepository, PreviewSelector, RecordRemediationJobResult,
-    RecordRemediationJobResultInput, RemediationApprovalRequestError, RemediationJobResultStatus,
-    RemediationRequestRecord, RemediationRequestRepository, RemediationResultUseCaseError,
-    RequestAgentCertificateIssuance, RequestAgentCertificateIssuanceInput,
-    RequestRemediationApproval, RequestRemediationApprovalInput, RequestSigningKeyRotation,
-    RequestSigningKeyRotationInput, RetireSigningKeyRotation, RetireSigningKeyRotationInput,
-    RevokeAgentKey, RevokeAgentKeyError, RevokeAgentKeyInput, RevokeEnrollmentToken,
-    RevokeEnrollmentTokenInput, RunDueScheduledDrift, RunDueScheduledDriftError,
-    RunDueScheduledDriftInput, RunRetentionCleanup, RunRetentionCleanupError,
-    RunRetentionCleanupInput, RunbookJobRepository, SavePolicy, SavePolicyInput,
-    SchedulePolicyDrift, SchedulePolicyDriftInput, SelectorPreviewInput, SigningKeyRotationRecord,
-    SigningKeyRotationRepository, SigningKeyRotationUseCaseError, SnapshotPageCursor,
-    TaskAssignmentRepository, TaskEnvelopeSigner, UpdateAgentLabels, UpdateAgentLabelsError,
-    UpdateAgentLabelsInput, ValidateSigningKeyRotation, ValidateSigningKeyRotationInput,
-    VerifyRemediationResolution, VerifyRemediationResolutionInput,
+    PersistVerifiedDriftProposal, PersistVerifiedDriftProposalUseCaseInput,
+    PolicyRepository as AppPolicyRepository, PrepareRemediationExecutionTransition,
+    PreviewSelector, RemediationApprovalRequestError, RemediationExecutionPersistenceInput,
+    RemediationExecutionTransition, RemediationJobResultStatus, RemediationRequestRecord,
+    RemediationRequestRepository, RemediationResultUseCaseError,
+    RemediationVerificationJobPersistenceInput, RemediationVerificationJobRepository,
+    RemediationVerificationJobSave, RemediationVerificationRecoveryRepository,
+    RemediationVerificationResolutionRepository, RequestAgentCertificateIssuance,
+    RequestAgentCertificateIssuanceInput, RequestRemediationApproval,
+    RequestRemediationApprovalInput, RequestSigningKeyRotation, RequestSigningKeyRotationInput,
+    ResolveRemediationVerificationEvidence, ResolveRemediationVerificationEvidenceInput,
+    RetireSigningKeyRotation, RetireSigningKeyRotationInput, RevokeAgentKey, RevokeAgentKeyError,
+    RevokeAgentKeyInput, RevokeEnrollmentToken, RevokeEnrollmentTokenInput, RunDueScheduledDrift,
+    RunDueScheduledDriftError, RunDueScheduledDriftInput, RunRetentionCleanup,
+    RunRetentionCleanupError, RunRetentionCleanupInput, RunbookJobRepository, SavePolicy,
+    SavePolicyInput, SchedulePolicyDrift, SchedulePolicyDriftInput, SelectorPreviewInput,
+    SigningKeyRotationRecord, SigningKeyRotationRepository, SigningKeyRotationUseCaseError,
+    SnapshotPageCursor, TaskAssignmentRepository, TaskEnvelopeSigner, UpdateAgentLabels,
+    UpdateAgentLabelsError, UpdateAgentLabelsInput, ValidateSigningKeyRotation,
+    ValidateSigningKeyRotationInput, VerifiedDriftProposalRepository,
     select_controller_signing_fingerprint, select_dispatch_targets,
 };
 use fleet_application::{AssignPolicyToAgent, AssignPolicyToAgentInput, RetentionPolicy};
@@ -66,9 +73,9 @@ use fleet_domain::{
     Agent, AgentCapability, AgentCapabilitySnapshot, AgentFingerprint, AgentId, AgentIdentity,
     AgentLabel, AgentName, AgentPublicKey, AgentRuntimeProfile, AgentStatus, ArtifactChecksum,
     ArtifactId, ArtifactRetentionClass, AssignmentStatus, AuditActor, AuditCategory, AuditEvent,
-    AuditTarget, AuditValue, ControllerPublicKey, DriftAcknowledgement, DriftReport, DriftSeverity,
-    DriftStatus, Job, JobId, JobStatus, PackageManager, PrivilegeLevel, RenderedArtifactMetadata,
-    Selector, ServiceManager, TaskEnvelope, TaskId,
+    AuditTarget, AuditValue, ControllerPublicKey, DriftAcknowledgement, DriftReport,
+    DriftReportProvenance, DriftSeverity, DriftStatus, Job, JobId, JobStatus, PackageManager,
+    PrivilegeLevel, RenderedArtifactMetadata, Selector, ServiceManager, TaskEnvelope, TaskId,
 };
 use fleet_store::{LocalArtifactStore, SqliteStore};
 #[cfg(feature = "postgres")]
@@ -599,6 +606,66 @@ impl ControllerStore {
 
 #[allow(dead_code)]
 impl ControllerStoreRef<'_> {
+    fn find_task_assignment_state_for_job(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<fleet_store::TaskAssignmentStateRecord>, fleet_store::StoreError> {
+        match self {
+            Self::Sqlite(store) => store.find_task_assignment_state_for_job(job_id),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(_) => {
+                self.with_postgres(|store| store.find_task_assignment_state_for_job(job_id))
+            }
+        }
+    }
+
+    fn find_drift_assignment_provenance(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<fleet_store::DriftAssignmentProvenanceRecord>, fleet_store::StoreError> {
+        match self {
+            Self::Sqlite(store) => store.find_drift_assignment_provenance(task_id),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(_) => {
+                self.with_postgres(|store| store.find_drift_assignment_provenance(task_id))
+            }
+        }
+    }
+
+    fn insert_drift_report_with_provenance(
+        &self,
+        agent_id: &str,
+        report: &DriftReport,
+        provenance: &DriftReportProvenance,
+        checked_at: SystemTime,
+    ) -> Result<(), fleet_store::StoreError> {
+        match self {
+            Self::Sqlite(store) => {
+                store.insert_drift_report_with_provenance(agent_id, report, provenance, checked_at)
+            }
+            #[cfg(feature = "postgres")]
+            Self::Postgres(_) => self.with_postgres(|store| {
+                DriftRepository::insert_drift_report_with_provenance(
+                    store, agent_id, report, provenance, checked_at,
+                )
+            }),
+        }
+    }
+
+    fn save_verified_drift_proposal(
+        &self,
+        input: fleet_application::PersistVerifiedDriftProposalInput,
+    ) -> Result<fleet_application::PersistVerifiedDriftProposalOutput, fleet_store::StoreError>
+    {
+        match self {
+            Self::Sqlite(store) => store.save_verified_drift_proposal_record(&input),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(_) => self.with_postgres(|store| {
+                VerifiedDriftProposalRepository::save_verified_drift_proposal(store, input)
+            }),
+        }
+    }
+
     #[cfg(feature = "postgres")]
     fn with_postgres<T>(
         &self,
@@ -1036,8 +1103,10 @@ impl ControllerStoreRef<'_> {
         match self {
             Self::Sqlite(store) => Ok(store.latest_drift_report(agent_id)?.map(|record| {
                 fleet_application::DriftReportRecord {
+                    id: record.id,
                     agent_id: record.agent_id,
                     report: record.report,
+                    provenance: record.provenance,
                     checked_at: record.checked_at,
                 }
             })),
@@ -1057,8 +1126,10 @@ impl ControllerStoreRef<'_> {
                 .list_drift_reports(agent_id, limit, before)?
                 .into_iter()
                 .map(|record| fleet_application::DriftReportPageRecord {
+                    id: record.id,
                     agent_id: record.agent_id,
                     report: record.report,
+                    provenance: record.provenance,
                     checked_at: record.checked_at,
                     cursor: record.cursor,
                 })
@@ -1417,6 +1488,124 @@ impl ControllerStoreRef<'_> {
                     job.clone(),
                     task,
                     assignments,
+                )
+            }),
+        }
+    }
+
+    fn save_drift_check_job_with_assignments_and_provenance_record(
+        &self,
+        job: &Job,
+        task: &fleet_domain::DriftCheckTask,
+        assignments: &[TaskEnvelope],
+        provenance: Option<&fleet_domain::DriftJobProvenance>,
+    ) -> Result<(), fleet_store::StoreError> {
+        match self {
+            Self::Sqlite(store) => store
+                .save_drift_check_job_with_assignments_and_provenance_record(
+                    job,
+                    task,
+                    assignments,
+                    provenance,
+                ),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(_) => self.with_postgres(|store| {
+                fleet_application::DriftCheckJobRepository::save_drift_check_job_with_assignments_and_provenance(
+                    store,
+                    job.clone(),
+                    task,
+                    assignments,
+                    provenance,
+                )
+            }),
+        }
+    }
+
+    fn find_remediation_verification_job_id(
+        &self,
+        remediation_id: &str,
+    ) -> Result<Option<String>, fleet_store::StoreError> {
+        match self {
+            Self::Sqlite(store) => store.find_remediation_verification_job_id(remediation_id),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(_) => self
+                .with_postgres(|store| store.find_remediation_verification_job_id(remediation_id)),
+        }
+    }
+
+    fn find_remediation_request_by_verification_job_id_record(
+        &self,
+        verification_job_id: &str,
+    ) -> Result<Option<RemediationRequestRecord>, fleet_store::StoreError> {
+        match self {
+            Self::Sqlite(store) => {
+                store.find_remediation_request_by_verification_job_id_record(verification_job_id)
+            }
+            #[cfg(feature = "postgres")]
+            Self::Postgres(_) => self.with_postgres(|store| {
+                store.find_remediation_request_by_verification_job_id(verification_job_id)
+            }),
+        }
+    }
+
+    fn find_drift_report_by_correlation(
+        &self,
+        job_id: &str,
+        task_id: &str,
+    ) -> Result<Option<fleet_application::DriftReportRecord>, fleet_store::StoreError> {
+        match self {
+            Self::Sqlite(store) => store.find_drift_report_by_correlation(job_id, task_id),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(_) => {
+                self.with_postgres(|store| store.find_drift_report_by_correlation(job_id, task_id))
+            }
+        }
+    }
+
+    fn save_remediation_verification_job_record(
+        &self,
+        input: &RemediationVerificationJobPersistenceInput,
+    ) -> Result<RemediationVerificationJobSave, fleet_store::StoreError> {
+        match self {
+            Self::Sqlite(store) => store.save_remediation_verification_job_record(input),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(_) => self.with_postgres(|store| {
+                RemediationVerificationJobRepository::save_remediation_verification_job(
+                    store,
+                    input.clone(),
+                )
+            }),
+        }
+    }
+
+    fn resolve_remediation_verification_evidence_record(
+        &self,
+        remediation: &RemediationRequestRecord,
+        origin_drift_report_id: &fleet_domain::DriftReportId,
+        evidence_report_id: &fleet_domain::DriftReportId,
+        verification_job_id: &str,
+        verification_task_id: &str,
+        audit: &AuditEvent,
+    ) -> Result<RemediationRequestRecord, fleet_store::StoreError> {
+        match self {
+            Self::Sqlite(store) => store.resolve_remediation_verification_evidence_record(
+                remediation,
+                origin_drift_report_id,
+                evidence_report_id,
+                verification_job_id,
+                verification_task_id,
+                audit,
+            ),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(_) => self.with_postgres(|store| {
+                RemediationVerificationResolutionRepository::resolve_remediation_verification_evidence(
+                    store,
+                    remediation.clone(),
+                    origin_drift_report_id.clone(),
+                    evidence_report_id.clone(),
+                    verification_job_id,
+                    verification_task_id,
+                    audit.clone(),
                 )
             }),
         }
@@ -1784,6 +1973,40 @@ impl ControllerStoreRef<'_> {
         }
     }
 
+    fn find_remediation_request_by_job_id_record(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<RemediationRequestRecord>, fleet_store::StoreError> {
+        match self {
+            Self::Sqlite(store) => store.find_remediation_request_by_job_id_record(job_id),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(_) => self.with_postgres(|store| {
+                store
+                    .list_remediation_requests(None, None, 500)
+                    .map(|requests| {
+                        requests
+                            .into_iter()
+                            .find(|request| request.job_id.as_deref() == Some(job_id))
+                    })
+            }),
+        }
+    }
+
+    fn persist_remediation_execution_transition(
+        &self,
+        input: RemediationExecutionPersistenceInput,
+    ) -> Result<bool, fleet_store::StoreError> {
+        match self {
+            Self::Sqlite(store) => store.persist_remediation_execution_transition_record(&input),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(_) => self.with_postgres(|store| {
+                fleet_application::RemediationExecutionPersistenceRepository::persist_remediation_execution_transition(
+                    store, input,
+                )
+            }),
+        }
+    }
+
     fn list_remediation_request_records(
         &self,
         agent_id: Option<&str>,
@@ -1797,6 +2020,21 @@ impl ControllerStoreRef<'_> {
             #[cfg(feature = "postgres")]
             Self::Postgres(_) => self
                 .with_postgres(|store| store.list_remediation_requests(agent_id, policy_id, limit)),
+        }
+    }
+
+    fn list_pending_remediation_verification_recovery_records(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<RemediationRequestRecord>, fleet_store::StoreError> {
+        match self {
+            Self::Sqlite(store) => store.list_pending_remediation_verification_recovery_records(limit),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(_) => self.with_postgres(|store| {
+                RemediationVerificationRecoveryRepository::list_pending_remediation_verification_recovery(
+                    store, limit,
+                )
+            }),
         }
     }
 
@@ -2531,6 +2769,14 @@ impl RegisteredAgentSessionGuard {
             connection_id,
         }
     }
+
+    /// Removes this exact registered session once its reader or writer has ended.
+    fn finish(self, close_reason: AgentSessionCloseReason) -> Option<AgentSessionEnded> {
+        self.sessions
+            .lock()
+            .ok()?
+            .unregister(&self.agent_id, &self.connection_id, close_reason)
+    }
 }
 
 impl Drop for RegisteredAgentSessionGuard {
@@ -2970,6 +3216,16 @@ pub struct RemediationRequestResponse {
     pub approval_required: bool,
     pub risk_summary: String,
     pub job_id: Option<String>,
+    /// Identifies whether this response is derived solely from persisted records.
+    pub lifecycle_source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verification_job_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verification_assignment_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verification_evidence_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub legacy_state: Option<String>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
 }
@@ -3644,20 +3900,11 @@ where
     F: Fn() -> bool + Send + Sync + 'static,
 {
     ensure_agent_client_certificate_mtls_supported(trust_settings.agent_client_certificate())?;
-    let bind_addr = format!("{}:{}", config.host, config.port);
-    let listener = tokio::net::TcpListener::bind(&bind_addr)
-        .await
-        .map_err(|error| controller_bind_error(&bind_addr, error))?;
     let tls_acceptor = trust_settings
         .tls_server()
         .map(|settings| build_tls_acceptor(settings.cert_path(), settings.key_path()))
         .transpose()?;
     let insecure_http_target = insecure_http_transport_target(&config);
-    if let Some(target) = &insecure_http_target {
-        audit_insecure_http_transport_enabled(&store, target)?;
-    }
-    announce_controller_started(&config, &identity, insecure_http_target.as_deref());
-
     let state = ControllerAppState {
         store: Arc::new(Mutex::new(store)),
         artifact_store: Arc::new(Mutex::new(artifact_store)),
@@ -3686,6 +3933,30 @@ where
         }),
         sessions: Arc::new(Mutex::new(AgentSessionRegistry::default())),
     };
+    let recovery = recover_pending_remediation_verifications(
+        &state,
+        MAX_REMEDIATION_VERIFICATION_RECOVERY_BATCH,
+    )?;
+    tracing::info!(
+        discovered = recovery.discovered,
+        created = recovery.created,
+        existing = recovery.existing,
+        skipped = recovery.skipped,
+        "remediation_verification_startup_recovery_completed"
+    );
+    let bind_addr = format!("{}:{}", config.host, config.port);
+    let listener = tokio::net::TcpListener::bind(&bind_addr)
+        .await
+        .map_err(|error| controller_bind_error(&bind_addr, error))?;
+    if let Some(target) = &insecure_http_target {
+        let store = lock_store(&state)?;
+        audit_insecure_http_transport_enabled(&*store, target)?;
+    }
+    announce_controller_started(
+        &config,
+        state.identity.as_ref(),
+        insecure_http_target.as_deref(),
+    );
     start_scheduled_drift_worker(state.store.clone(), state.identity.clone());
     start_controller_signing_staged_rollout_worker(
         state.store.clone(),
@@ -3940,7 +4211,7 @@ async fn handle_agent_websocket_axum(
         let store = lock_store(&state)?;
         audit_agent_session_replaced(&store, &replacement)?;
     }
-    let _session_guard = RegisteredAgentSessionGuard::new(
+    let session_guard = RegisteredAgentSessionGuard::new(
         state.sessions.clone(),
         agent_id.clone(),
         connection_id.clone(),
@@ -3995,10 +4266,7 @@ async fn handle_agent_websocket_axum(
         }
     };
 
-    if let Some(ended) = {
-        let mut sessions = lock_sessions(&state)?;
-        sessions.unregister(&agent_id, &connection_id, close_reason)
-    } {
+    if let Some(ended) = session_guard.finish(close_reason) {
         tracing::debug!(
             agent_id = %ended.agent_id,
             connection_id = %ended.connection_id,
@@ -4055,15 +4323,7 @@ async fn read_task_data_until_close_axum(
                 sessions.record_agent_certificate_lifecycle_ack(agent_id, connection_id, ack);
             }
         }
-        let done = {
-            let store = lock_store(state)?;
-            handle_agent_task_data_message_with_artifact_store(
-                &store,
-                agent_id,
-                message,
-                Some(&state.artifact_store),
-            )?
-        };
+        let done = handle_agent_task_data_message_from_state(state, agent_id, message)?;
         if done {
             return Ok(AgentSessionCloseReason::NormalShutdown);
         }
@@ -4071,6 +4331,222 @@ async fn read_task_data_until_close_axum(
             let store = lock_store(state)?;
             let _ = dispatch_pending_assignments(&*store, &state.sessions, None, None, 100)?;
         }
+    }
+}
+
+fn handle_agent_task_data_message_from_state(
+    state: &ControllerAppState,
+    agent_id: &str,
+    message: fleet_protocol::WireMessage,
+) -> Result<bool, ControllerError> {
+    let successful_job_id = successful_task_result_job_id(&message).map(str::to_owned);
+    let done = {
+        let store = lock_store(state)?;
+        handle_agent_task_data_message_with_artifact_store(
+            &*store,
+            agent_id,
+            message,
+            Some(&state.artifact_store),
+        )?
+    };
+    if let Some(execution_job_id) = successful_job_id {
+        schedule_remediation_verification_after_success(state, agent_id, &execution_job_id)?;
+    }
+    Ok(done)
+}
+
+fn successful_task_result_job_id(message: &fleet_protocol::WireMessage) -> Option<&str> {
+    let fleet_protocol::WirePayload::TaskResult {
+        job_id,
+        exit_code,
+        status,
+        ..
+    } = &message.payload
+    else {
+        return None;
+    };
+    match status {
+        Some(fleet_protocol::TaskResultStatus::Succeeded) => Some(job_id),
+        None if *exit_code == 0 => Some(job_id),
+        _ => None,
+    }
+}
+
+fn schedule_remediation_verification_after_success(
+    state: &ControllerAppState,
+    actor: &str,
+    execution_job_id: &str,
+) -> Result<(), ControllerError> {
+    let remediation_id = {
+        let store = lock_store(state)?;
+        store
+            .store_ref()
+            .find_remediation_request_by_job_id_record(execution_job_id)?
+            .map(|record| record.id)
+    };
+    let Some(remediation_id) = remediation_id else {
+        return Ok(());
+    };
+    let output = create_remediation_verification_job(state, actor, remediation_id)
+        .map_err(map_create_remediation_verification_controller_error)?;
+    let store = lock_store(state)?;
+    let _ = dispatch_pending_assignments_for_created_job(&*store, &state.sessions, &output.job_id)?;
+    Ok(())
+}
+
+enum CreateRemediationVerificationControllerError {
+    UseCase(
+        CreateRemediationVerificationJobError<fleet_store::StoreError, fleet_core::IdentityError>,
+    ),
+    Controller(ControllerError),
+}
+
+fn create_remediation_verification_job(
+    state: &ControllerAppState,
+    actor: &str,
+    remediation_id: String,
+) -> Result<
+    fleet_application::CreateRemediationVerificationJobOutput,
+    CreateRemediationVerificationControllerError,
+> {
+    let issued_at = SystemTime::now();
+    let verification_job_id = fleet_core::generate_prefixed_ulid("job").map_err(|error| {
+        CreateRemediationVerificationControllerError::Controller(ControllerError::Json(
+            error.to_string(),
+        ))
+    })?;
+    let nonce_prefix = fleet_core::generate_prefixed_ulid("nonce").map_err(|error| {
+        CreateRemediationVerificationControllerError::Controller(ControllerError::Json(
+            error.to_string(),
+        ))
+    })?;
+    {
+        let store =
+            lock_store(state).map_err(CreateRemediationVerificationControllerError::Controller)?;
+        let mut repo = ControllerJobRepository {
+            store: (&*store).into(),
+        };
+        let mut signer = ControllerTaskSigner {
+            private_key: &state.identity.private_key,
+            signing_fingerprint: &state.identity.fingerprint,
+        };
+        CreateRemediationVerificationJob::execute(
+            &mut repo,
+            &mut signer,
+            CreateRemediationVerificationJobInput {
+                remediation_id,
+                verification_job_id,
+                timeout: Duration::from_secs(30),
+                actor: actor.to_owned(),
+                issued_at,
+                expires_at: issued_at + Duration::from_secs(300),
+                nonce_prefix,
+            },
+        )
+        .map_err(CreateRemediationVerificationControllerError::UseCase)
+    }
+}
+
+fn map_create_remediation_verification_controller_error(
+    error: CreateRemediationVerificationControllerError,
+) -> ControllerError {
+    match error {
+        CreateRemediationVerificationControllerError::UseCase(error) => {
+            map_create_remediation_verification_job_error(error)
+        }
+        CreateRemediationVerificationControllerError::Controller(error) => error,
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RemediationVerificationRecoverySummary {
+    discovered: usize,
+    created: usize,
+    existing: usize,
+    skipped: usize,
+}
+
+/// Reconciles one bounded durable verification backlog before accepting controller traffic.
+fn recover_pending_remediation_verifications(
+    state: &ControllerAppState,
+    limit: usize,
+) -> Result<RemediationVerificationRecoverySummary, ControllerError> {
+    let records = {
+        let store = lock_store(state)?;
+        let repo = ControllerJobRepository {
+            store: (&*store).into(),
+        };
+        ListPendingRemediationVerificationRecovery::execute(&repo, limit)
+            .map_err(ControllerError::Store)?
+    };
+    let mut summary = RemediationVerificationRecoverySummary {
+        discovered: records.len(),
+        ..Default::default()
+    };
+    for record in records {
+        match create_remediation_verification_job(
+            state,
+            "controller_startup_recovery",
+            record.id.clone(),
+        ) {
+            Ok(output) => {
+                if output.created {
+                    summary.created += 1;
+                } else {
+                    summary.existing += 1;
+                }
+                let store = lock_store(state)?;
+                let _ = dispatch_pending_assignments_for_created_job(
+                    &*store,
+                    &state.sessions,
+                    &output.job_id,
+                )?;
+            }
+            Err(CreateRemediationVerificationControllerError::UseCase(error)) => {
+                let Some(reason) = remediation_verification_recovery_skip_reason(&error) else {
+                    return Err(map_create_remediation_verification_job_error(error));
+                };
+                let store = lock_store(state)?;
+                store.store_ref().write_audit_event(AuditEvent {
+                    category: AuditCategory::Policy,
+                    action: "remediation_verification_recovery_skipped".to_owned(),
+                    actor: AuditActor::new("controller_startup_recovery"),
+                    target: AuditTarget::new(record.agent_id),
+                    value: AuditValue::Plain(format!(
+                        "remediation_id={},reason={reason}",
+                        record.id
+                    )),
+                    occurred_at: SystemTime::now(),
+                })?;
+                summary.skipped += 1;
+            }
+            Err(CreateRemediationVerificationControllerError::Controller(error)) => {
+                return Err(error);
+            }
+        }
+    }
+    Ok(summary)
+}
+
+fn remediation_verification_recovery_skip_reason(
+    error: &CreateRemediationVerificationJobError<
+        fleet_store::StoreError,
+        fleet_core::IdentityError,
+    >,
+) -> Option<&'static str> {
+    match error {
+        CreateRemediationVerificationJobError::NotFound("policy") => Some("missing_policy"),
+        CreateRemediationVerificationJobError::InvalidRemediation(_) => {
+            Some("invalid_persisted_remediation")
+        }
+        CreateRemediationVerificationJobError::PolicyVersionMismatch { .. } => {
+            Some("policy_version_mismatch")
+        }
+        CreateRemediationVerificationJobError::Domain(_) => Some("invalid_verification_task"),
+        CreateRemediationVerificationJobError::Agent(_) => Some("invalid_target_agent"),
+        CreateRemediationVerificationJobError::NotFound(_)
+        | CreateRemediationVerificationJobError::Repository(_)
+        | CreateRemediationVerificationJobError::Sign(_) => None,
     }
 }
 
@@ -4993,11 +5469,17 @@ fn handle_agent_task_data_message_with_artifact_store<'a>(
             }
         }
         fleet_protocol::WirePayload::TaskStarted { job_id, task_id } => {
-            let changed = store.update_active_task_assignment_status(
-                &task_id,
-                AssignmentStatus::Started,
-                agent_message_time,
-                None,
+            let changed = persist_task_execution_transition(
+                store,
+                TaskExecutionTransitionInput {
+                    job_id: &job_id,
+                    task_id: &task_id,
+                    assignment_status: "started",
+                    assignment_last_error: None,
+                    transition: Some(RemediationExecutionTransition::Started),
+                    actor: agent_id,
+                    occurred_at: agent_message_time,
+                },
             )?;
             if changed {
                 apply_job_aggregate_after_assignment_update(store, &job_id, agent_message_time)?;
@@ -5066,11 +5548,25 @@ fn handle_agent_task_data_message_with_artifact_store<'a>(
             });
             let (assignment_status, audit_action) = task_result_status_to_domain(result_status);
             let last_error = task_result_last_error(exit_code, &reason);
-            let changed = store.update_active_task_assignment_status(
-                &task_id,
-                assignment_status,
-                agent_message_time,
-                Some(&last_error),
+            let remediation_status = match result_status {
+                fleet_protocol::TaskResultStatus::Succeeded => {
+                    RemediationJobResultStatus::Succeeded
+                }
+                fleet_protocol::TaskResultStatus::Failed => RemediationJobResultStatus::Failed,
+                fleet_protocol::TaskResultStatus::Canceled => RemediationJobResultStatus::Canceled,
+                fleet_protocol::TaskResultStatus::TimedOut => RemediationJobResultStatus::Expired,
+            };
+            let changed = persist_task_execution_transition(
+                store,
+                TaskExecutionTransitionInput {
+                    job_id: &job_id,
+                    task_id: &task_id,
+                    assignment_status: assignment_status.as_str(),
+                    assignment_last_error: Some(last_error.clone()),
+                    transition: Some(RemediationExecutionTransition::Result(remediation_status)),
+                    actor: agent_id,
+                    occurred_at: agent_message_time,
+                },
             )?;
             if changed {
                 store_task_result_artifacts(
@@ -5093,6 +5589,7 @@ fn handle_agent_task_data_message_with_artifact_store<'a>(
                         fleet_core::redact_secret(&reason)
                     )),
                 )?;
+                resolve_remediation_from_verification_evidence(store, &job_id, &task_id)?;
             } else {
                 audit_job(
                     store,
@@ -5245,6 +5742,8 @@ fn handle_agent_task_data_message_with_artifact_store<'a>(
         }
         fleet_protocol::WirePayload::DriftReport {
             agent_id: event_agent_id,
+            job_id,
+            task_id,
             status,
             expected,
             actual,
@@ -5252,30 +5751,211 @@ fn handle_agent_task_data_message_with_artifact_store<'a>(
             if event_agent_id != agent_id {
                 audit_security(store, "websocket_drift_agent_mismatch", agent_id)?;
             } else {
+                let verified_provenance = verified_drift_report_provenance(
+                    &store,
+                    agent_id,
+                    job_id.as_deref(),
+                    task_id.as_deref(),
+                )?;
+                if job_id.is_some() && task_id.is_some() && verified_provenance.is_none() {
+                    audit_security(store, "websocket_drift_provenance_mismatch", agent_id)?;
+                }
                 let report = DriftReport {
-                    policy_name: "agent-reported".to_owned(),
+                    policy_name: verified_provenance
+                        .as_ref()
+                        .and_then(|provenance| provenance.policy_id.clone())
+                        .unwrap_or_else(|| "agent-reported".to_owned()),
                     status: parse_drift_status(&status),
                     severity: DriftSeverity::for_status(parse_drift_status(&status)),
                     acknowledgement: DriftAcknowledgement::Open,
                     expected,
                     actual,
                 };
-                store.insert_drift_report(agent_id, &report, agent_message_time)?;
-                audit_drift(
-                    store,
-                    "drift_report_received",
-                    agent_id,
-                    AuditValue::Plain(format!(
-                        "policy_name={},status={}",
-                        report.policy_name,
-                        drift_status_to_str(&report.status)
-                    )),
-                )?;
+                let persisted_with_proposal = if let Some(provenance) = verified_provenance.as_ref()
+                {
+                    persist_verified_drifted_proposal(
+                        store,
+                        agent_id,
+                        &report,
+                        provenance,
+                        agent_message_time,
+                    )?
+                } else {
+                    false
+                };
+                if !persisted_with_proposal {
+                    if let Some(provenance) = verified_provenance.as_ref() {
+                        store.insert_drift_report_with_provenance(
+                            agent_id,
+                            &report,
+                            provenance,
+                            agent_message_time,
+                        )?;
+                    } else {
+                        store.insert_drift_report(agent_id, &report, agent_message_time)?;
+                    }
+                    audit_drift(
+                        store,
+                        "drift_report_received",
+                        agent_id,
+                        AuditValue::Plain(format!(
+                            "policy_name={},status={}",
+                            report.policy_name,
+                            drift_status_to_str(&report.status)
+                        )),
+                    )?;
+                }
+                if let (Some(job_id), Some(task_id)) = (job_id.as_deref(), task_id.as_deref()) {
+                    resolve_remediation_from_verification_evidence(store, job_id, task_id)?;
+                }
             }
         }
         _ => audit_security(store, "websocket_unexpected_task_data", agent_id)?,
     }
     Ok(false)
+}
+
+fn verified_drift_report_provenance(
+    store: &ControllerStoreRef<'_>,
+    agent_id: &str,
+    job_id: Option<&str>,
+    task_id: Option<&str>,
+) -> Result<Option<DriftReportProvenance>, ControllerError> {
+    let (Some(job_id), Some(task_id)) = (job_id, task_id) else {
+        return Ok(None);
+    };
+    let Some(assignment) = store.find_drift_assignment_provenance(task_id)? else {
+        return Ok(None);
+    };
+    if assignment.job_id != job_id
+        || assignment.task_id != task_id
+        || assignment.agent_id != agent_id
+    {
+        return Ok(None);
+    }
+    let (Ok(job_id), Ok(task_id)) = (JobId::new(job_id), TaskId::new(task_id)) else {
+        return Ok(None);
+    };
+    Ok(Some(DriftReportProvenance::verified(
+        job_id,
+        task_id,
+        assignment.policy_id,
+        assignment.policy_version,
+        assignment.purpose,
+    )))
+}
+
+fn resolve_remediation_from_verification_evidence(
+    store: ControllerStoreRef<'_>,
+    verification_job_id: &str,
+    task_id: &str,
+) -> Result<(), ControllerError> {
+    let Some(remediation) =
+        store.find_remediation_request_by_verification_job_id_record(verification_job_id)?
+    else {
+        return Ok(());
+    };
+    let Some(assignment) = store.find_task_assignment_state_for_job(verification_job_id)? else {
+        return Ok(());
+    };
+    if assignment.status != "succeeded" || assignment.task_id != task_id {
+        return Ok(());
+    }
+    let Some(execution_job_id) = remediation.job_id.as_deref() else {
+        return Ok(());
+    };
+    let Some(execution_assignment) = store.find_task_assignment_state_for_job(execution_job_id)?
+    else {
+        return Ok(());
+    };
+    let Some(remediation_execution_completed_at) = execution_assignment.completed_at else {
+        return Ok(());
+    };
+    let Some(evidence) = store.find_drift_report_by_correlation(verification_job_id, task_id)?
+    else {
+        return Ok(());
+    };
+    let Some(policy_id) = evidence.provenance.policy_id.clone() else {
+        return Ok(());
+    };
+    let Some(policy_version) = evidence.provenance.policy_version else {
+        return Ok(());
+    };
+    if evidence.provenance.purpose != Some(fleet_domain::DriftCheckPurpose::RemediationVerification)
+    {
+        return Ok(());
+    }
+    let mut repo = ControllerJobRepository { store };
+    let mut audit = ControllerAuditWriter { store };
+    ResolveRemediationVerificationEvidence::execute(
+        &mut repo,
+        &mut audit,
+        ResolveRemediationVerificationEvidenceInput {
+            remediation_id: remediation.id,
+            verification_job_id: verification_job_id.to_owned(),
+            verification_task_id: task_id.to_owned(),
+            evidence_report_id: evidence.id,
+            agent_id: evidence.agent_id,
+            policy_id,
+            policy_name: evidence.report.policy_name,
+            policy_version,
+            status: evidence.report.status,
+            checked_at: evidence.checked_at,
+            remediation_execution_completed_at,
+            actor: "controller_verification_reconciler".to_owned(),
+        },
+    )
+    .map_err(|error| match error {
+        RemediationResultUseCaseError::Repository(error) => ControllerError::Store(error),
+        _ => ControllerError::Json("remediation verification resolution rejected".to_owned()),
+    })?;
+    Ok(())
+}
+
+fn persist_verified_drifted_proposal(
+    store: ControllerStoreRef<'_>,
+    agent_id: &str,
+    report: &DriftReport,
+    provenance: &DriftReportProvenance,
+    checked_at: SystemTime,
+) -> Result<bool, ControllerError> {
+    if report.status != DriftStatus::Drifted {
+        return Ok(false);
+    }
+    let (Some(policy_id), Some(policy_version), Some(task_id)) = (
+        provenance.policy_id.as_deref(),
+        provenance.policy_version,
+        provenance.task_id.as_ref(),
+    ) else {
+        return Ok(false);
+    };
+    let Some(stored_policy) = store.find_policy(policy_id)? else {
+        return Ok(false);
+    };
+    if stored_policy.version != policy_version {
+        return Ok(false);
+    }
+    let policy = fleet_domain::parse_policy_document(&stored_policy.source).map_err(|error| {
+        ControllerError::Store(fleet_store::StoreError::Domain(error.to_string()))
+    })?;
+    if policy.id != policy_id || policy.version != policy_version || policy.remediation.is_none() {
+        return Ok(false);
+    }
+    let mut repo = ControllerVerifiedDriftProposalRepository { store };
+    PersistVerifiedDriftProposal::execute(
+        &mut repo,
+        PersistVerifiedDriftProposalUseCaseInput {
+            remediation_id: format!("remediation-{policy_id}-{}", task_id.as_str()),
+            policy,
+            agent_id: agent_id.to_owned(),
+            report: report.clone(),
+            provenance: provenance.clone(),
+            actor: "controller".to_owned(),
+            requested_at: checked_at,
+        },
+    )
+    .map_err(map_policy_use_case_error)?;
+    Ok(true)
 }
 
 fn controller_signing_trust_ack_audit_value(
@@ -5539,6 +6219,46 @@ fn task_result_status_to_domain(
         fleet_protocol::TaskResultStatus::Canceled => (AssignmentStatus::Canceled, "job_canceled"),
         fleet_protocol::TaskResultStatus::TimedOut => (AssignmentStatus::Expired, "job_timed_out"),
     }
+}
+
+struct TaskExecutionTransitionInput<'a> {
+    job_id: &'a str,
+    task_id: &'a str,
+    assignment_status: &'a str,
+    assignment_last_error: Option<String>,
+    transition: Option<RemediationExecutionTransition>,
+    actor: &'a str,
+    occurred_at: SystemTime,
+}
+
+fn persist_task_execution_transition(
+    store: ControllerStoreRef<'_>,
+    input: TaskExecutionTransitionInput<'_>,
+) -> Result<bool, ControllerError> {
+    let remediation = store.find_remediation_request_by_job_id_record(input.job_id)?;
+    let (remediation, remediation_audit) = match (remediation, input.transition) {
+        (Some(record), Some(transition)) => PrepareRemediationExecutionTransition::execute(
+            record,
+            input.job_id,
+            transition,
+            input.actor,
+            input.occurred_at,
+        )
+        .map_err(ControllerError::Json)?
+        .map(|(record, audit)| (Some(record), Some(audit)))
+        .unwrap_or((None, None)),
+        _ => (None, None),
+    };
+    store
+        .persist_remediation_execution_transition(RemediationExecutionPersistenceInput {
+            task_id: input.task_id.to_owned(),
+            assignment_status: input.assignment_status.to_owned(),
+            assignment_last_error: input.assignment_last_error,
+            occurred_at: input.occurred_at,
+            remediation,
+            remediation_audit,
+        })
+        .map_err(ControllerError::Store)
 }
 
 fn store_task_result_artifacts<'a>(
@@ -8531,6 +9251,7 @@ fn create_drift_check_job<'a>(
         job_id: request.job_id,
         target_agent_ids,
         policy_document: request.policy_document,
+        provenance: None,
         timeout: Duration::from_secs(request.timeout_seconds),
         created_by: actor.to_owned(),
         issued_at,
@@ -9985,9 +10706,45 @@ fn remediation_response(record: RemediationRequestRecord) -> RemediationRequestR
         approval_required: record.approval_required,
         risk_summary: record.risk_summary,
         job_id: record.job_id,
+        lifecycle_source: "persisted".to_owned(),
+        verification_job_id: None,
+        verification_assignment_status: None,
+        verification_evidence_status: None,
+        legacy_state: None,
         created_at_ms: system_time_to_millis(record.created_at),
         updated_at_ms: system_time_to_millis(record.updated_at),
     }
+}
+
+/// Builds the read-only lifecycle view from persisted remediation, assignment, and evidence rows.
+///
+/// It deliberately does not infer transitions from an operator-supplied request body or the
+/// latest report for an agent. A provenance-free historical row remains visibly legacy.
+fn remediation_read_response(
+    record: RemediationRequestRecord,
+    store: ControllerStoreRef<'_>,
+) -> Result<RemediationRequestResponse, ControllerError> {
+    let legacy_unverified = record.origin_drift_report_id.is_none();
+    let remediation_id = record.id.clone();
+    let mut response = remediation_response(record);
+    response.legacy_state = legacy_unverified.then(|| "legacy_unverified".to_owned());
+
+    let Some(verification_job_id) = store.find_remediation_verification_job_id(&remediation_id)?
+    else {
+        return Ok(response);
+    };
+    response.verification_job_id = Some(verification_job_id.clone());
+    let Some(assignment) = store.find_task_assignment_state_for_job(&verification_job_id)? else {
+        return Ok(response);
+    };
+    response.verification_assignment_status = Some(assignment.status);
+    if let Some(evidence) =
+        store.find_drift_report_by_correlation(&verification_job_id, &assignment.task_id)?
+    {
+        response.verification_evidence_status =
+            Some(drift_status_to_str(&evidence.report.status).to_owned());
+    }
+    Ok(response)
 }
 
 fn list_remediations<'a>(
@@ -10013,8 +10770,8 @@ fn list_remediations<'a>(
     )?;
     let response = records
         .into_iter()
-        .map(remediation_response)
-        .collect::<Vec<_>>();
+        .map(|record| remediation_read_response(record, store))
+        .collect::<Result<Vec<_>, _>>()?;
     serde_json::to_string(&response).map_err(|error| ControllerError::Json(error.to_string()))
 }
 
@@ -10025,7 +10782,8 @@ fn get_remediation<'a>(
     let store = store.into();
     store
         .find_remediation_request_record(remediation_id)?
-        .map(remediation_response)
+        .map(|record| remediation_read_response(record, store))
+        .transpose()?
         .map(|response| {
             serde_json::to_string(&response)
                 .map_err(|error| ControllerError::Json(error.to_string()))
@@ -10139,103 +10897,36 @@ fn approve_remediation_job<'a>(
 }
 
 fn mark_remediation_running<'a>(
-    remediation_id: &str,
-    body: &str,
-    store: impl Into<ControllerStoreRef<'a>> + Copy,
-    actor: &str,
+    _remediation_id: &str,
+    _body: &str,
+    _store: impl Into<ControllerStoreRef<'a>> + Copy,
+    _actor: &str,
 ) -> Result<String, RemediationHttpError> {
-    let request: RemediationJobRunningRequest = serde_json::from_str(body)
-        .map_err(|error| RemediationHttpError::BadRequest(error.to_string()))?;
-    let mut repo = ControllerJobRepository {
-        store: store.into(),
-    };
-    let mut audit = ControllerAuditWriter {
-        store: store.into(),
-    };
-    let output = MarkRemediationJobRunning::execute(
-        &mut repo,
-        &mut audit,
-        MarkRemediationJobRunningInput {
-            remediation_id: remediation_id.to_owned(),
-            job_id: request.job_id,
-            actor: actor.to_owned(),
-            occurred_at: SystemTime::now(),
-        },
-    )
-    .map_err(map_remediation_result_error)?;
-    serde_json::to_string(&remediation_response(output.remediation))
-        .map_err(|error| RemediationHttpError::Internal(ControllerError::Json(error.to_string())))
+    Err(deprecated_manual_remediation_lifecycle_error())
 }
 
 fn record_remediation_result<'a>(
-    remediation_id: &str,
-    body: &str,
-    store: impl Into<ControllerStoreRef<'a>> + Copy,
-    actor: &str,
+    _remediation_id: &str,
+    _body: &str,
+    _store: impl Into<ControllerStoreRef<'a>> + Copy,
+    _actor: &str,
 ) -> Result<String, RemediationHttpError> {
-    let request: RemediationJobResultRequest = serde_json::from_str(body)
-        .map_err(|error| RemediationHttpError::BadRequest(error.to_string()))?;
-    let status = match request.status.as_str() {
-        "succeeded" | "success" => RemediationJobResultStatus::Succeeded,
-        "failed" | "failure" | "canceled" | "expired" => RemediationJobResultStatus::Failed,
-        _ => {
-            return Err(RemediationHttpError::BadRequest(
-                "remediation result status must be succeeded or failed".to_owned(),
-            ));
-        }
-    };
-    let mut repo = ControllerJobRepository {
-        store: store.into(),
-    };
-    let mut audit = ControllerAuditWriter {
-        store: store.into(),
-    };
-    let output = RecordRemediationJobResult::execute(
-        &mut repo,
-        &mut audit,
-        RecordRemediationJobResultInput {
-            remediation_id: remediation_id.to_owned(),
-            job_id: request.job_id,
-            status,
-            actor: actor.to_owned(),
-            occurred_at: SystemTime::now(),
-        },
-    )
-    .map_err(map_remediation_result_error)?;
-    serde_json::to_string(&remediation_response(output.remediation))
-        .map_err(|error| RemediationHttpError::Internal(ControllerError::Json(error.to_string())))
+    Err(deprecated_manual_remediation_lifecycle_error())
 }
 
 fn verify_remediation<'a>(
-    remediation_id: &str,
-    body: &str,
-    store: impl Into<ControllerStoreRef<'a>> + Copy,
-    actor: &str,
+    _remediation_id: &str,
+    _body: &str,
+    _store: impl Into<ControllerStoreRef<'a>> + Copy,
+    _actor: &str,
 ) -> Result<String, RemediationHttpError> {
-    let request: RemediationVerifyRequest = serde_json::from_str(body)
-        .map_err(|error| RemediationHttpError::BadRequest(error.to_string()))?;
-    let mut repo = ControllerJobRepository {
-        store: store.into(),
-    };
-    let mut audit = ControllerAuditWriter {
-        store: store.into(),
-    };
-    let output = VerifyRemediationResolution::execute(
-        &mut repo,
-        &mut audit,
-        VerifyRemediationResolutionInput {
-            remediation_id: remediation_id.to_owned(),
-            agent_id: request.agent_id,
-            policy_id: request.policy_id,
-            policy_name: request.policy_name,
-            job_id: request.job_id,
-            actor: actor.to_owned(),
-            verified_at: SystemTime::now(),
-        },
+    Err(deprecated_manual_remediation_lifecycle_error())
+}
+
+fn deprecated_manual_remediation_lifecycle_error() -> RemediationHttpError {
+    RemediationHttpError::Conflict(
+        "manual remediation lifecycle mutation is deprecated; wait for authenticated agent task events and persisted verification evidence".to_owned(),
     )
-    .map_err(map_remediation_result_error)?;
-    serde_json::to_string(&remediation_response(output.remediation))
-        .map_err(|error| RemediationHttpError::Internal(ControllerError::Json(error.to_string())))
 }
 
 fn connected_agent_ids(
@@ -10937,6 +11628,37 @@ fn map_create_drift_check_job_error(
     }
 }
 
+fn map_create_remediation_verification_job_error(
+    error: CreateRemediationVerificationJobError<
+        fleet_store::StoreError,
+        fleet_core::IdentityError,
+    >,
+) -> ControllerError {
+    match error {
+        CreateRemediationVerificationJobError::NotFound(_) => {
+            ControllerError::Store(fleet_store::StoreError::NotFound)
+        }
+        CreateRemediationVerificationJobError::InvalidRemediation(message) => {
+            ControllerError::Json(message)
+        }
+        CreateRemediationVerificationJobError::PolicyVersionMismatch { expected, actual } => {
+            ControllerError::Json(format!(
+                "remediation policy version mismatch: expected {expected}, found {actual}"
+            ))
+        }
+        CreateRemediationVerificationJobError::Domain(error) => {
+            ControllerError::Json(error.to_string())
+        }
+        CreateRemediationVerificationJobError::Agent(error) => {
+            ControllerError::Json(error.to_string())
+        }
+        CreateRemediationVerificationJobError::Repository(error) => ControllerError::Store(error),
+        CreateRemediationVerificationJobError::Sign(_) => ControllerError::Json(
+            "controller could not sign remediation verification task".to_owned(),
+        ),
+    }
+}
+
 fn map_create_runbook_job_error(
     error: CreateRunbookJobError<
         fleet_store::StoreError,
@@ -11033,22 +11755,6 @@ fn map_approve_remediation_job_error(
         }
         ApproveRemediationRunbookJobError::Sign(error) => {
             RemediationHttpError::Internal(ControllerError::Json(error.to_string()))
-        }
-    }
-}
-
-fn map_remediation_result_error(
-    error: RemediationResultUseCaseError<fleet_store::StoreError, fleet_store::StoreError>,
-) -> RemediationHttpError {
-    match error {
-        RemediationResultUseCaseError::Domain(message) => RemediationHttpError::BadRequest(message),
-        RemediationResultUseCaseError::Mismatch(field) => {
-            RemediationHttpError::BadRequest(format!("remediation evidence mismatch: {field}"))
-        }
-        RemediationResultUseCaseError::NotFound(_) => RemediationHttpError::NotFound,
-        RemediationResultUseCaseError::Repository(error)
-        | RemediationResultUseCaseError::Audit(error) => {
-            RemediationHttpError::Internal(ControllerError::Store(error))
         }
     }
 }
@@ -11313,6 +12019,21 @@ struct ControllerDriftRepository<'a> {
     store: ControllerStoreRef<'a>,
 }
 
+struct ControllerVerifiedDriftProposalRepository<'a> {
+    store: ControllerStoreRef<'a>,
+}
+
+impl VerifiedDriftProposalRepository for ControllerVerifiedDriftProposalRepository<'_> {
+    type Error = fleet_store::StoreError;
+
+    fn save_verified_drift_proposal(
+        &mut self,
+        input: fleet_application::PersistVerifiedDriftProposalInput,
+    ) -> Result<fleet_application::PersistVerifiedDriftProposalOutput, Self::Error> {
+        self.store.save_verified_drift_proposal(input)
+    }
+}
+
 impl DriftRepository for ControllerDriftRepository<'_> {
     type Error = fleet_store::StoreError;
 
@@ -11325,14 +12046,27 @@ impl DriftRepository for ControllerDriftRepository<'_> {
         self.store.insert_drift_report(agent_id, report, checked_at)
     }
 
+    fn insert_drift_report_with_provenance(
+        &mut self,
+        agent_id: &str,
+        report: &DriftReport,
+        provenance: &DriftReportProvenance,
+        checked_at: SystemTime,
+    ) -> Result<(), Self::Error> {
+        self.store
+            .insert_drift_report_with_provenance(agent_id, report, provenance, checked_at)
+    }
+
     fn latest_drift_report(
         &self,
         agent_id: &str,
     ) -> Result<Option<fleet_application::DriftReportRecord>, Self::Error> {
         Ok(self.store.latest_drift_report(agent_id)?.map(|record| {
             fleet_application::DriftReportRecord {
+                id: record.id,
                 agent_id: record.agent_id,
                 report: record.report,
+                provenance: record.provenance,
                 checked_at: record.checked_at,
             }
         }))
@@ -11349,8 +12083,10 @@ impl DriftRepository for ControllerDriftRepository<'_> {
             .list_drift_reports(agent_id, limit, before)?
             .into_iter()
             .map(|record| fleet_application::DriftReportPageRecord {
+                id: record.id,
                 agent_id: record.agent_id,
                 report: record.report,
+                provenance: record.provenance,
                 checked_at: record.checked_at,
                 cursor: record.cursor,
             })
@@ -11891,6 +12627,13 @@ impl RemediationRequestRepository for ControllerJobRepository<'_> {
         self.store.find_remediation_request_record(request_id)
     }
 
+    fn find_remediation_request_by_job_id(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<RemediationRequestRecord>, Self::Error> {
+        self.store.find_remediation_request_by_job_id_record(job_id)
+    }
+
     fn list_remediation_requests(
         &self,
         agent_id: Option<&str>,
@@ -11910,6 +12653,56 @@ impl RemediationRequestRepository for ControllerJobRepository<'_> {
     ) -> Result<(), Self::Error> {
         self.store
             .update_remediation_request_status_record(request_id, status, job_id, updated_at)
+    }
+}
+
+impl RemediationVerificationJobRepository for ControllerJobRepository<'_> {
+    fn find_remediation_verification_job(
+        &self,
+        remediation_id: &str,
+    ) -> Result<Option<String>, <Self as RemediationRequestRepository>::Error> {
+        self.store
+            .find_remediation_verification_job_id(remediation_id)
+    }
+
+    fn save_remediation_verification_job(
+        &mut self,
+        input: RemediationVerificationJobPersistenceInput,
+    ) -> Result<RemediationVerificationJobSave, <Self as RemediationRequestRepository>::Error> {
+        self.store.save_remediation_verification_job_record(&input)
+    }
+}
+
+impl RemediationVerificationResolutionRepository for ControllerJobRepository<'_> {
+    fn resolve_remediation_verification_evidence(
+        &mut self,
+        remediation: RemediationRequestRecord,
+        origin_drift_report_id: fleet_domain::DriftReportId,
+        evidence_report_id: fleet_domain::DriftReportId,
+        verification_job_id: &str,
+        verification_task_id: &str,
+        audit: AuditEvent,
+    ) -> Result<RemediationRequestRecord, <Self as RemediationRequestRepository>::Error> {
+        self.store.resolve_remediation_verification_evidence_record(
+            &remediation,
+            &origin_drift_report_id,
+            &evidence_report_id,
+            verification_job_id,
+            verification_task_id,
+            &audit,
+        )
+    }
+}
+
+impl RemediationVerificationRecoveryRepository for ControllerJobRepository<'_> {
+    type Error = fleet_store::StoreError;
+
+    fn list_pending_remediation_verification_recovery(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<RemediationRequestRecord>, Self::Error> {
+        self.store
+            .list_pending_remediation_verification_recovery_records(limit)
     }
 }
 
@@ -11998,6 +12791,22 @@ impl fleet_application::DriftCheckJobRepository for ControllerJobRepository<'_> 
     ) -> Result<(), <Self as TaskAssignmentRepository>::Error> {
         self.store
             .save_drift_check_job_with_assignments_record(&job, task, assignments)
+    }
+
+    fn save_drift_check_job_with_assignments_and_provenance(
+        &mut self,
+        job: Job,
+        task: &fleet_domain::DriftCheckTask,
+        assignments: &[TaskEnvelope],
+        provenance: Option<&fleet_domain::DriftJobProvenance>,
+    ) -> Result<(), <Self as TaskAssignmentRepository>::Error> {
+        self.store
+            .save_drift_check_job_with_assignments_and_provenance_record(
+                &job,
+                task,
+                assignments,
+                provenance,
+            )
     }
 }
 
@@ -12679,6 +13488,35 @@ mod tests {
             })
         );
         assert!(!registry.has_active_session("agent-1"));
+    }
+
+    #[test]
+    fn registered_session_guard_keeps_session_active_until_explicit_finish() {
+        let sessions = Arc::new(Mutex::new(AgentSessionRegistry::default()));
+        let (handle, _receiver) = session_handle(
+            "agent-1",
+            "conn-1",
+            SystemTime::UNIX_EPOCH,
+            vec!["persistent_session".to_owned()],
+            Some(64),
+        );
+        sessions.lock().unwrap().register(handle);
+        let guard = RegisteredAgentSessionGuard::new(
+            sessions.clone(),
+            "agent-1".to_owned(),
+            "conn-1".to_owned(),
+        );
+
+        assert!(sessions.lock().unwrap().has_active_session("agent-1"));
+        assert_eq!(
+            guard.finish(AgentSessionCloseReason::NormalShutdown),
+            Some(AgentSessionEnded {
+                agent_id: "agent-1".to_owned(),
+                connection_id: "conn-1".to_owned(),
+                close_reason: AgentSessionCloseReason::NormalShutdown,
+            })
+        );
+        assert!(!sessions.lock().unwrap().has_active_session("agent-1"));
     }
 
     #[test]
@@ -17256,9 +18094,12 @@ mod tests {
 
         assert!(list_response.starts_with("HTTP/1.1 200"));
         assert!(list_response.contains("\"id\":\"rem-1\""));
+        assert!(list_response.contains("\"lifecycle_source\":\"persisted\""));
+        assert!(list_response.contains("\"legacy_state\":\"legacy_unverified\""));
         assert!(!list_response.contains("rem-other"));
         assert!(detail_response.starts_with("HTTP/1.1 200"));
         assert!(detail_response.contains("\"runbook_ref\":\"runbooks/remediate.yml\""));
+        assert!(detail_response.contains("\"legacy_state\":\"legacy_unverified\""));
         assert!(missing_response.starts_with("HTTP/1.1 404"));
         assert!(bad_limit_response.starts_with("HTTP/1.1 400"));
         assert_remediation_surface_excludes_payloads(&list_response);
@@ -17388,7 +18229,7 @@ mod tests {
     }
 
     #[test]
-    fn admin_can_record_remediation_result_and_verify_resolution() {
+    fn deprecated_manual_remediation_lifecycle_routes_conflict_without_state_change() {
         let store = SqliteStore::in_memory().unwrap();
         store
             .insert_admin_token_hash(&hash_token("admin-token"))
@@ -17452,25 +18293,25 @@ mod tests {
             .list_audit_events_by_category(AuditCategory::Policy, 10)
             .unwrap();
 
-        assert!(running_response.starts_with("HTTP/1.1 200"));
-        assert!(running_response.contains("\"status\":\"running\""));
-        assert!(result_response.starts_with("HTTP/1.1 200"));
-        assert!(result_response.contains("\"status\":\"succeeded_pending_verify\""));
+        assert!(running_response.starts_with("HTTP/1.1 409"));
+        assert!(result_response.starts_with("HTTP/1.1 409"));
+        assert!(verify_response.starts_with("HTTP/1.1 409"));
+        for response in [&running_response, &result_response, &verify_response] {
+            assert!(response.contains("manual remediation lifecycle mutation is deprecated"));
+        }
         assert!(matches!(
             &before_verify.report.acknowledgement,
             DriftAcknowledgement::Open
         ));
-        assert!(verify_response.starts_with("HTTP/1.1 200"));
-        assert!(verify_response.contains("\"status\":\"resolved\""));
-        assert_eq!(remediation.status, "resolved");
+        assert_eq!(remediation.status, "job_created");
         assert!(matches!(
             &drift.report.acknowledgement,
-            DriftAcknowledgement::Resolved { job_id, .. } if job_id == "job-rem-result"
+            DriftAcknowledgement::Open
         ));
         assert!(
             audits
                 .iter()
-                .any(|event| event.action == "remediation_resolved")
+                .all(|event| !event.action.starts_with("remediation_"))
         );
     }
 
@@ -17516,8 +18357,8 @@ mod tests {
             .unwrap();
         let drift = store.latest_drift_report("agent-1").unwrap().unwrap();
 
-        assert!(response.starts_with("HTTP/1.1 400"));
-        assert!(response.contains("remediation evidence mismatch: policy_id"));
+        assert!(response.starts_with("HTTP/1.1 409"));
+        assert!(response.contains("manual remediation lifecycle mutation is deprecated"));
         assert_eq!(remediation.status, "succeeded_pending_verify");
         assert!(matches!(
             &drift.report.acknowledgement,
@@ -19423,6 +20264,529 @@ spec:
     }
 
     #[test]
+    fn remediation_execution_task_events_follow_persisted_assignment_lifecycle() {
+        let store = SqliteStore::in_memory().unwrap();
+        save_test_agent(&store, "agent-1");
+        save_test_job(&store, "job-remediation");
+        save_test_assignment(&store, "job-remediation", "task-remediation", "agent-1");
+        store
+            .save_remediation_request_record(&controller_remediation_request_record(
+                "remediation-1",
+                "agent-1",
+                "policy-1",
+                "job_created",
+                Some("job-remediation"),
+            ))
+            .unwrap();
+
+        handle_agent_task_data_message(
+            &store,
+            "agent-1",
+            fleet_protocol::WireMessage::new(
+                "msg-remediation-started",
+                "corr-remediation-started",
+                Some("agent-1".to_owned()),
+                1,
+                fleet_protocol::WirePayload::TaskStarted {
+                    job_id: "job-remediation".to_owned(),
+                    task_id: "task-remediation".to_owned(),
+                },
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .find_remediation_request_record("remediation-1")
+                .unwrap()
+                .unwrap()
+                .status,
+            "running"
+        );
+
+        handle_agent_task_data_message(
+            &store,
+            "agent-1",
+            fleet_protocol::WireMessage::new(
+                "msg-remediation-result",
+                "corr-remediation-result",
+                Some("agent-1".to_owned()),
+                2,
+                fleet_protocol::WirePayload::TaskResult {
+                    job_id: "job-remediation".to_owned(),
+                    task_id: "task-remediation".to_owned(),
+                    exit_code: 0,
+                    status: Some(fleet_protocol::TaskResultStatus::Succeeded),
+                    reason: String::new(),
+                    artifacts: Vec::new(),
+                },
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .find_remediation_request_record("remediation-1")
+                .unwrap()
+                .unwrap()
+                .status,
+            "succeeded_pending_verify"
+        );
+        handle_agent_task_data_message(
+            &store,
+            "agent-1",
+            fleet_protocol::WireMessage::new(
+                "msg-remediation-result-duplicate",
+                "corr-remediation-result-duplicate",
+                Some("agent-1".to_owned()),
+                3,
+                fleet_protocol::WirePayload::TaskResult {
+                    job_id: "job-remediation".to_owned(),
+                    task_id: "task-remediation".to_owned(),
+                    exit_code: 0,
+                    status: Some(fleet_protocol::TaskResultStatus::Succeeded),
+                    reason: String::new(),
+                    artifacts: Vec::new(),
+                },
+            ),
+        )
+        .unwrap();
+        handle_agent_task_data_message(
+            &store,
+            "agent-1",
+            fleet_protocol::WireMessage::new(
+                "msg-remediation-started-late",
+                "corr-remediation-started-late",
+                Some("agent-1".to_owned()),
+                4,
+                fleet_protocol::WirePayload::TaskStarted {
+                    job_id: "job-remediation".to_owned(),
+                    task_id: "task-remediation".to_owned(),
+                },
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .list_audit_events(100)
+                .unwrap()
+                .iter()
+                .filter(|event| event.action.starts_with("remediation_job_"))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn successful_remediation_task_result_creates_one_queued_verification_job() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .insert_admin_token_hash(&hash_token("admin-token"))
+            .unwrap();
+        save_test_agent(&store, "agent-1");
+        save_test_job(&store, "job-remediation-verify");
+        save_test_assignment(
+            &store,
+            "job-remediation-verify",
+            "task-remediation-verify",
+            "agent-1",
+        );
+        store
+            .save_policy_source(
+                "policy-verify",
+                "policy-verify",
+                1,
+                "apiVersion: fleet.sponzey.dev/v1alpha1",
+            )
+            .unwrap();
+        let mut remediation = controller_remediation_request_record(
+            "remediation-verify",
+            "agent-1",
+            "policy-verify",
+            "job_created",
+            Some("job-remediation-verify"),
+        );
+        remediation.policy_version = Some(1);
+        store.save_remediation_request_record(&remediation).unwrap();
+        let root = artifact_test_root("remediation-verification-disconnect");
+        let state = ControllerAppState {
+            store: Arc::new(Mutex::new(ControllerStore::Sqlite(store))),
+            artifact_store: Arc::new(Mutex::new(LocalArtifactStore::new(&root).unwrap())),
+            identity: Arc::new(ControllerIdentity::dev_insecure()),
+            metadata: Arc::new(ControllerRuntimeMetadata::default()),
+            sessions: Arc::new(Mutex::new(AgentSessionRegistry::default())),
+        };
+
+        handle_agent_task_data_message_from_state(
+            &state,
+            "agent-1",
+            fleet_protocol::WireMessage::new(
+                "msg-remediation-verify-started",
+                "corr-remediation-verify-started",
+                Some("agent-1".to_owned()),
+                1,
+                fleet_protocol::WirePayload::TaskStarted {
+                    job_id: "job-remediation-verify".to_owned(),
+                    task_id: "task-remediation-verify".to_owned(),
+                },
+            ),
+        )
+        .unwrap();
+        let result = fleet_protocol::WireMessage::new(
+            "msg-remediation-verify-result",
+            "corr-remediation-verify-result",
+            Some("agent-1".to_owned()),
+            2,
+            fleet_protocol::WirePayload::TaskResult {
+                job_id: "job-remediation-verify".to_owned(),
+                task_id: "task-remediation-verify".to_owned(),
+                exit_code: 0,
+                status: Some(fleet_protocol::TaskResultStatus::Succeeded),
+                reason: String::new(),
+                artifacts: Vec::new(),
+            },
+        );
+        handle_agent_task_data_message_from_state(&state, "agent-1", result.clone()).unwrap();
+        handle_agent_task_data_message_from_state(&state, "agent-1", result).unwrap();
+
+        let guard = lock_store(&state).unwrap();
+        let store = sqlite_test_store(&guard);
+        let verification_job_id = store
+            .find_remediation_verification_job_id("remediation-verify")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .find_task_assignment_status(&format!("{verification_job_id}-task-0"))
+                .unwrap(),
+            Some("queued".to_owned())
+        );
+        assert_eq!(
+            store
+                .list_audit_events(100)
+                .unwrap()
+                .iter()
+                .filter(|event| event.action == "remediation_verification_created")
+                .count(),
+            1
+        );
+        drop(guard);
+
+        handle_agent_task_data_message_from_state(
+            &state,
+            "agent-1",
+            fleet_protocol::WireMessage::new(
+                "msg-remediation-verification-failed",
+                "corr-remediation-verification-failed",
+                Some("agent-1".to_owned()),
+                3,
+                fleet_protocol::WirePayload::TaskResult {
+                    job_id: verification_job_id.clone(),
+                    task_id: format!("{verification_job_id}-task-0"),
+                    exit_code: 1,
+                    status: Some(fleet_protocol::TaskResultStatus::Failed),
+                    reason: "verification drift check failed".to_owned(),
+                    artifacts: Vec::new(),
+                },
+            ),
+        )
+        .unwrap();
+        let guard = lock_store(&state).unwrap();
+        let response = route_request(
+            "GET /api/remediations/remediation-verify HTTP/1.1\r\nAuthorization: Bearer admin-token\r\n\r\n",
+            sqlite_test_store(&guard),
+        )
+        .unwrap();
+        assert!(response.contains("\"lifecycle_source\":\"persisted\""));
+        assert!(response.contains(&format!(
+            "\"verification_job_id\":\"{verification_job_id}\""
+        )));
+        assert!(response.contains("\"verification_assignment_status\":\"failed\""));
+        assert!(response.contains("\"status\":\"succeeded_pending_verify\""));
+        drop(guard);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn verification_evidence_and_result_converge_in_either_delivery_order() {
+        for report_before_result in [true, false] {
+            let suffix = if report_before_result {
+                "report-first"
+            } else {
+                "result-first"
+            };
+            let store = SqliteStore::in_memory().unwrap();
+            save_test_agent(&store, "agent-1");
+            save_test_job(&store, &format!("job-remediation-{suffix}"));
+            save_test_assignment(
+                &store,
+                &format!("job-remediation-{suffix}"),
+                &format!("task-remediation-{suffix}"),
+                "agent-1",
+            );
+            store
+                .save_policy_source(
+                    "policy-verify-order",
+                    "policy-verify-order",
+                    1,
+                    "apiVersion: fleet.sponzey.dev/v1alpha1",
+                )
+                .unwrap();
+            let origin = DriftReport {
+                policy_name: "policy-verify-order".to_owned(),
+                status: DriftStatus::Drifted,
+                severity: DriftSeverity::Warning,
+                acknowledgement: DriftAcknowledgement::Open,
+                expected: "running".to_owned(),
+                actual: "stopped".to_owned(),
+            };
+            store
+                .insert_drift_report(
+                    "agent-1",
+                    &origin,
+                    SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+                )
+                .unwrap();
+            let mut remediation = controller_remediation_request_record(
+                &format!("remediation-{suffix}"),
+                "agent-1",
+                "policy-verify-order",
+                "job_created",
+                Some(&format!("job-remediation-{suffix}")),
+            );
+            remediation.policy_version = Some(1);
+            remediation.origin_drift_report_id =
+                Some(store.latest_drift_report("agent-1").unwrap().unwrap().id);
+            store.save_remediation_request_record(&remediation).unwrap();
+            let root = artifact_test_root(&format!("remediation-verification-{suffix}"));
+            let state = ControllerAppState {
+                store: Arc::new(Mutex::new(ControllerStore::Sqlite(store))),
+                artifact_store: Arc::new(Mutex::new(LocalArtifactStore::new(&root).unwrap())),
+                identity: Arc::new(ControllerIdentity::dev_insecure()),
+                metadata: Arc::new(ControllerRuntimeMetadata::default()),
+                sessions: Arc::new(Mutex::new(AgentSessionRegistry::default())),
+            };
+            let execution_job_id = format!("job-remediation-{suffix}");
+            let execution_task_id = format!("task-remediation-{suffix}");
+            handle_agent_task_data_message_from_state(
+                &state,
+                "agent-1",
+                fleet_protocol::WireMessage::new(
+                    format!("msg-remediation-started-{suffix}"),
+                    format!("corr-remediation-started-{suffix}"),
+                    Some("agent-1".to_owned()),
+                    9_000,
+                    fleet_protocol::WirePayload::TaskStarted {
+                        job_id: execution_job_id.clone(),
+                        task_id: execution_task_id.clone(),
+                    },
+                ),
+            )
+            .unwrap();
+            handle_agent_task_data_message_from_state(
+                &state,
+                "agent-1",
+                fleet_protocol::WireMessage::new(
+                    format!("msg-remediation-result-{suffix}"),
+                    format!("corr-remediation-result-{suffix}"),
+                    Some("agent-1".to_owned()),
+                    10_000,
+                    fleet_protocol::WirePayload::TaskResult {
+                        job_id: execution_job_id,
+                        task_id: execution_task_id,
+                        exit_code: 0,
+                        status: Some(fleet_protocol::TaskResultStatus::Succeeded),
+                        reason: String::new(),
+                        artifacts: Vec::new(),
+                    },
+                ),
+            )
+            .unwrap();
+            let verification_job_id = {
+                let guard = lock_store(&state).unwrap();
+                let store = sqlite_test_store(&guard);
+                store
+                    .find_remediation_verification_job_id(&format!("remediation-{suffix}"))
+                    .unwrap()
+                    .unwrap()
+            };
+            let verification_task_id = format!("{verification_job_id}-task-0");
+            let report = fleet_protocol::WireMessage::new(
+                format!("msg-verification-report-{suffix}"),
+                format!("corr-verification-report-{suffix}"),
+                Some("agent-1".to_owned()),
+                20_000,
+                fleet_protocol::WirePayload::DriftReport {
+                    agent_id: "agent-1".to_owned(),
+                    job_id: Some(verification_job_id.clone()),
+                    task_id: Some(verification_task_id.clone()),
+                    status: "compliant".to_owned(),
+                    expected: "running".to_owned(),
+                    actual: "running".to_owned(),
+                },
+            );
+            let result = fleet_protocol::WireMessage::new(
+                format!("msg-verification-result-{suffix}"),
+                format!("corr-verification-result-{suffix}"),
+                Some("agent-1".to_owned()),
+                30_000,
+                fleet_protocol::WirePayload::TaskResult {
+                    job_id: verification_job_id,
+                    task_id: verification_task_id,
+                    exit_code: 0,
+                    status: Some(fleet_protocol::TaskResultStatus::Succeeded),
+                    reason: String::new(),
+                    artifacts: Vec::new(),
+                },
+            );
+            if report_before_result {
+                handle_agent_task_data_message_from_state(&state, "agent-1", report).unwrap();
+                handle_agent_task_data_message_from_state(&state, "agent-1", result).unwrap();
+            } else {
+                handle_agent_task_data_message_from_state(&state, "agent-1", result).unwrap();
+                handle_agent_task_data_message_from_state(&state, "agent-1", report).unwrap();
+            }
+
+            let guard = lock_store(&state).unwrap();
+            let store = sqlite_test_store(&guard);
+            assert_eq!(
+                store
+                    .find_remediation_request_record(&format!("remediation-{suffix}"))
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                "resolved"
+            );
+            assert_eq!(
+                store
+                    .list_audit_events(100)
+                    .unwrap()
+                    .iter()
+                    .filter(|event| event.action == "remediation_resolved_by_verification")
+                    .count(),
+                1
+            );
+            drop(guard);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn startup_verification_recovery_is_bounded_skips_legacy_and_keeps_offline_work_queued() {
+        let store = SqliteStore::in_memory().unwrap();
+        save_test_agent(&store, "agent-1");
+        store
+            .save_policy_source(
+                "policy-recovery",
+                "policy-recovery",
+                1,
+                "apiVersion: fleet.sponzey.dev/v1alpha1",
+            )
+            .unwrap();
+        for remediation_id in ["rem-a-pending", "rem-d-pending"] {
+            let mut remediation = controller_remediation_request_record(
+                remediation_id,
+                "agent-1",
+                "policy-recovery",
+                "succeeded_pending_verify",
+                Some("job-remediation"),
+            );
+            remediation.policy_version = Some(1);
+            store.save_remediation_request_record(&remediation).unwrap();
+        }
+        let correlated = controller_remediation_request_record(
+            "rem-b-correlated",
+            "agent-1",
+            "missing-policy",
+            "succeeded_pending_verify",
+            Some("job-correlated"),
+        );
+        store.save_remediation_request_record(&correlated).unwrap();
+        save_test_job(&store, "job-existing-verification");
+        store
+            .save_remediation_verification_job(
+                "rem-b-correlated",
+                "job-existing-verification",
+                SystemTime::UNIX_EPOCH,
+            )
+            .unwrap();
+        let legacy = controller_remediation_request_record(
+            "rem-c-legacy",
+            "agent-1",
+            "missing-policy",
+            "succeeded_pending_verify",
+            None,
+        );
+        store.save_remediation_request_record(&legacy).unwrap();
+        let root = artifact_test_root("remediation-verification-startup-recovery");
+        let state = ControllerAppState {
+            store: Arc::new(Mutex::new(ControllerStore::Sqlite(store))),
+            artifact_store: Arc::new(Mutex::new(LocalArtifactStore::new(&root).unwrap())),
+            identity: Arc::new(ControllerIdentity::dev_insecure()),
+            metadata: Arc::new(ControllerRuntimeMetadata::default()),
+            sessions: Arc::new(Mutex::new(AgentSessionRegistry::default())),
+        };
+
+        let first = recover_pending_remediation_verifications(&state, 1).unwrap();
+        let second = recover_pending_remediation_verifications(&state, 10).unwrap();
+
+        assert_eq!(
+            first,
+            RemediationVerificationRecoverySummary {
+                discovered: 1,
+                created: 1,
+                existing: 0,
+                skipped: 0,
+            }
+        );
+        assert_eq!(
+            second,
+            RemediationVerificationRecoverySummary {
+                discovered: 2,
+                created: 1,
+                existing: 0,
+                skipped: 1,
+            }
+        );
+        let guard = lock_store(&state).unwrap();
+        let store = sqlite_test_store(&guard);
+        for remediation_id in ["rem-a-pending", "rem-d-pending"] {
+            let verification_job_id = store
+                .find_remediation_verification_job_id(remediation_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                store
+                    .find_task_assignment_status(&format!("{verification_job_id}-task-0"))
+                    .unwrap(),
+                Some("queued".to_owned())
+            );
+        }
+        assert_eq!(
+            store
+                .find_remediation_verification_job_id("rem-b-correlated")
+                .unwrap(),
+            Some("job-existing-verification".to_owned())
+        );
+        let audits = store.list_audit_events(100).unwrap();
+        assert_eq!(
+            audits
+                .iter()
+                .filter(|event| event.action == "remediation_verification_recovery_skipped")
+                .count(),
+            1
+        );
+        assert!(audits.iter().any(|event| {
+            event.action == "remediation_verification_recovery_skipped"
+                && matches!(
+                    &event.value,
+                    AuditValue::Plain(value)
+                        if value == "remediation_id=rem-c-legacy,reason=invalid_persisted_remediation"
+                )
+        }));
+        drop(guard);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn output_chunk_does_not_mark_assignment_success() {
         let store = SqliteStore::in_memory().unwrap();
         save_test_agent(&store, "agent-1");
@@ -19653,6 +21017,8 @@ spec:
             1000,
             fleet_protocol::WirePayload::DriftReport {
                 agent_id: "agent-1".to_owned(),
+                job_id: None,
+                task_id: None,
                 status: "drifted".to_owned(),
                 expected: "service nginx running".to_owned(),
                 actual: "stopped".to_owned(),
@@ -19672,8 +21038,428 @@ spec:
         );
         assert_eq!(record.report.status, DriftStatus::Drifted);
         assert_eq!(record.report.actual, "stopped");
+        assert!(!record.provenance.is_automation_eligible());
         assert_eq!(audits.len(), 1);
         assert_eq!(audits[0].action, "drift_report_received");
+        assert!(
+            store
+                .list_audit_events_by_category(AuditCategory::Security, 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn mismatched_drift_report_correlation_is_audited_and_remains_observation_only() {
+        let store = SqliteStore::in_memory().unwrap();
+        save_test_agent(&store, "agent-1");
+        let message = fleet_protocol::WireMessage::new(
+            "msg-drift-mismatch",
+            "corr-drift-mismatch",
+            Some("agent-1".to_owned()),
+            1000,
+            fleet_protocol::WirePayload::DriftReport {
+                agent_id: "agent-1".to_owned(),
+                job_id: Some("missing-job".to_owned()),
+                task_id: Some("missing-task".to_owned()),
+                status: "drifted".to_owned(),
+                expected: "expected".to_owned(),
+                actual: "actual".to_owned(),
+            },
+        );
+
+        handle_agent_task_data_message(&store, "agent-1", message).unwrap();
+
+        let record = store.latest_drift_report("agent-1").unwrap().unwrap();
+        let security = store
+            .list_audit_events_by_category(AuditCategory::Security, 10)
+            .unwrap();
+        assert!(!record.provenance.is_automation_eligible());
+        assert!(
+            security
+                .iter()
+                .any(|event| event.action == "websocket_drift_provenance_mismatch")
+        );
+        assert_eq!(
+            security
+                .iter()
+                .filter(|event| event.action == "websocket_drift_provenance_mismatch")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn partial_drift_report_correlation_remains_observation_only_without_mismatch_audit() {
+        let store = SqliteStore::in_memory().unwrap();
+        save_test_agent(&store, "agent-1");
+        handle_agent_task_data_message(
+            &store,
+            "agent-1",
+            fleet_protocol::WireMessage::new(
+                "msg-drift-partial",
+                "corr-drift-partial",
+                Some("agent-1".to_owned()),
+                1_000,
+                fleet_protocol::WirePayload::DriftReport {
+                    agent_id: "agent-1".to_owned(),
+                    job_id: Some("claimed-job".to_owned()),
+                    task_id: None,
+                    status: "drifted".to_owned(),
+                    expected: "expected".to_owned(),
+                    actual: "actual".to_owned(),
+                },
+            ),
+        )
+        .unwrap();
+
+        assert!(
+            !store
+                .latest_drift_report("agent-1")
+                .unwrap()
+                .unwrap()
+                .provenance
+                .is_automation_eligible()
+        );
+        assert!(
+            store
+                .list_audit_events_by_category(AuditCategory::Security, 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn mismatched_signed_drift_assignment_report_is_audited_and_remains_observation_only() {
+        let store = SqliteStore::in_memory().unwrap();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(600);
+        save_test_agent_with_labels(&store, "agent-1", vec![("role", "web")]);
+        let policy_source = r#"
+apiVersion: fleet.sponzey.dev/v1alpha1
+kind: Policy
+metadata:
+  name: nginx-running
+spec:
+  selector:
+    matchLabels:
+      role: web
+  checks:
+    - id: nginx-service
+      service:
+        name: nginx
+        state: running
+  remediation:
+    runbookRef: runbooks/nginx-remediate.yml
+    approvalRequired: true
+"#;
+        store
+            .save_policy_source("nginx-running", "nginx-running", 1, policy_source)
+            .unwrap();
+        store
+            .upsert_policy_schedule(
+                "nginx-running",
+                "agent-1",
+                Duration::from_secs(300),
+                now - Duration::from_secs(1),
+            )
+            .unwrap();
+        run_due_scheduled_drift_once(&store, &ControllerIdentity::dev_insecure(), now).unwrap();
+        let assignment = store
+            .list_pending_dispatch_assignments(None, None, 10)
+            .unwrap()
+            .pop()
+            .unwrap();
+        handle_agent_task_data_message(
+            &store,
+            "agent-1",
+            fleet_protocol::WireMessage::new(
+                "msg-drift-wrong-job",
+                "corr-drift-wrong-job",
+                Some("agent-1".to_owned()),
+                1_000,
+                fleet_protocol::WirePayload::DriftReport {
+                    agent_id: "agent-1".to_owned(),
+                    job_id: Some("other-job".to_owned()),
+                    task_id: Some(assignment.envelope.task_id.as_str().to_owned()),
+                    status: "drifted".to_owned(),
+                    expected: "expected".to_owned(),
+                    actual: "actual".to_owned(),
+                },
+            ),
+        )
+        .unwrap();
+
+        assert!(
+            !store
+                .latest_drift_report("agent-1")
+                .unwrap()
+                .unwrap()
+                .provenance
+                .is_automation_eligible()
+        );
+        assert_eq!(
+            store
+                .list_audit_events_by_category(AuditCategory::Security, 10)
+                .unwrap()
+                .iter()
+                .filter(|event| event.action == "websocket_drift_provenance_mismatch")
+                .count(),
+            1
+        );
+        assert!(
+            store
+                .list_remediation_request_records(None, None, 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn raw_and_non_drift_assignment_reports_remain_observation_only() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .insert_admin_token_hash(&hash_token("admin-token"))
+            .unwrap();
+        save_test_agent(&store, "agent-1");
+        assert!(
+            route_request(&drift_check_job_request("raw-drift-job", "agent-1"), &store)
+                .unwrap()
+                .starts_with("HTTP/1.1 201")
+        );
+        assert!(
+            route_request(&command_job_request("command-job", "agent-1", true), &store)
+                .unwrap()
+                .starts_with("HTTP/1.1 201")
+        );
+        let raw_assignment = store
+            .list_pending_drift_check_assignments_for_agent("agent-1")
+            .unwrap()
+            .pop()
+            .unwrap();
+        let command_assignment = store
+            .list_pending_command_assignments_for_agent("agent-1")
+            .unwrap()
+            .pop()
+            .unwrap();
+
+        for (message_id, assignment) in [
+            ("raw-drift-report", raw_assignment.envelope),
+            ("command-drift-report", command_assignment.envelope),
+        ] {
+            handle_agent_task_data_message(
+                &store,
+                "agent-1",
+                fleet_protocol::WireMessage::new(
+                    message_id,
+                    message_id,
+                    Some("agent-1".to_owned()),
+                    1_000,
+                    fleet_protocol::WirePayload::DriftReport {
+                        agent_id: "agent-1".to_owned(),
+                        job_id: Some(assignment.job_id.as_str().to_owned()),
+                        task_id: Some(assignment.task_id.as_str().to_owned()),
+                        status: "drifted".to_owned(),
+                        expected: "expected".to_owned(),
+                        actual: "actual".to_owned(),
+                    },
+                ),
+            )
+            .unwrap();
+        }
+
+        let reports = store.list_drift_reports("agent-1", 10, None).unwrap();
+        let security = store
+            .list_audit_events_by_category(AuditCategory::Security, 10)
+            .unwrap();
+        assert_eq!(reports.len(), 2);
+        assert!(
+            reports
+                .iter()
+                .all(|report| !report.provenance.is_automation_eligible())
+        );
+        assert_eq!(
+            security
+                .iter()
+                .filter(|event| event.action == "websocket_drift_provenance_mismatch")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn signed_drift_assignment_report_is_stored_with_verified_provenance() {
+        let store = SqliteStore::in_memory().unwrap();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(600);
+        save_test_agent_with_labels(&store, "agent-1", vec![("role", "web")]);
+        let policy_source = r#"
+apiVersion: fleet.sponzey.dev/v1alpha1
+kind: Policy
+metadata:
+  name: nginx-running
+spec:
+  selector:
+    matchLabels:
+      role: web
+  checks:
+    - id: nginx-service
+      service:
+        name: nginx
+        state: running
+  remediation:
+    runbookRef: runbooks/nginx-remediate.yml
+    approvalRequired: true
+"#;
+        store
+            .save_policy_source("nginx-running", "nginx-running", 1, policy_source)
+            .unwrap();
+        store
+            .upsert_policy_schedule(
+                "nginx-running",
+                "agent-1",
+                Duration::from_secs(300),
+                now - Duration::from_secs(1),
+            )
+            .unwrap();
+        run_due_scheduled_drift_once(&store, &ControllerIdentity::dev_insecure(), now).unwrap();
+        let assignment = store
+            .list_pending_dispatch_assignments(None, None, 10)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let message = fleet_protocol::WireMessage::new(
+            "msg-drift-verified",
+            "corr-drift-verified",
+            Some("agent-1".to_owned()),
+            1_000,
+            fleet_protocol::WirePayload::DriftReport {
+                agent_id: "agent-1".to_owned(),
+                job_id: Some(assignment.envelope.job_id.as_str().to_owned()),
+                task_id: Some(assignment.envelope.task_id.as_str().to_owned()),
+                status: "compliant".to_owned(),
+                expected: "running".to_owned(),
+                actual: "stopped".to_owned(),
+            },
+        );
+
+        handle_agent_task_data_message(&store, "agent-1", message).unwrap();
+
+        let record = store.latest_drift_report("agent-1").unwrap().unwrap();
+        let security = store
+            .list_audit_events_by_category(AuditCategory::Security, 10)
+            .unwrap();
+        assert_eq!(record.report.policy_name, "nginx-running");
+        assert_eq!(
+            record.provenance.job_id.as_ref(),
+            Some(&assignment.envelope.job_id)
+        );
+        assert_eq!(
+            record.provenance.task_id.as_ref(),
+            Some(&assignment.envelope.task_id)
+        );
+        assert_eq!(
+            record.provenance.policy_id.as_deref(),
+            Some("nginx-running")
+        );
+        assert_eq!(record.provenance.policy_version, Some(1));
+        assert!(record.provenance.is_automation_eligible());
+        assert!(security.is_empty());
+        assert!(
+            store
+                .list_remediation_request_records(None, None, 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn verified_drifted_report_creates_one_proposed_remediation_without_a_job() {
+        let store = SqliteStore::in_memory().unwrap();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(600);
+        save_test_agent_with_labels(&store, "agent-1", vec![("role", "web")]);
+        let policy_source = r#"
+apiVersion: fleet.sponzey.dev/v1alpha1
+kind: Policy
+metadata:
+  name: nginx-running
+spec:
+  selector:
+    matchLabels:
+      role: web
+  checks:
+    - id: nginx-service
+      service:
+        name: nginx
+        state: running
+  remediation:
+    runbookRef: runbooks/nginx-remediate.yml
+    approvalRequired: true
+"#;
+        store
+            .save_policy_source("nginx-running", "nginx-running", 1, policy_source)
+            .unwrap();
+        store
+            .upsert_policy_schedule(
+                "nginx-running",
+                "agent-1",
+                Duration::from_secs(300),
+                now - Duration::from_secs(1),
+            )
+            .unwrap();
+        run_due_scheduled_drift_once(&store, &ControllerIdentity::dev_insecure(), now).unwrap();
+        let assignment = store
+            .list_pending_dispatch_assignments(None, None, 10)
+            .unwrap()
+            .pop()
+            .unwrap();
+
+        let message = fleet_protocol::WireMessage::new(
+            "msg-drift-remediation",
+            "corr-drift-remediation",
+            Some("agent-1".to_owned()),
+            1_000,
+            fleet_protocol::WirePayload::DriftReport {
+                agent_id: "agent-1".to_owned(),
+                job_id: Some(assignment.envelope.job_id.as_str().to_owned()),
+                task_id: Some(assignment.envelope.task_id.as_str().to_owned()),
+                status: "drifted".to_owned(),
+                expected: "running".to_owned(),
+                actual: "stopped".to_owned(),
+            },
+        );
+        handle_agent_task_data_message(&store, "agent-1", message.clone()).unwrap();
+        handle_agent_task_data_message(&store, "agent-1", message).unwrap();
+
+        let remediations = store
+            .list_remediation_request_records(None, None, 10)
+            .unwrap();
+        assert_eq!(remediations.len(), 1);
+        assert_eq!(remediations[0].status, "proposed");
+        assert_eq!(remediations[0].agent_id, "agent-1");
+        assert_eq!(remediations[0].policy_id, "nginx-running");
+        assert!(remediations[0].job_id.is_none());
+        assert!(remediations[0].origin_drift_report_id.is_some());
+        assert_eq!(
+            store
+                .list_audit_events_by_category(AuditCategory::Policy, 10)
+                .unwrap()
+                .iter()
+                .filter(|event| event.action == "remediation_requested")
+                .count(),
+            1
+        );
+        assert_eq!(
+            store.list_drift_reports("agent-1", 10, None).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            store
+                .list_audit_events_by_category(AuditCategory::Drift, 10)
+                .unwrap()
+                .iter()
+                .filter(|event| event.action == "drift_report_received")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -19889,6 +21675,17 @@ spec:
 
         assert_eq!(output.created_count, 1);
         assert_eq!(pending.len(), 1);
+        let provenance = store
+            .find_drift_assignment_provenance(pending[0].envelope.task_id.as_str())
+            .unwrap()
+            .unwrap();
+        assert_eq!(provenance.agent_id, "agent-1");
+        assert_eq!(provenance.policy_id, "nginx-running");
+        assert_eq!(provenance.policy_version, 1);
+        assert_eq!(
+            provenance.purpose,
+            fleet_domain::DriftCheckPurpose::Evaluation
+        );
         assert!(matches!(
             pending[0].task,
             fleet_domain::TaskKind::DriftCheck(_)
@@ -21978,6 +23775,8 @@ spec:
             approval_required: true,
             risk_summary: "drifted policy requires approved remediation".to_owned(),
             job_id: job_id.map(str::to_owned),
+            origin_drift_report_id: None,
+            policy_version: None,
             created_at: SystemTime::UNIX_EPOCH,
             updated_at: SystemTime::UNIX_EPOCH,
         }
@@ -22210,6 +24009,20 @@ spec:
                 signature: Some(fleet_domain::TaskSignature::new("sig").unwrap()),
             })
             .unwrap();
+    }
+
+    #[cfg(feature = "postgres")]
+    fn sqlite_test_store(store: &ControllerStore) -> &SqliteStore {
+        match store {
+            ControllerStore::Sqlite(store) => store,
+            ControllerStore::Postgres(_) => panic!("test state uses SQLite"),
+        }
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    fn sqlite_test_store(store: &ControllerStore) -> &SqliteStore {
+        let ControllerStore::Sqlite(store) = store;
+        store
     }
 
     fn write_test_tls_material(dir: &Path) -> (PathBuf, PathBuf) {

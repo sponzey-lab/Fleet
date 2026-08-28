@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-BIN="${1:-target/release/sponzey}"
+BIN="${1:-target/release/fleet}"
 MAX_GLIBC="${SPONZEY_MAX_GLIBC:-2.35}"
 
 if [ "$(uname -s)" != "Linux" ]; then
