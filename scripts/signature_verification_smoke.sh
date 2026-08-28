@@ -15,7 +15,7 @@ if ! command -v openssl >/dev/null 2>&1; then
   exit 1
 fi
 
-printf '%s\n' "d41d8cd98f00b204e9800998ecf8427e  sponzey-linux-x64.tar.gz" > "$ARTIFACT_DIR/SHA256SUMS"
+printf '%s\n' "d41d8cd98f00b204e9800998ecf8427e  fleet-linux-x64.tar.gz" > "$ARTIFACT_DIR/SHA256SUMS"
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$PRIVATE_KEY" >/dev/null 2>&1
 openssl pkey -in "$PRIVATE_KEY" -pubout -out "$PUBLIC_KEY" >/dev/null 2>&1
 

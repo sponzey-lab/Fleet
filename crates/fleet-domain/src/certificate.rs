@@ -813,12 +813,7 @@ mod tests {
 
         assert_eq!(restored.snapshot(), snapshot);
         let debug = format!("{snapshot:?}");
-        for forbidden in [
-            "PRIVATE KEY",
-            "BEGIN CERTIFICATE",
-            "/etc/sponzey",
-            "CA_PATH",
-        ] {
+        for forbidden in ["PRIVATE KEY", "BEGIN CERTIFICATE", "/etc/fleet", "CA_PATH"] {
             assert!(
                 !debug.contains(forbidden),
                 "certificate lifecycle snapshot must not expose {forbidden}"

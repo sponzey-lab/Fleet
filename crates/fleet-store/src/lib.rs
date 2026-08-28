@@ -12680,9 +12680,9 @@ mod tests {
 
     #[cfg(feature = "postgres")]
     #[test]
-    #[ignore = "requires explicit SPONZEY_TEST_POSTGRES_URL and a disposable Postgres database"]
+    #[ignore = "requires explicit FLEET_TEST_POSTGRES_URL and a disposable Postgres database"]
     fn postgres_migration_records_current_schema_version() {
-        let Ok(url) = std::env::var("SPONZEY_TEST_POSTGRES_URL") else {
+        let Ok(url) = std::env::var("FLEET_TEST_POSTGRES_URL") else {
             return;
         };
         let mut store = PostgresStore::connect(&url).unwrap();
@@ -12697,9 +12697,9 @@ mod tests {
 
     #[cfg(feature = "postgres")]
     #[test]
-    #[ignore = "requires explicit SPONZEY_TEST_POSTGRES_URL and a disposable Postgres database"]
+    #[ignore = "requires explicit FLEET_TEST_POSTGRES_URL and a disposable Postgres database"]
     fn postgres_bootstrap_repositories_roundtrip() {
-        let Ok(url) = std::env::var("SPONZEY_TEST_POSTGRES_URL") else {
+        let Ok(url) = std::env::var("FLEET_TEST_POSTGRES_URL") else {
             return;
         };
         let mut store = PostgresStore::connect(&url).unwrap();
@@ -12733,9 +12733,9 @@ mod tests {
 
     #[cfg(feature = "postgres")]
     #[test]
-    #[ignore = "requires explicit SPONZEY_TEST_POSTGRES_URL and a disposable Postgres database"]
+    #[ignore = "requires explicit FLEET_TEST_POSTGRES_URL and a disposable Postgres database"]
     fn postgres_enrollment_token_repository_roundtrip() {
-        let Ok(url) = std::env::var("SPONZEY_TEST_POSTGRES_URL") else {
+        let Ok(url) = std::env::var("FLEET_TEST_POSTGRES_URL") else {
             return;
         };
         let mut store = PostgresStore::connect(&url).unwrap();
@@ -12753,9 +12753,9 @@ mod tests {
 
     #[cfg(feature = "postgres")]
     #[test]
-    #[ignore = "requires explicit SPONZEY_TEST_POSTGRES_URL and a disposable Postgres database"]
+    #[ignore = "requires explicit FLEET_TEST_POSTGRES_URL and a disposable Postgres database"]
     fn postgres_audit_repository_roundtrip() {
-        let Ok(url) = std::env::var("SPONZEY_TEST_POSTGRES_URL") else {
+        let Ok(url) = std::env::var("FLEET_TEST_POSTGRES_URL") else {
             return;
         };
         let mut store = PostgresStore::connect(&url).unwrap();
@@ -12773,9 +12773,9 @@ mod tests {
 
     #[cfg(feature = "postgres")]
     #[test]
-    #[ignore = "requires explicit SPONZEY_TEST_POSTGRES_URL and a disposable Postgres database"]
+    #[ignore = "requires explicit FLEET_TEST_POSTGRES_URL and a disposable Postgres database"]
     fn postgres_approval_repository_roundtrip() {
-        let Ok(url) = std::env::var("SPONZEY_TEST_POSTGRES_URL") else {
+        let Ok(url) = std::env::var("FLEET_TEST_POSTGRES_URL") else {
             return;
         };
         let mut store = PostgresStore::connect(&url).unwrap();
@@ -12795,9 +12795,9 @@ mod tests {
 
     #[cfg(feature = "postgres")]
     #[test]
-    #[ignore = "requires explicit SPONZEY_TEST_POSTGRES_URL and a disposable Postgres database"]
+    #[ignore = "requires explicit FLEET_TEST_POSTGRES_URL and a disposable Postgres database"]
     fn postgres_job_assignment_repository_roundtrip() {
-        let Ok(url) = std::env::var("SPONZEY_TEST_POSTGRES_URL") else {
+        let Ok(url) = std::env::var("FLEET_TEST_POSTGRES_URL") else {
             return;
         };
         let mut store = PostgresStore::connect(&url).unwrap();
@@ -12823,9 +12823,9 @@ mod tests {
 
     #[cfg(feature = "postgres")]
     #[test]
-    #[ignore = "requires explicit SPONZEY_TEST_POSTGRES_URL and a disposable Postgres database"]
+    #[ignore = "requires explicit FLEET_TEST_POSTGRES_URL and a disposable Postgres database"]
     fn postgres_typed_job_repository_roundtrip() {
-        let Ok(url) = std::env::var("SPONZEY_TEST_POSTGRES_URL") else {
+        let Ok(url) = std::env::var("FLEET_TEST_POSTGRES_URL") else {
             return;
         };
         let mut store = PostgresStore::connect(&url).unwrap();
@@ -12863,9 +12863,9 @@ mod tests {
 
     #[cfg(feature = "postgres")]
     #[test]
-    #[ignore = "requires explicit SPONZEY_TEST_POSTGRES_URL and a disposable Postgres database"]
+    #[ignore = "requires explicit FLEET_TEST_POSTGRES_URL and a disposable Postgres database"]
     fn postgres_dispatch_assignment_repository_roundtrip() {
-        let Ok(url) = std::env::var("SPONZEY_TEST_POSTGRES_URL") else {
+        let Ok(url) = std::env::var("FLEET_TEST_POSTGRES_URL") else {
             return;
         };
         let mut store = PostgresStore::connect(&url).unwrap();
@@ -12909,9 +12909,9 @@ mod tests {
 
     #[cfg(feature = "postgres")]
     #[test]
-    #[ignore = "requires explicit SPONZEY_TEST_POSTGRES_URL and a disposable Postgres database"]
+    #[ignore = "requires explicit FLEET_TEST_POSTGRES_URL and a disposable Postgres database"]
     fn postgres_output_telemetry_repository_roundtrip() {
-        let Ok(url) = std::env::var("SPONZEY_TEST_POSTGRES_URL") else {
+        let Ok(url) = std::env::var("FLEET_TEST_POSTGRES_URL") else {
             return;
         };
         let mut store = PostgresStore::connect(&url).unwrap();
@@ -12945,9 +12945,9 @@ mod tests {
 
     #[cfg(feature = "postgres")]
     #[test]
-    #[ignore = "requires explicit SPONZEY_TEST_POSTGRES_URL and a disposable Postgres database"]
+    #[ignore = "requires explicit FLEET_TEST_POSTGRES_URL and a disposable Postgres database"]
     fn postgres_drift_policy_capability_repository_roundtrip() {
-        let Ok(url) = std::env::var("SPONZEY_TEST_POSTGRES_URL") else {
+        let Ok(url) = std::env::var("FLEET_TEST_POSTGRES_URL") else {
             return;
         };
         let mut store = PostgresStore::connect(&url).unwrap();
@@ -12969,9 +12969,9 @@ mod tests {
 
     #[cfg(feature = "postgres")]
     #[test]
-    #[ignore = "requires explicit SPONZEY_TEST_POSTGRES_URL and a disposable Postgres database"]
+    #[ignore = "requires explicit FLEET_TEST_POSTGRES_URL and a disposable Postgres database"]
     fn postgres_query_artifact_retention_repository_roundtrip() {
-        let Ok(url) = std::env::var("SPONZEY_TEST_POSTGRES_URL") else {
+        let Ok(url) = std::env::var("FLEET_TEST_POSTGRES_URL") else {
             return;
         };
         let mut store = PostgresStore::connect(&url).unwrap();
@@ -13013,9 +13013,9 @@ mod tests {
 
     #[cfg(feature = "postgres")]
     #[test]
-    #[ignore = "requires explicit SPONZEY_TEST_POSTGRES_URL and a disposable Postgres database"]
+    #[ignore = "requires explicit FLEET_TEST_POSTGRES_URL and a disposable Postgres database"]
     fn postgres_remediation_request_repository_roundtrip() {
-        let Ok(url) = std::env::var("SPONZEY_TEST_POSTGRES_URL") else {
+        let Ok(url) = std::env::var("FLEET_TEST_POSTGRES_URL") else {
             return;
         };
         let mut store = PostgresStore::connect(&url).unwrap();
@@ -13080,7 +13080,7 @@ mod tests {
             ControllerIdentityMetadata {
                 public_key: "controller-pk".to_owned(),
                 public_fingerprint: "controller-fp".to_owned(),
-                private_key_path: "/var/lib/sponzey/controller_private.key".to_owned(),
+                private_key_path: "/var/lib/fleet/controller_private.key".to_owned(),
                 created_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1),
             },
         )
@@ -13362,7 +13362,7 @@ mod tests {
             ControllerIdentityMetadata {
                 public_key: "controller-pk".to_owned(),
                 public_fingerprint: "controller-fp".to_owned(),
-                private_key_path: "/var/lib/sponzey/controller_private.key".to_owned(),
+                private_key_path: "/var/lib/fleet/controller_private.key".to_owned(),
                 created_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1),
             },
         )
@@ -14682,7 +14682,7 @@ mod tests {
             JobId::new("job-query-artifact-retention-contract").unwrap(),
             AgentId::new("a1").unwrap(),
             TaskId::new("task-query-artifact-retention-contract").unwrap(),
-            "/etc/sponzey/rendered.conf",
+            "/etc/fleet/rendered.conf",
             ArtifactChecksum::sha256(
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             )
@@ -16227,7 +16227,7 @@ mod tests {
             "BEGIN CERTIFICATE",
             "certificate_body",
             "private_key",
-            "/etc/sponzey",
+            "/etc/fleet",
             "CA_PATH",
             "websocket_handle",
         ] {
@@ -17272,7 +17272,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("sponzey-{name}-{}-{unique}", std::process::id()))
+        std::env::temp_dir().join(format!("fleet-{name}-{}-{unique}", std::process::id()))
     }
 
     fn test_artifact_checksum(bytes: &[u8]) -> ArtifactChecksum {

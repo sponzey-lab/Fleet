@@ -50,39 +50,37 @@ TOKEN=$(./target/debug/fleet enroll-token create --data-dir .fleet --labels role
 ./scripts/run_agent.sh --data-dir .fleet
 ```
 
-## Migration from `.sponzey` and old systemd units
+## Move existing data to `/var/lib/fleet`
 
 New installations use `.fleet` locally, `/var/lib/fleet` for services, and
-`fleet-controller.service` / `fleet-agent.service`. The `fleet` binary can read
-an existing `.sponzey` data directory for backup, but it never moves or deletes
-that directory automatically. Do this migration during a maintenance window.
+`fleet-controller.service` / `fleet-agent.service`. `fleet` never moves or
+deletes an existing data directory automatically. Perform a data-directory move
+during a maintenance window, using the actual previous directory as
+`OLD_DATA_DIR`.
 
-1. Stop both old units and confirm they are inactive:
+1. Stop the services that use the previous directory and confirm they are
+   inactive.
 
-   ```bash
-   sudo systemctl stop sponzey-fleet-agent.service sponzey-fleet-controller.service
-   sudo systemctl is-active sponzey-fleet-agent.service sponzey-fleet-controller.service
-   ```
-
-2. Create and retain a controller backup from the old directory. Do not place
-   the archive inside either data directory.
+2. Create and retain a controller backup from that directory. Do not place the
+   archive inside either data directory.
 
    ```bash
-   fleet controller backup --data-dir /var/lib/sponzey-fleet \
+   OLD_DATA_DIR=/absolute/path/to/previous-fleet-data
+   fleet controller backup --data-dir "$OLD_DATA_DIR" \
      --output ./fleet-before-path-migration.backup.json
    ```
 
 3. Refuse to continue if the destination already contains data. Copy ownership,
-   permissions, and contents; do not use a move command or delete the source.
+   permissions, and contents; do not move or delete the source.
 
    ```bash
    sudo test ! -e /var/lib/fleet || sudo test -z "$(sudo find /var/lib/fleet -mindepth 1 -print -quit)"
    sudo install -d -m 700 /var/lib/fleet
-   sudo cp -a /var/lib/sponzey-fleet/. /var/lib/fleet/
-   sudo diff -qr /var/lib/sponzey-fleet /var/lib/fleet
+   sudo cp -a "$OLD_DATA_DIR"/. /var/lib/fleet/
+   sudo diff -qr "$OLD_DATA_DIR" /var/lib/fleet
    ```
 
-4. Validate the copied controller data before installing the new units:
+4. Validate the copied controller data before installing or restarting services:
 
    ```bash
    fleet controller backup --data-dir /var/lib/fleet \
@@ -91,26 +89,10 @@ that directory automatically. Do this migration during a maintenance window.
      --input ./fleet-after-path-migration.backup.json --dry-run
    ```
 
-5. Render and inspect the new units, then install and health-check them. Only
-   after the checks pass may you disable and remove the old units.
-
-   ```bash
-   sudo fleet controller install-service --data-dir /var/lib/fleet
-   sudo fleet agent install-service --data-dir /var/lib/fleet
-   sudo fleet controller start-service
-   sudo fleet agent start-service
-   sudo fleet controller status-service
-   sudo fleet agent status-service
-   sudo systemctl disable --now sponzey-fleet-agent.service sponzey-fleet-controller.service
-   sudo rm -f /etc/systemd/system/sponzey-fleet-agent.service /etc/systemd/system/sponzey-fleet-controller.service
-   sudo systemctl daemon-reload
-   ```
-
-If a copy check, restore dry-run, or health check fails, stop the new units,
-restore the old units, and start them against `/var/lib/sponzey-fleet`. Keep the
-old data and backup until the new services have operated successfully. CLI
-profiles are intentionally not copied: run `fleet login` again to create a new
-owner-only `.fleet/cli-profile.json`.
+5. Render and inspect the Fleet service units, then install and health-check
+   them. Keep the source directory and backup until the new services have
+   operated successfully. CLI profiles are intentionally not copied: run
+   `fleet login` again to create a new owner-only `.fleet/cli-profile.json`.
 
 ## Required Service Properties
 
@@ -230,7 +212,7 @@ The supported upgrade path is:
 3. Download an npm package update or standalone release archive.
 4. Verify release artifact integrity with `SHA256SUMS` and, when published,
    `SHA256SUMS.sig`.
-5. Replace the `sponzey` binary through the chosen package/artifact mechanism.
+5. Replace the `fleet` binary through the chosen package/artifact mechanism.
 6. Start services and verify with `status-service` and `/healthz`.
 
 If upgrade fails before controller storage migration, restore the previous
@@ -266,10 +248,10 @@ variables.
 GitHub release artifacts use this naming rule:
 
 ```text
-sponzey-darwin-arm64.tar.gz
-sponzey-darwin-x64.tar.gz
-sponzey-linux-arm64.tar.gz
-sponzey-linux-x64.tar.gz
+fleet-darwin-arm64.tar.gz
+fleet-darwin-x64.tar.gz
+fleet-linux-arm64.tar.gz
+fleet-linux-x64.tar.gz
 ```
 
 The release workflow also uploads `SHA256SUMS`. Verify downloaded artifacts:
@@ -283,7 +265,7 @@ The verification script checks:
 - each artifact listed in `SHA256SUMS` exists,
 - the SHA-256 digest matches,
 - the archive extracts successfully,
-- an executable `sponzey` binary is present.
+- an executable `fleet` binary is present.
 
 Release checksum signatures cover the `SHA256SUMS` manifest. When
 `SHA256SUMS.sig` is published, verify it with the pinned release public key from
@@ -311,7 +293,7 @@ Requirements:
 - Linux host
 - root privileges
 - systemd
-- built `sponzey` binary or `SPONZEY_BIN` pointing to an absolute binary
+- built `fleet` binary or `FLEET_BIN` pointing to an absolute binary
 
 Run before reboot:
 
@@ -329,7 +311,7 @@ sudo ./scripts/manual_systemd_reboot_smoke.sh verify
 sudo ./scripts/release_readiness_gate.sh --verify-manual-reboot
 ```
 
-The script checks that both `sponzey-fleet-controller.service` and `sponzey-fleet-agent.service` are enabled and active.
+The script checks that both `fleet-controller.service` and `fleet-agent.service` are enabled and active.
 
 ## Manual npm Registry Smoke
 
@@ -337,13 +319,13 @@ After publishing `@sponzey/fleet` and its platform packages to the npm registry:
 
 ```bash
 ./scripts/npm_publish_current_platform.sh --dry-run
-SPONZEY_NPM_TOKEN_FILE=token.md ./scripts/npm_publish_current_platform.sh
+FLEET_NPM_TOKEN_FILE=token.md ./scripts/npm_publish_current_platform.sh
 ./scripts/manual_npm_registry_smoke.sh
 # or run it through the release gate
 ./scripts/release_readiness_gate.sh --include-registry
 ```
 
-The script installs into a temporary npm prefix and verifies that `sponzey --help` runs through the installed wrapper.
+The script installs into a temporary npm prefix and verifies that `fleet --help` runs through the installed wrapper.
 
 For full multi-platform npm publish, use the GitHub Actions workflow in
 `.github/workflows/npm-release.yml`. Configure npm Trusted Publisher for the

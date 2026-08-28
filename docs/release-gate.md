@@ -179,4 +179,4 @@ signature smoke가 포함되어야 한다. 해당 smoke가 빠지면 release 후
 - HTTP smoke는 test-only warning이 유지되는지 확인해야 한다.
 - HTTPS smoke는 production path가 문서상 존재함을 확인해야 한다.
 - Web Admin smoke는 API schema와 UI client가 어긋나지 않게 해야 한다.
-- registry smoke는 사용자 설치 경로에서 `sponzey --help`가 실행되는지 확인해야 한다.
+- registry smoke는 사용자 설치 경로에서 `fleet --help`가 실행되는지 확인해야 한다.

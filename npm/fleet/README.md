@@ -53,7 +53,7 @@ Registry publish for the current OS/architecture:
 
 ```sh
 ./scripts/npm_publish_current_platform.sh --dry-run
-SPONZEY_NPM_TOKEN_FILE=token.md ./scripts/npm_publish_current_platform.sh
+FLEET_NPM_TOKEN_FILE=token.md ./scripts/npm_publish_current_platform.sh
 ./scripts/manual_npm_registry_smoke.sh
 ```
 

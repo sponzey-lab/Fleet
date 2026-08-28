@@ -3,7 +3,7 @@ set -eu
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 REPO_ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)"
-WORK_DIR="${TMPDIR:-/tmp}/sponzey-fleet-npm-publish-$$"
+WORK_DIR="${TMPDIR:-/tmp}/fleet-npm-publish-$$"
 DRY_RUN=0
 TAG="${NPM_PUBLISH_TAG:-latest}"
 
@@ -16,7 +16,7 @@ Publishes the current OS/architecture package first, then publishes @sponzey/fle
 Authentication:
   - use an existing npm login, or
   - set NPM_TOKEN, or
-  - set SPONZEY_NPM_TOKEN_FILE to a file containing either a raw token or NPM_TOKEN=<token>.
+  - set FLEET_NPM_TOKEN_FILE to a file containing either a raw token or NPM_TOKEN=<token>.
 
 2FA:
   - set NPM_CONFIG_OTP when npm requires a one-time password.
@@ -24,7 +24,7 @@ Authentication:
 Examples:
   $0 --dry-run
   NPM_TOKEN=... $0
-  SPONZEY_NPM_TOKEN_FILE=token.md $0
+  FLEET_NPM_TOKEN_FILE=token.md $0
   NPM_CONFIG_OTP=123456 $0
 EOF
 }
@@ -102,34 +102,34 @@ if [ -n "${NPM_TOKEN:-}" ]; then
   printf '//registry.npmjs.org/:_authToken=%s\n' "$NPM_TOKEN" > "$NPMRC"
   chmod 600 "$NPMRC"
   export NPM_CONFIG_USERCONFIG="$NPMRC"
-elif [ -n "${SPONZEY_NPM_TOKEN_FILE:-}" ]; then
-  if [ ! -f "$SPONZEY_NPM_TOKEN_FILE" ]; then
-    echo "SPONZEY_NPM_TOKEN_FILE does not exist: $SPONZEY_NPM_TOKEN_FILE" >&2
+elif [ -n "${FLEET_NPM_TOKEN_FILE:-}" ]; then
+  if [ ! -f "$FLEET_NPM_TOKEN_FILE" ]; then
+    echo "FLEET_NPM_TOKEN_FILE does not exist: $FLEET_NPM_TOKEN_FILE" >&2
     exit 1
   fi
   TOKEN="$(
     sed -n \
       -e 's/^[[:space:]]*NPM_TOKEN[[:space:]]*=[[:space:]]*//p' \
       -e 's/^.*_authToken[[:space:]]*=[[:space:]]*//p' \
-      "$SPONZEY_NPM_TOKEN_FILE" \
+      "$FLEET_NPM_TOKEN_FILE" \
       | sed -n '/^$/!{/^#/!p;}' \
       | head -n 1
   )"
   if [ -z "$TOKEN" ]; then
     TOKEN="$(
-      sed -n 's/^.*\(npm_[A-Za-z0-9_=-][A-Za-z0-9_=-]*\).*$/\1/p' "$SPONZEY_NPM_TOKEN_FILE" \
+      sed -n 's/^.*\(npm_[A-Za-z0-9_=-][A-Za-z0-9_=-]*\).*$/\1/p' "$FLEET_NPM_TOKEN_FILE" \
         | head -n 1
     )"
   fi
   if [ -z "$TOKEN" ]; then
     TOKEN="$(
-      sed -n 's/^[[:space:]]*//p' "$SPONZEY_NPM_TOKEN_FILE" \
+      sed -n 's/^[[:space:]]*//p' "$FLEET_NPM_TOKEN_FILE" \
         | sed -n '/^$/!{/^#/!{/^```/!p;};}' \
         | head -n 1
     )"
   fi
   if [ -z "$TOKEN" ]; then
-    echo "SPONZEY_NPM_TOKEN_FILE did not contain a token" >&2
+    echo "FLEET_NPM_TOKEN_FILE did not contain a token" >&2
     exit 1
   fi
   NPMRC="$WORK_DIR/.npmrc"
@@ -147,7 +147,7 @@ Run one of these before publishing:
 
   npm login
   NPM_TOKEN=<valid-publish-token> $0
-  SPONZEY_NPM_TOKEN_FILE=token.md $0
+  FLEET_NPM_TOKEN_FILE=token.md $0
 
 The token must have publish access to the @sponzey scope. If @sponzey is an npm
 organization, the npm account behind the token must be a member with publish

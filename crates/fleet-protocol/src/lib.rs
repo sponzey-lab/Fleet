@@ -1082,7 +1082,7 @@ mod tests {
                         "not_after_ms": 1710003600000,
                         "private_key": "must-not-enter-model",
                         "certificate_body": "must-not-enter-model",
-                        "ca_path": "/etc/sponzey/ca.pem"
+                        "ca_path": "/etc/fleet/ca.pem"
                     },
                     "next_certificate": null,
                     "grace_until_ms": null,
@@ -1123,7 +1123,7 @@ mod tests {
 
         assert!(reencoded.contains("\"agent_certificate_lifecycle_update\""));
         assert!(!reencoded.contains("must-not-enter-model"));
-        assert!(!reencoded.contains("/etc/sponzey/ca.pem"));
+        assert!(!reencoded.contains("/etc/fleet/ca.pem"));
     }
 
     #[test]

@@ -756,31 +756,31 @@ mod tests {
     fn database_settings_default_to_sqlite_path() {
         let settings = DatabaseSettings::parse_optional(
             None,
-            PathBuf::from("/var/lib/sponzey-fleet/controller/fleet.db"),
+            PathBuf::from("/var/lib/fleet/controller/fleet.db"),
         )
         .expect("default sqlite settings should parse");
 
         assert_eq!(settings.backend_name(), "sqlite");
         assert_eq!(
             settings.sqlite_path(),
-            Some(Path::new("/var/lib/sponzey-fleet/controller/fleet.db"))
+            Some(Path::new("/var/lib/fleet/controller/fleet.db"))
         );
     }
 
     #[test]
     fn artifact_store_settings_default_to_local_controller_artifacts_path() {
-        let settings = ArtifactStoreSettings::default_local(Path::new("/var/lib/sponzey-fleet"))
+        let settings = ArtifactStoreSettings::default_local(Path::new("/var/lib/fleet"))
             .expect("default artifact store settings should parse");
 
         assert_eq!(settings.backend_name(), "local");
         assert_eq!(
             settings.local_root(),
-            Path::new("/var/lib/sponzey-fleet/controller/artifacts")
+            Path::new("/var/lib/fleet/controller/artifacts")
         );
         assert_eq!(
             settings.backend(),
             &ArtifactStoreBackend::Local {
-                root: PathBuf::from("/var/lib/sponzey-fleet/controller/artifacts")
+                root: PathBuf::from("/var/lib/fleet/controller/artifacts")
             }
         );
     }
@@ -860,14 +860,14 @@ mod tests {
     #[test]
     fn database_settings_parse_sqlite_url() {
         let settings = DatabaseSettings::parse_optional(
-            Some("sqlite:///tmp/sponzey-fleet.db"),
+            Some("sqlite:///tmp/fleet.db"),
             PathBuf::from("/ignored/default.db"),
         )
         .expect("sqlite URL should parse");
 
         assert_eq!(
             settings,
-            DatabaseSettings::sqlite(PathBuf::from("/tmp/sponzey-fleet.db")).unwrap()
+            DatabaseSettings::sqlite(PathBuf::from("/tmp/fleet.db")).unwrap()
         );
     }
 
@@ -996,24 +996,24 @@ mod tests {
     #[test]
     fn trust_settings_keep_tls_and_signing_identities_distinct() {
         let settings = ControllerTrustSettings::from_parts(
-            Some(PathBuf::from("/etc/sponzey/tls/server.crt")),
-            Some(PathBuf::from("/etc/sponzey/tls/server.key")),
-            PathBuf::from("/var/lib/sponzey/controller/controller_public.key"),
-            PathBuf::from("/var/lib/sponzey/controller/controller_private.key"),
+            Some(PathBuf::from("/etc/fleet/tls/server.crt")),
+            Some(PathBuf::from("/etc/fleet/tls/server.key")),
+            PathBuf::from("/var/lib/fleet/controller/controller_public.key"),
+            PathBuf::from("/var/lib/fleet/controller/controller_private.key"),
             AgentClientCertificateTrust::disabled(),
         )
         .expect("separate trust settings should parse");
 
         let tls = settings.tls_server().expect("tls settings expected");
-        assert_eq!(tls.cert_path(), Path::new("/etc/sponzey/tls/server.crt"));
-        assert_eq!(tls.key_path(), Path::new("/etc/sponzey/tls/server.key"));
+        assert_eq!(tls.cert_path(), Path::new("/etc/fleet/tls/server.crt"));
+        assert_eq!(tls.key_path(), Path::new("/etc/fleet/tls/server.key"));
         assert_eq!(
             settings.controller_signing().public_key_path(),
-            Path::new("/var/lib/sponzey/controller/controller_public.key")
+            Path::new("/var/lib/fleet/controller/controller_public.key")
         );
         assert_eq!(
             settings.controller_signing().private_key_path(),
-            Path::new("/var/lib/sponzey/controller/controller_private.key")
+            Path::new("/var/lib/fleet/controller/controller_private.key")
         );
         assert_eq!(
             settings.agent_client_certificate(),
@@ -1024,10 +1024,10 @@ mod tests {
     #[test]
     fn trust_settings_reject_missing_tls_key_pair_without_path_leak() {
         let error = ControllerTrustSettings::from_parts(
-            Some(PathBuf::from("/etc/sponzey/secret-server.crt")),
+            Some(PathBuf::from("/etc/fleet/secret-server.crt")),
             None,
-            PathBuf::from("/var/lib/sponzey/controller/controller_public.key"),
-            PathBuf::from("/var/lib/sponzey/controller/controller_private.key"),
+            PathBuf::from("/var/lib/fleet/controller/controller_public.key"),
+            PathBuf::from("/var/lib/fleet/controller/controller_private.key"),
             AgentClientCertificateTrust::disabled(),
         )
         .expect_err("partial TLS identity should fail");
@@ -1044,10 +1044,10 @@ mod tests {
     #[test]
     fn trust_settings_reject_tls_private_key_reused_as_signing_private_key() {
         let error = ControllerTrustSettings::from_parts(
-            Some(PathBuf::from("/etc/sponzey/tls/server.crt")),
-            Some(PathBuf::from("/etc/sponzey/shared-private.key")),
-            PathBuf::from("/var/lib/sponzey/controller/controller_public.key"),
-            PathBuf::from("/etc/sponzey/shared-private.key"),
+            Some(PathBuf::from("/etc/fleet/tls/server.crt")),
+            Some(PathBuf::from("/etc/fleet/shared-private.key")),
+            PathBuf::from("/var/lib/fleet/controller/controller_public.key"),
+            PathBuf::from("/etc/fleet/shared-private.key"),
             AgentClientCertificateTrust::disabled(),
         )
         .expect_err("TLS key reuse for signing should fail");
@@ -1065,10 +1065,10 @@ mod tests {
     #[test]
     fn trust_settings_do_not_derive_controller_signing_from_tls_fingerprint() {
         let settings = ControllerTrustSettings::from_parts(
-            Some(PathBuf::from("/etc/sponzey/tls/server.crt")),
-            Some(PathBuf::from("/etc/sponzey/tls/server.key")),
-            PathBuf::from("/var/lib/sponzey/controller/controller_public.key"),
-            PathBuf::from("/var/lib/sponzey/controller/controller_private.key"),
+            Some(PathBuf::from("/etc/fleet/tls/server.crt")),
+            Some(PathBuf::from("/etc/fleet/tls/server.key")),
+            PathBuf::from("/var/lib/fleet/controller/controller_public.key"),
+            PathBuf::from("/var/lib/fleet/controller/controller_private.key"),
             AgentClientCertificateTrust::disabled(),
         )
         .expect("separate identity settings should parse");

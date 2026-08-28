@@ -48,7 +48,7 @@ coverage/
 *.sqlite
 *.sqlite3
 fleet.db
-.sponzey/
+.fleet/
 logs/
 artifacts/
 

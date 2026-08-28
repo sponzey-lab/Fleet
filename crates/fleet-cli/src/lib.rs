@@ -1735,7 +1735,7 @@ fn controller_signing_staged_trust_bundle_request_body(
     .to_string()
 }
 
-const CONTROLLER_BACKUP_FORMAT: &str = "sponzey-controller-backup";
+const CONTROLLER_BACKUP_FORMAT: &str = "fleet-controller-backup";
 const CONTROLLER_BACKUP_FORMAT_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -7821,7 +7821,7 @@ mod tests {
             "controller",
             "start",
             "--db",
-            "sqlite:///tmp/sponzey-fleet.db",
+            "sqlite:///tmp/fleet.db",
         ])
         .expect("valid command");
 
@@ -7832,15 +7832,12 @@ mod tests {
             panic!("expected controller start command");
         };
 
-        assert_eq!(db.as_deref(), Some("sqlite:///tmp/sponzey-fleet.db"));
+        assert_eq!(db.as_deref(), Some("sqlite:///tmp/fleet.db"));
         let settings =
             parse_controller_database_settings(db.as_deref(), Path::new("/ignored/data-dir"))
                 .unwrap();
         assert_eq!(settings.backend_name(), "sqlite");
-        assert_eq!(
-            settings.sqlite_path(),
-            Some(Path::new("/tmp/sponzey-fleet.db"))
-        );
+        assert_eq!(settings.sqlite_path(), Some(Path::new("/tmp/fleet.db")));
     }
 
     #[test]
@@ -7854,7 +7851,7 @@ selector: role=web
 steps:
   - id: write-token
     file.template:
-      dest: /tmp/sponzey-secret.conf
+      dest: /tmp/fleet-secret.conf
       content: "token={{ api_token }}"
       secretRefs: api_token=secret://app/disabled-token
 "#,
@@ -7946,7 +7943,7 @@ selector: role=web
 steps:
   - id: write-token
     file.template:
-      dest: /tmp/sponzey-secret.conf
+      dest: /tmp/fleet-secret.conf
       content: "token={{ api_token }}"
       secretRefs: api_token=secret://app/apply-token
 "#,
@@ -10756,7 +10753,7 @@ steps:
             "logs",
             "web-01",
             "--file",
-            "/definitely/missing/sponzey.log",
+            "/definitely/missing/fleet.log",
         ])
         .unwrap();
 
@@ -12241,7 +12238,7 @@ steps:
         fs::create_dir_all(&dir).unwrap();
         write_secure_file(
             &dir.join("agent.conf"),
-            "url=https://127.0.0.1:7700\ntls_ca_cert=/tmp/sponzey-ca.pem\nagent_id=agent-web-01\nfingerprint=fp-1\ncontroller_fingerprint=controller-fp-1\n",
+            "url=https://127.0.0.1:7700\ntls_ca_cert=/tmp/fleet-ca.pem\nagent_id=agent-web-01\nfingerprint=fp-1\ncontroller_fingerprint=controller-fp-1\n",
         )
         .unwrap();
         write_secure_file(&dir.join("agent_private.key"), "private-key-1\n").unwrap();
@@ -12250,7 +12247,7 @@ steps:
 
         assert_eq!(
             config.tls_ca_cert.as_deref(),
-            Some(Path::new("/tmp/sponzey-ca.pem"))
+            Some(Path::new("/tmp/fleet-ca.pem"))
         );
     }
 
@@ -12400,7 +12397,7 @@ steps:
 
     fn unique_test_dir(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
-            "sponzey-{name}-{}-{}",
+            "fleet-{name}-{}-{}",
             std::process::id(),
             epoch_millis()
         ))

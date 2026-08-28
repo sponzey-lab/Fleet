@@ -258,7 +258,7 @@ Example:
 steps:
   - id: nginx-template
     file.template:
-      dest: /etc/nginx/conf.d/sponzey.conf
+      dest: /etc/nginx/conf.d/fleet.conf
       content: server { listen {{ port }}; server_name {{ host }}; }
       mode: "0644"
       variables: port=8080,host=example.test
@@ -337,7 +337,7 @@ Every primitive step result follows this common shape:
   "exit_code": null,
   "stdout": "",
   "stderr": "",
-  "audit_metadata": "primitive=file.copy,destination=/etc/nginx/conf.d/sponzey.conf,changed=true,bytes=42"
+  "audit_metadata": "primitive=file.copy,destination=/etc/nginx/conf.d/fleet.conf,changed=true,bytes=42"
 }
 ```
 

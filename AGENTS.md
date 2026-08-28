@@ -43,7 +43,7 @@ artifact, audit를 다룬다. 따라서 다음 위험은 일반 기능 편의보
 작업 시작 시 manifest와 source로 다시 확인하되, 이 규칙을 정리한 시점의 기준선은
 다음과 같다.
 
-- Rust 2024 edition workspace이며 제품 binary는 `fleet-cli`가 만드는 `sponzey` 하나다.
+- Rust 2024 edition workspace이며 제품 binary는 `fleet-cli`가 만드는 `fleet` 하나다.
 - `fleet-domain`은 project dependency와 external dependency가 없는 순수 Rust crate다.
 - `fleet-application`은 domain port와 use case를 소유한다.
 - `fleet-protocol`은 Serde JSON wire DTO와 protocol version boundary를 소유한다.
@@ -156,7 +156,7 @@ fleet-cli          -> composition root and the only shipped binary
 - `fleet-controller` 또는 `fleet-cli`의 내부 DTO를 protocol source of truth로 사용하지
   않는다.
 - `fleet-controller`와 `fleet-agent`에 `main.rs`를 만들지 않는다. binary와 service unit,
-  npm wrapper, release archive는 모두 resolved `sponzey` binary를 사용한다.
+  npm wrapper, release archive는 모두 resolved `fleet` binary를 사용한다.
 - `fleet-cli`가 현재 agent runtime을 포함한다는 사실은 migration 대상이지 새 domain
   rule을 계속 넣을 허가가 아니다. agent-specific runtime을 `fleet-agent`로 옮길 때는
   behavior test를 먼저 고정하고 작은 이동을 별도 tidy 단위로 수행한다.
@@ -333,7 +333,7 @@ Source 추가·삭제·이동 또는 책임·계층·state owner·중요 side ef
   singleton과 runtime config patch endpoint를 금지한다.
 - `std::env::consts`, `temp_dir`, `current_exe` 같은 platform/process 정보는 설정 재조회가
   아니지만, 이 값으로 domain policy를 숨기지 않는다.
-- ignored Postgres integration test의 `SPONZEY_TEST_POSTGRES_URL`처럼 외부 integration
+- ignored Postgres integration test의 `FLEET_TEST_POSTGRES_URL`처럼 외부 integration
   입력이 필요한 경우 test bootstrap에서만 한 번 읽고 production path와 분리한다.
 - child process별 환경이 필요하면 `Command` builder에 명시적으로 전달한다. parent process
   environment를 변경하지 않는다.

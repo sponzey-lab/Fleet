@@ -228,7 +228,7 @@ MVP부터 반드시 들어갈 것:
 ```text
 @sponzey/fleet
   bin:
-    sponzey
+    fleet
   optionalDependencies:
     @sponzey/fleet-darwin-arm64
     @sponzey/fleet-darwin-x64
@@ -249,7 +249,7 @@ fleet agent init --url https://fleet.example.com --token <enrollment-token>
 fleet agent start
 ```
 
-나중에 패키지를 분리할 수는 있지만, 실행 바이너리는 계속 단일 `sponzey`를 기본으로 한다.
+나중에 패키지를 분리할 수는 있지만, 실행 바이너리는 계속 단일 `fleet`를 기본으로 한다.
 
 ```text
 @sponzey/fleet
@@ -281,10 +281,10 @@ web-admin/
 
 배포 원칙:
 
-- Rust workspace는 여러 crate로 나누지만 배포 바이너리는 `sponzey` 하나다.
-- Controller, Agent, CLI 역할은 `fleet controller ...`, `fleet agent ...`, `sponzey ...` subcommand로 선택한다.
+- Rust workspace는 여러 crate로 나누지만 배포 바이너리는 `fleet` 하나다.
+- Controller, Agent, CLI 역할은 `fleet controller ...`, `fleet agent ...`, `fleet ...` subcommand로 선택한다.
 - `web-admin/dist`는 `fleet controller start`가 서빙하는 static asset으로 embed하거나 release artifact로 같이 패키징한다.
-- npm package는 현재 OS/arch에 맞는 `sponzey` Rust binary를 노출한다.
+- npm package는 현재 OS/arch에 맞는 `fleet` Rust binary를 노출한다.
 - npm이 없는 운영 환경은 standalone binary, `.deb`, `.rpm`, Homebrew, Docker를 사용한다.
 
 ### 4.2 npx 체험 모드
@@ -313,11 +313,11 @@ npx @sponzey/fleet demo
 
 ```bash
 npm install -g @sponzey/fleet
-fleet controller init --data-dir ./sponzey-fleet
+fleet controller init --data-dir ./fleet
 fleet controller start \
   --host 127.0.0.1 \
   --port 7700 \
-  --data-dir ./sponzey-fleet \
+  --data-dir ./fleet \
   --external-url http://127.0.0.1:7700
 ```
 
@@ -380,7 +380,7 @@ sudo fleet agent start-service
 npm이 없는 서버를 위해 bootstrap script도 제공한다.
 
 ```bash
-curl -fsSL https://get.sponzey.dev/fleet.sh | sudo bash -s -- \
+curl -fsSL https://get.fleet.dev/fleet.sh | sudo bash -s -- \
   --url https://fleet.example.com \
   --token <token> \
   --labels role=web,env=prod
@@ -679,7 +679,7 @@ spec:
 v0.5 후보:
 
 ```bash
-sponzey import ansible site.yml --output fleet-runbook.yml
+fleet import ansible site.yml --output fleet-runbook.yml
 ```
 
 지원 범위:
@@ -756,7 +756,7 @@ MVP는 “npm으로 controller와 agent를 설치하고, agent가 outbound로 �
 
 - `fleet login`
 - `fleet agents list`
-- `sponzey fleet list`
+- `fleet fleet list`
 - `fleet enroll-token create`
 - `fleet agent install`
 - `fleet run --selector role=web "uptime"`
@@ -772,7 +772,7 @@ MVP는 “npm으로 controller와 agent를 설치하고, agent가 outbound로 �
 | 명령                           | 의미                                      | 실제 내부 동작                                                       |
 | ---------------------------- | --------------------------------------- | -------------------------------------------------------------- |
 | `fleet agent install`      | agent 설치/등록/서비스화를 한 번에 처리               | `agent init` + `agent install-service` + `agent start-service` |
-| `sponzey fleet list`         | fleet 대상 서버 목록 조회                       | `agents list`                                                  |
+| `fleet fleet list`         | fleet 대상 서버 목록 조회                       | `agents list`                                                  |
 | `fleet run "uptime"`       | 기본 selector 전체 또는 현재 context 대상으로 명령 실행 | `run --selector <context> "uptime"`                            |
 | `fleet apply playbook.yml` | YAML runbook 적용                         | `runbook apply playbook.yml`                                   |
 | `fleet facts`              | 현재 context 대상 facts 조회                  | `facts --selector <context>`                                   |
@@ -836,7 +836,7 @@ Phase 002의 핵심 방향:
 
 완료 기준:
 
-- `npm install -g` 후 `sponzey --help` 동작
+- `npm install -g` 후 `fleet --help` 동작
 - `fleet controller start`가 빈 API 서버 실행
 - protocol message type이 Rust type과 문서로 정의됨
 
@@ -1091,7 +1091,7 @@ Rust workspace:
 - `fleet-agent`: `fleet agent`가 사용하는 daemon, task runner, facts/metrics/logs/drift collector library
 - `fleet-runner`: command/package/service/file primitive 실행
 - `fleet-store`: SQLite/Postgres storage abstraction
-- `fleet-cli`: 단일 제품 바이너리 `sponzey`와 subcommand UX
+- `fleet-cli`: 단일 제품 바이너리 `fleet`와 subcommand UX
 
 Controller:
 
@@ -1117,7 +1117,7 @@ Agent:
 CLI:
 
 - clap
-- local config in `~/.sponzey/config.toml`
+- local config in `~/.fleet/config.toml`
 - shell completion
 
 Web Admin UI:

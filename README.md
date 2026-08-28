@@ -3,7 +3,7 @@
 [한국어 설명서](README.ko.md)
 
 Sponzey Fleet lets you manage several computers from one place. You install the
-same `sponzey` program on every machine, then choose what that machine should do:
+same `fleet` program on every machine, then choose what that machine should do:
 
 - The **Controller** is the control center. It stores data, shows the Web Admin
   page, signs jobs, and receives connections from agents.
@@ -14,7 +14,7 @@ One Controller can manage many Agents. The Controller never needs to open an
 incoming connection to an Agent; every Agent connects outward to the Controller.
 
 > The npm package is named `@sponzey/fleet`, but the current command is
-> `sponzey`.
+> `fleet`.
 
 ## What you need
 
@@ -36,18 +36,18 @@ If either command is missing, install a current Node.js LTS release first.
 
 ## Install
 
-Install Sponzey Fleet globally so the `sponzey` command is available in every
+Install Sponzey Fleet globally so the `fleet` command is available in every
 terminal:
 
 ```bash
 npm install -g @sponzey/fleet
-sponzey --version
+fleet --version
 ```
 
 If you install it only inside a project with `npm install @sponzey/fleet`, run it
-as `npx sponzey` instead.
+as `npx fleet` instead.
 
-If the terminal says `sponzey: command not found`, inspect npm's global command
+If the terminal says `fleet: command not found`, inspect npm's global command
 directory:
 
 ```bash
@@ -63,7 +63,7 @@ cargo build -p fleet-cli
 ./target/debug/fleet --version
 ```
 
-When using the source build, replace `sponzey` in the examples below with
+When using the source build, replace `fleet` in the examples below with
 `./target/debug/fleet`.
 
 ## Try the one-command demo
@@ -71,7 +71,7 @@ When using the source build, replace `sponzey` in the examples below with
 Before setting up real machines, run:
 
 ```bash
-sponzey demo
+fleet demo
 ```
 
 The demo creates temporary Controller and Agent data, runs a small job, and
@@ -100,8 +100,8 @@ computer.
 Open the first terminal and run:
 
 ```bash
-mkdir -p sponzey-controller
-fleet controller init --data-dir ./sponzey-controller
+mkdir -p fleet-controller
+fleet controller init --data-dir ./fleet-controller
 ```
 
 The command prints an `admin token`. Copy it into a password manager or another
@@ -118,7 +118,7 @@ In the same terminal, run:
 fleet controller start \
   --host 127.0.0.1 \
   --port 7700 \
-  --data-dir ./sponzey-controller \
+  --data-dir ./fleet-controller \
   --external-url http://127.0.0.1:7700
 ```
 
@@ -145,7 +145,7 @@ Open a second terminal. Run this command while the Controller remains running:
 
 ```bash
 fleet enroll-token create \
-  --data-dir ./sponzey-controller \
+  --data-dir ./fleet-controller \
   --labels role=test,env=local
 ```
 
@@ -158,9 +158,9 @@ In the second terminal, replace `PASTE_ENROLLMENT_TOKEN_HERE` with the token fro
 Step 4, then run:
 
 ```bash
-mkdir -p sponzey-agent
+mkdir -p fleet-agent
 fleet agent init \
-  --data-dir ./sponzey-agent \
+  --data-dir ./fleet-agent \
   --url http://127.0.0.1:7700 \
   --token PASTE_ENROLLMENT_TOKEN_HERE \
   --name my-first-agent \
@@ -175,7 +175,7 @@ It is normally done only once per Agent data directory.
 Run:
 
 ```bash
-fleet agent start --data-dir ./sponzey-agent
+fleet agent start --data-dir ./fleet-agent
 ```
 
 Leave this terminal open too. Refresh Web Admin. `my-first-agent` should appear
@@ -184,7 +184,7 @@ in the Agent list.
 To perform only one connection check and exit, use:
 
 ```bash
-fleet agent start --data-dir ./sponzey-agent --once
+fleet agent start --data-dir ./fleet-agent --once
 ```
 
 The normal Agent keeps reconnecting when the network or Controller is briefly
@@ -219,8 +219,8 @@ You may also find the address in your router or cloud server dashboard.
 On the Controller computer:
 
 ```bash
-mkdir -p sponzey-controller
-fleet controller init --data-dir ./sponzey-controller
+mkdir -p fleet-controller
+fleet controller init --data-dir ./fleet-controller
 ```
 
 Save the printed admin token, then start the Controller:
@@ -229,7 +229,7 @@ Save the printed admin token, then start the Controller:
 fleet controller start \
   --host 0.0.0.0 \
   --port 7700 \
-  --data-dir ./sponzey-controller \
+  --data-dir ./fleet-controller \
   --external-url http://192.168.0.10:7700
 ```
 
@@ -252,7 +252,7 @@ On the Controller computer:
 
 ```bash
 fleet enroll-token create \
-  --data-dir ./sponzey-controller \
+  --data-dir ./fleet-controller \
   --labels role=web,env=test
 ```
 
@@ -265,9 +265,9 @@ On the Agent computer:
 
 ```bash
 npm install -g @sponzey/fleet
-mkdir -p sponzey-agent
+mkdir -p fleet-agent
 fleet agent init \
-  --data-dir ./sponzey-agent \
+  --data-dir ./fleet-agent \
   --url http://192.168.0.10:7700 \
   --token PASTE_ENROLLMENT_TOKEN_HERE \
   --name web-01 \
@@ -277,7 +277,7 @@ fleet agent init \
 Then start it:
 
 ```bash
-fleet agent start --data-dir ./sponzey-agent
+fleet agent start --data-dir ./fleet-agent
 ```
 
 Open `http://192.168.0.10:7700/admin` and confirm that `web-01` is online.
@@ -302,8 +302,8 @@ fleet controller start \
   --port 7700 \
   --data-dir /var/lib/fleet \
   --external-url https://fleet.example.com:7700 \
-  --tls-cert /etc/sponzey/tls/fullchain.pem \
-  --tls-key /etc/sponzey/tls/privkey.pem
+  --tls-cert /etc/fleet/tls/fullchain.pem \
+  --tls-key /etc/fleet/tls/privkey.pem
 ```
 
 The private key should be readable only by the account running the Controller.
@@ -397,9 +397,9 @@ Then commands such as these use that profile:
 
 ```bash
 fleet agents remote-list
-sponzey jobs list
-sponzey approvals list
-sponzey remediations list
+fleet jobs list
+fleet approvals list
+fleet remediations list
 fleet audit export --category security --limit 100
 ```
 
@@ -441,8 +441,8 @@ so SQLite is not being written during the backup.
 
 ```bash
 fleet controller backup \
-  --data-dir ./sponzey-controller \
-  --output ./sponzey-controller.backup.json
+  --data-dir ./fleet-controller \
+  --output ./fleet-controller.backup.json
 ```
 
 The backup contains Controller keys and operational data. Treat it as a secret.
@@ -452,7 +452,7 @@ Validate a backup without writing anything:
 ```bash
 fleet controller restore \
   --data-dir ./restore-check \
-  --input ./sponzey-controller.backup.json \
+  --input ./fleet-controller.backup.json \
   --dry-run
 ```
 
@@ -460,13 +460,13 @@ Restore into an empty data directory:
 
 ```bash
 fleet controller restore \
-  --data-dir ./sponzey-controller-restored \
-  --input ./sponzey-controller.backup.json
+  --data-dir ./fleet-controller-restored \
+  --input ./fleet-controller.backup.json
 ```
 
 ## Common problems
 
-### `sponzey: command not found`
+### `fleet: command not found`
 
 Open a new terminal after global installation. If it still fails, check
 `$(npm prefix -g)/bin` and add that directory to `PATH`.

@@ -18,7 +18,7 @@ HTTP 사용으로 발생하는 token 노출, command 탈취, 데이터 유출, �
 기타 위험이 있을 수 있다.
 
 ```bash
-fleet controller start --host 127.0.0.1 --port 7700 --data-dir .sponzey --external-url http://127.0.0.1:7700
+fleet controller start --host 127.0.0.1 --port 7700 --data-dir .fleet --external-url http://127.0.0.1:7700
 ```
 
 SQLite DB 경로를 명시하려면 bootstrap 시점에 `--db sqlite://...`를 전달한다.
@@ -27,7 +27,7 @@ SQLite DB 경로를 명시하려면 bootstrap 시점에 `--db sqlite://...`를 �
 request handler가 열리기 전에 bootstrap 오류로 실패한다.
 
 ```bash
-fleet controller start --host 127.0.0.1 --port 7700 --data-dir .sponzey --db sqlite:///tmp/sponzey-fleet.db --external-url http://127.0.0.1:7700
+fleet controller start --host 127.0.0.1 --port 7700 --data-dir .fleet --db sqlite:///tmp/fleet.db --external-url http://127.0.0.1:7700
 ```
 
 ## Swagger / OpenAPI 지원 기준
@@ -718,13 +718,13 @@ background scheduler는 별도 hardening task다.
 `fleet controller init`은 최초 실행 시 admin token을 1회 출력한다.
 
 ```bash
-fleet controller init --data-dir .sponzey
+fleet controller init --data-dir .fleet
 ```
 
 출력 예:
 
 ```text
-controller initialized at .sponzey
+controller initialized at .fleet
 controller fingerprint: <sha256-public-key-fingerprint-hex>
 admin token: admin-...
 ```
@@ -1385,13 +1385,13 @@ Read model and validation rules:
 CLI surface:
 
 ```bash
-sponzey remediations list --agent-id agent-web-01 --policy-id nginx-running
-sponzey remediations get remediation-nginx-running-agent-web-01
-sponzey remediations request-approval remediation-nginx-running-agent-web-01 --approval-id approval-remediation-01 --job-id job-remediation-01
-sponzey remediations approve remediation-nginx-running-agent-web-01 --approval-id approval-remediation-01 --job-id job-remediation-01 --runbook runbooks/nginx-remediate.yml
-sponzey remediations running remediation-nginx-running-agent-web-01 --job-id job-remediation-01
-sponzey remediations result remediation-nginx-running-agent-web-01 --job-id job-remediation-01 --status succeeded
-sponzey remediations verify remediation-nginx-running-agent-web-01 --agent-id agent-web-01 --policy-id nginx-running --policy-name nginx-running --job-id job-remediation-01
+fleet remediations list --agent-id agent-web-01 --policy-id nginx-running
+fleet remediations get remediation-nginx-running-agent-web-01
+fleet remediations request-approval remediation-nginx-running-agent-web-01 --approval-id approval-remediation-01 --job-id job-remediation-01
+fleet remediations approve remediation-nginx-running-agent-web-01 --approval-id approval-remediation-01 --job-id job-remediation-01 --runbook runbooks/nginx-remediate.yml
+fleet remediations running remediation-nginx-running-agent-web-01 --job-id job-remediation-01
+fleet remediations result remediation-nginx-running-agent-web-01 --job-id job-remediation-01 --status succeeded
+fleet remediations verify remediation-nginx-running-agent-web-01 --agent-id agent-web-01 --policy-id nginx-running --policy-name nginx-running --job-id job-remediation-01
 ```
 
 CLI와 Web Admin은 persisted remediation lifecycle metadata만 표시한다. Web Admin의 approved runbook YAML 입력은 approve request body로만 사용하고 list/detail/result surface에 다시 렌더링하지 않는다.

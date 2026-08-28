@@ -76,7 +76,7 @@ File checksum check:
 checks:
   - id: rendered-template
     file:
-      path: /etc/nginx/conf.d/sponzey.conf
+      path: /etc/nginx/conf.d/fleet.conf
       sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 ```
 

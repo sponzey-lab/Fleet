@@ -4,17 +4,11 @@ const path = require("path");
 const { spawnSync } = require("child_process");
 
 const bin = path.join(__dirname, "..", "bin", "fleet");
-const legacyBin = path.join(__dirname, "..", "bin", "sponzey");
 const postinstall = path.join(__dirname, "postinstall.js");
 const packageJson = require(path.join(__dirname, "..", "package.json"));
 
 if (!fs.existsSync(bin)) {
   console.error("missing bin/fleet");
-  process.exit(1);
-}
-
-if (fs.existsSync(legacyBin)) {
-  console.error("legacy bin/sponzey executable must not remain after the fleet hard cut");
   process.exit(1);
 }
 
@@ -45,28 +39,8 @@ if (!body.includes("FLEET_BIN")) {
   process.exit(1);
 }
 
-if (body.includes("SPONZEY_FLEET_")) {
-  console.error("bin/fleet must not retain the previous runtime override prefix");
-  process.exit(1);
-}
-
 if (!body.includes("fleet-$PLATFORM_OS-$PLATFORM_ARCH")) {
   console.error("bin/fleet must support platform binary package lookup");
-  process.exit(1);
-}
-
-const legacyOverride = spawnSync(bin, ["--help"], {
-  env: {
-    ...process.env,
-    FLEET_NPM_OS: "plan9",
-    FLEET_NPM_ARCH: "mips",
-    SPONZEY_FLEET_BIN: "/does-not-exist",
-  },
-  encoding: "utf8",
-});
-
-if (legacyOverride.status !== 127 || !legacyOverride.stderr.includes("unsupported platform")) {
-  console.error("previous runtime overrides must not affect bin/fleet");
   process.exit(1);
 }
 
@@ -94,8 +68,8 @@ if (!unsupported.stderr.includes("unsupported platform for @sponzey/fleet")) {
   process.exit(1);
 }
 
-const prefix = fs.mkdtempSync(path.join(os.tmpdir(), "sponzey-postinstall-"));
-const pathBin = fs.mkdtempSync(path.join(os.tmpdir(), "sponzey-path-bin-"));
+const prefix = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-postinstall-"));
+const pathBin = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-path-bin-"));
 const postinstallRun = spawnSync(process.execPath, [postinstall], {
   env: {
     ...process.env,

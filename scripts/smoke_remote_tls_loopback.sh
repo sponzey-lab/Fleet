@@ -1,22 +1,22 @@
 #!/usr/bin/env sh
 set -eu
 
-if [ -z "${SPONZEY_TLS_SMOKE_REEXEC:-}" ]; then
-  export SPONZEY_TLS_SMOKE_REEXEC=1
-  export SPONZEY_KEEP_SMOKE="${SPONZEY_KEEP_SMOKE:-0}"
+if [ -z "${FLEET_TLS_SMOKE_REEXEC:-}" ]; then
+  export FLEET_TLS_SMOKE_REEXEC=1
+  export FLEET_KEEP_SMOKE="${FLEET_KEEP_SMOKE:-0}"
   exec "$0" "$@"
 fi
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 REPO_ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)"
 BIN="$REPO_ROOT/target/debug/fleet"
-SMOKE_TMPDIR="${SPONZEY_SMOKE_TMPDIR:-/private/tmp}"
+SMOKE_TMPDIR="${FLEET_SMOKE_TMPDIR:-/private/tmp}"
 if [ ! -d "$SMOKE_TMPDIR" ]; then
   SMOKE_TMPDIR="${TMPDIR:-/tmp}"
 fi
-WORK_DIR="$(mktemp -d "$SMOKE_TMPDIR/sponzey-fleet-tls-smoke.XXXXXX")"
-if [ -n "${SPONZEY_TLS_SMOKE_PORT:-}" ]; then
-  PORT="$SPONZEY_TLS_SMOKE_PORT"
+WORK_DIR="$(mktemp -d "$SMOKE_TMPDIR/fleet-tls-smoke.XXXXXX")"
+if [ -n "${FLEET_TLS_SMOKE_PORT:-}" ]; then
+  PORT="$FLEET_TLS_SMOKE_PORT"
 elif command -v python3 >/dev/null 2>&1; then
   PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()' 2>/dev/null || printf '%s' "$((18000 + ($$ % 10000)))")"
 else
@@ -40,7 +40,7 @@ cleanup() {
     kill "$CONTROLLER_PID" 2>/dev/null || true
     wait "$CONTROLLER_PID" 2>/dev/null || true
   fi
-  if [ "${SPONZEY_KEEP_SMOKE:-0}" = "1" ] || [ -z "$CLEANED" ]; then
+  if [ "${FLEET_KEEP_SMOKE:-0}" = "1" ] || [ -z "$CLEANED" ]; then
     echo "kept smoke dir: $WORK_DIR"
   fi
 }
@@ -143,7 +143,7 @@ CONTROLLER_PID=""
 kill "$AGENT_PID" 2>/dev/null || true
 wait "$AGENT_PID" 2>/dev/null || true
 AGENT_PID=""
-if [ "${SPONZEY_KEEP_SMOKE:-0}" != "1" ]; then
+if [ "${FLEET_KEEP_SMOKE:-0}" != "1" ]; then
   rm -rf "$WORK_DIR"
   CLEANED="1"
 fi

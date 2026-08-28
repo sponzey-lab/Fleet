@@ -29,9 +29,9 @@ if ! command -v apt-get >/dev/null 2>&1 \
   exit 1
 fi
 
-BIN="${SPONZEY_BIN:-./target/debug/fleet}"
-PORT="${SPONZEY_PORT:-7700}"
-WORK_DIR="${TMPDIR:-/tmp}/sponzey-fleet-nginx-runbook-smoke-$$"
+BIN="${FLEET_BIN:-./target/debug/fleet}"
+PORT="${FLEET_PORT:-7700}"
+WORK_DIR="${TMPDIR:-/tmp}/fleet-nginx-runbook-smoke-$$"
 
 cleanup() {
   if [ -n "${CONTROLLER_PID:-}" ]; then

@@ -7619,9 +7619,9 @@ fn controller_signing_rotation_restart_plan_from_status(
         selected_signing_fingerprint_prefix: status.selected_signing_fingerprint_prefix,
         blocked_reason,
         verification_commands: vec![
-            "sponzey controller signing-rotation-status --controller-url <controller-url>"
+            "fleet controller signing-rotation-status --controller-url <controller-url>"
                 .to_owned(),
-            "sponzey controller signing-rotation restart-plan --controller-url <controller-url>"
+            "fleet controller signing-rotation restart-plan --controller-url <controller-url>"
                 .to_owned(),
         ],
         safety_notes: vec![
@@ -7663,7 +7663,7 @@ fn controller_signing_rotation_restart_action<'a>(
         bootstrap_guard: plan.bootstrap_guard,
         active_signing_fingerprint_prefix: plan.active_signing_fingerprint_prefix,
         selected_signing_fingerprint_prefix: plan.selected_signing_fingerprint_prefix,
-        service_command: "sponzey controller restart-service --dry-run".to_owned(),
+        service_command: "fleet controller restart-service --dry-run".to_owned(),
         verification_commands: plan.verification_commands,
         safety_notes: vec![
             "controller restart is executed outside the HTTP handler through an explicit service-manager command".to_owned(),
@@ -14791,7 +14791,7 @@ mod tests {
         assert_eq!(response_body["bootstrap_guard"], "active_mismatch_selected");
         assert_eq!(
             response_body["service_command"],
-            "sponzey controller restart-service --dry-run"
+            "fleet controller restart-service --dry-run"
         );
         assert!(
             audits
@@ -22531,7 +22531,7 @@ spec:
             tls_cert_path: None,
             tls_key_path: None,
             agent_client_ca_cert_path: None,
-            data_dir: PathBuf::from("/var/lib/sponzey-fleet"),
+            data_dir: PathBuf::from("/var/lib/fleet"),
             database: None,
             secret_provider: None,
         };
@@ -22540,7 +22540,7 @@ spec:
         assert_eq!(database.backend_name(), "sqlite");
         assert_eq!(
             database.sqlite_path(),
-            Some(Path::new("/var/lib/sponzey-fleet/controller/fleet.db"))
+            Some(Path::new("/var/lib/fleet/controller/fleet.db"))
         );
     }
 
@@ -22553,7 +22553,7 @@ spec:
             tls_cert_path: None,
             tls_key_path: None,
             agent_client_ca_cert_path: None,
-            data_dir: PathBuf::from("/var/lib/sponzey-fleet"),
+            data_dir: PathBuf::from("/var/lib/fleet"),
             database: None,
             secret_provider: None,
         };
@@ -22562,13 +22562,13 @@ spec:
         assert_eq!(settings.backend_name(), "local");
         assert_eq!(
             settings.local_root(),
-            Path::new("/var/lib/sponzey-fleet/controller/artifacts")
+            Path::new("/var/lib/fleet/controller/artifacts")
         );
 
         let store = open_controller_artifact_store(&settings).unwrap();
         assert_eq!(
             store.root(),
-            Path::new("/var/lib/sponzey-fleet/controller/artifacts")
+            Path::new("/var/lib/fleet/controller/artifacts")
         );
     }
 
@@ -22581,7 +22581,7 @@ spec:
             tls_cert_path: None,
             tls_key_path: None,
             agent_client_ca_cert_path: None,
-            data_dir: PathBuf::from("/var/lib/sponzey-fleet"),
+            data_dir: PathBuf::from("/var/lib/fleet"),
             database: None,
             secret_provider: None,
         };
@@ -22773,7 +22773,7 @@ spec:
             tls_cert_path: None,
             tls_key_path: None,
             agent_client_ca_cert_path: None,
-            data_dir: PathBuf::from(".sponzey"),
+            data_dir: PathBuf::from(".fleet"),
             database: None,
             secret_provider: None,
         };
@@ -22790,7 +22790,7 @@ spec:
             tls_cert_path: None,
             tls_key_path: None,
             agent_client_ca_cert_path: None,
-            data_dir: PathBuf::from(".sponzey"),
+            data_dir: PathBuf::from(".fleet"),
             database: None,
             secret_provider: None,
         };
@@ -22811,7 +22811,7 @@ spec:
             tls_cert_path: None,
             tls_key_path: None,
             agent_client_ca_cert_path: None,
-            data_dir: PathBuf::from(".sponzey"),
+            data_dir: PathBuf::from(".fleet"),
             database: None,
             secret_provider: None,
         };
@@ -22831,7 +22831,7 @@ spec:
             tls_cert_path: None,
             tls_key_path: None,
             agent_client_ca_cert_path: None,
-            data_dir: PathBuf::from(".sponzey"),
+            data_dir: PathBuf::from(".fleet"),
             database: None,
             secret_provider: None,
         };
@@ -22865,7 +22865,7 @@ spec:
             tls_cert_path: Some(PathBuf::from("cert.pem")),
             tls_key_path: None,
             agent_client_ca_cert_path: None,
-            data_dir: PathBuf::from(".sponzey"),
+            data_dir: PathBuf::from(".fleet"),
             database: None,
             secret_provider: None,
         };
@@ -22887,7 +22887,7 @@ spec:
             tls_cert_path: Some(cert_path),
             tls_key_path: Some(key_path),
             agent_client_ca_cert_path: None,
-            data_dir: PathBuf::from(".sponzey"),
+            data_dir: PathBuf::from(".fleet"),
             database: None,
             secret_provider: None,
         };
@@ -22903,8 +22903,8 @@ spec:
             external_url: Some("https://127.0.0.1:7700".to_owned()),
             tls_cert_path: None,
             tls_key_path: None,
-            agent_client_ca_cert_path: Some(PathBuf::from("/etc/sponzey/agent-client-ca.pem")),
-            data_dir: PathBuf::from(".sponzey"),
+            agent_client_ca_cert_path: Some(PathBuf::from("/etc/fleet/agent-client-ca.pem")),
+            data_dir: PathBuf::from(".fleet"),
             database: None,
             secret_provider: None,
         };
@@ -22916,7 +22916,7 @@ spec:
 
         assert!(message.contains("agent client certificate mTLS enforcement is not implemented"));
         assert!(!message.contains("agent-client-ca.pem"));
-        assert!(!message.contains("/etc/sponzey"));
+        assert!(!message.contains("/etc/fleet"));
     }
 
     #[test]
@@ -24133,7 +24133,7 @@ spec:
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("sponzey-{name}-{}-{unique}", std::process::id()))
+        std::env::temp_dir().join(format!("fleet-{name}-{}-{unique}", std::process::id()))
     }
 
     fn controller_test_artifact_checksum(bytes: &[u8]) -> ArtifactChecksum {
@@ -24186,7 +24186,7 @@ spec:
 
     fn unique_test_dir(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
-            "sponzey-fleet-controller-{name}-{}-{}",
+            "fleet-controller-{name}-{}-{}",
             std::process::id(),
             epoch_millis()
         ))

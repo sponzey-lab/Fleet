@@ -282,31 +282,31 @@ transaction을 연다.
 
 ```bash
 fleet controller backup \
-  --data-dir .sponzey \
-  --output ./sponzey-controller.backup.json
+  --data-dir .fleet \
+  --output ./fleet-controller.backup.json
 ```
 
 공식 restore command:
 
 ```bash
 fleet controller restore \
-  --data-dir .sponzey-restored \
-  --input ./sponzey-controller.backup.json
+  --data-dir .fleet-restored \
+  --input ./fleet-controller.backup.json
 ```
 
 위험을 줄이기 위해 먼저 dry-run을 실행할 수 있다.
 
 ```bash
 fleet controller restore \
-  --data-dir .sponzey-restored \
-  --input ./sponzey-controller.backup.json \
+  --data-dir .fleet-restored \
+  --input ./fleet-controller.backup.json \
   --dry-run
 ```
 
 Archive format:
 
 - JSON file
-- `format = sponzey-controller-backup`
+- `format = fleet-controller-backup`
 - `format_version = 1`
 - `package_version`
 - `created_at_ms`
@@ -586,29 +586,29 @@ cargo test -p fleet-cli controller_restore_refuses_incompatible_schema_version
 Postgres가 있는 개발 환경에서만 실행하는 ignored gate:
 
 ```bash
-SPONZEY_TEST_POSTGRES_URL=postgresql://... \
+FLEET_TEST_POSTGRES_URL=postgresql://... \
   cargo test -p fleet-store --features postgres postgres_migration_records_current_schema_version -- --ignored
-SPONZEY_TEST_POSTGRES_URL=postgresql://... \
+FLEET_TEST_POSTGRES_URL=postgresql://... \
   cargo test -p fleet-store --features postgres postgres_bootstrap_repositories_roundtrip -- --ignored
-SPONZEY_TEST_POSTGRES_URL=postgresql://... \
+FLEET_TEST_POSTGRES_URL=postgresql://... \
   cargo test -p fleet-store --features postgres postgres_enrollment_token_repository_roundtrip -- --ignored
-SPONZEY_TEST_POSTGRES_URL=postgresql://... \
+FLEET_TEST_POSTGRES_URL=postgresql://... \
   cargo test -p fleet-store --features postgres postgres_audit_repository_roundtrip -- --ignored
-SPONZEY_TEST_POSTGRES_URL=postgresql://... \
+FLEET_TEST_POSTGRES_URL=postgresql://... \
   cargo test -p fleet-store --features postgres postgres_approval_repository_roundtrip -- --ignored
-SPONZEY_TEST_POSTGRES_URL=postgresql://... \
+FLEET_TEST_POSTGRES_URL=postgresql://... \
   cargo test -p fleet-store --features postgres postgres_job_assignment_repository_roundtrip -- --ignored
-SPONZEY_TEST_POSTGRES_URL=postgresql://... \
+FLEET_TEST_POSTGRES_URL=postgresql://... \
   cargo test -p fleet-store --features postgres postgres_typed_job_repository_roundtrip -- --ignored
-SPONZEY_TEST_POSTGRES_URL=postgresql://... \
+FLEET_TEST_POSTGRES_URL=postgresql://... \
   cargo test -p fleet-store --features postgres postgres_dispatch_assignment_repository_roundtrip -- --ignored
-SPONZEY_TEST_POSTGRES_URL=postgresql://... \
+FLEET_TEST_POSTGRES_URL=postgresql://... \
   cargo test -p fleet-store --features postgres postgres_output_telemetry_repository_roundtrip -- --ignored
-SPONZEY_TEST_POSTGRES_URL=postgresql://... \
+FLEET_TEST_POSTGRES_URL=postgresql://... \
   cargo test -p fleet-store --features postgres postgres_drift_policy_capability_repository_roundtrip -- --ignored
-SPONZEY_TEST_POSTGRES_URL=postgresql://... \
+FLEET_TEST_POSTGRES_URL=postgresql://... \
   cargo test -p fleet-store --features postgres postgres_query_artifact_retention_repository_roundtrip -- --ignored
-SPONZEY_TEST_POSTGRES_URL=postgresql://... \
+FLEET_TEST_POSTGRES_URL=postgresql://... \
   cargo test -p fleet-store --features postgres postgres_remediation_request_repository_roundtrip -- --ignored
 ```
 

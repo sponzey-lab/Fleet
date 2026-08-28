@@ -41,7 +41,7 @@ Planned 또는 Partial 항목은 다음 phase 번호를 기준으로 실행한�
 
 | 기능 | 상태 | 현재 기준 |
 | --- | --- | --- |
-| 단일 `sponzey` 바이너리의 controller subcommand | Implemented | `fleet controller init/start` |
+| 단일 `fleet` 바이너리의 controller subcommand | Implemented | `fleet controller init/start` |
 | controller data directory 초기화 | Implemented | key, admin token hash, SQLite store 생성 |
 | Web Admin static serving | Implemented | `/admin` |
 | OpenAPI JSON과 Swagger UI | Implemented | `/openapi.json`, `/swagger-ui` |

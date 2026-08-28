@@ -5,7 +5,7 @@ This document captures the current post-MVP state and known limits.
 ## Included
 
 - Rust workspace with layered crate boundaries.
-- Single Rust `sponzey` CLI binary.
+- Single Rust `fleet` CLI binary.
 - Controller initialization with Ed25519 identity and one-time admin token output.
 - Enrollment token create/list/revoke API.
 - Agent enrollment with controller fingerprint pinning.
@@ -32,7 +32,7 @@ This document captures the current post-MVP state and known limits.
 - Standalone release tarball packaging with `SHA256SUMS`, checksum verification, and release checksum signature sign/verify scripts.
 - Linux systemd install/start/status/log/uninstall commands with dry-run rendering.
 - `fleet upgrade --dry-run` policy inspection for external package/artifact upgrades.
-- `sponzey demo` local loopback demo through the npm wrapper.
+- `fleet demo` local loopback demo through the npm wrapper.
 - Local MVP smoke script.
 - Immediate dispatch and remote TLS loopback smoke scripts.
 - Hardening audit script.

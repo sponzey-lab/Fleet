@@ -5,7 +5,7 @@ version 3 only (`AGPL-3.0-only`). The complete license text is in the repository
 root [`LICENSE`](../LICENSE) file.
 
 This license declaration covers the Rust workspace, Web Admin source, npm
-distribution wrapper, platform npm packages, and the distributed `sponzey`
+distribution wrapper, platform npm packages, and the distributed `fleet`
 binary unless an individual file explicitly states a different license.
 Third-party dependencies remain subject to their respective licenses.
 

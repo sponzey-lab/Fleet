@@ -41,7 +41,7 @@ The publish job:
   `npm publish` command.
 
 Trusted Publishing applies only to npm publish operations. The local manual
-publish helper still accepts `SPONZEY_NPM_TOKEN_FILE` because a developer shell
+publish helper still accepts `FLEET_NPM_TOKEN_FILE` because a developer shell
 cannot assume the GitHub Actions OIDC identity.
 
 ## Release checklist

@@ -4,9 +4,9 @@ set -eu
 cargo build -p fleet-cli
 BIN="./target/debug/fleet"
 SMOKE_TMPDIR="${TMPDIR:-/tmp}"
-WORK_DIR="$(mktemp -d "$SMOKE_TMPDIR/sponzey-fleet-smoke.XXXXXX")"
-if [ -n "${SPONZEY_MVP_SMOKE_PORT:-}" ]; then
-  PORT="$SPONZEY_MVP_SMOKE_PORT"
+WORK_DIR="$(mktemp -d "$SMOKE_TMPDIR/fleet-smoke.XXXXXX")"
+if [ -n "${FLEET_MVP_SMOKE_PORT:-}" ]; then
+  PORT="$FLEET_MVP_SMOKE_PORT"
 elif command -v python3 >/dev/null 2>&1; then
   PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()' 2>/dev/null || printf '%s' "$((16000 + ($$ % 10000)))")"
 else

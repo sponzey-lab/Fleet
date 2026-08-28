@@ -3,7 +3,7 @@
 [English README](README.md)
 
 Sponzey Fleet는 여러 컴퓨터를 한곳에서 관리하는 도구입니다. 모든 컴퓨터에 같은
-`sponzey` 프로그램을 설치하고, 실행할 때 역할을 선택합니다.
+`fleet` 프로그램을 설치하고, 실행할 때 역할을 선택합니다.
 
 - **Controller**는 관리 본부입니다. 데이터를 저장하고, Web Admin 화면을 제공하고,
   작업에 서명하고, Agent의 연결을 받습니다.
@@ -13,7 +13,7 @@ Sponzey Fleet는 여러 컴퓨터를 한곳에서 관리하는 도구입니다. 
 Controller 하나에 Agent 여러 대를 연결할 수 있습니다. Controller가 Agent로 접속하는
 방식이 아니라, 각 Agent가 Controller로 연결하는 방식입니다.
 
-> npm 패키지 이름은 `@sponzey/fleet`이지만 현재 실행 명령은 `sponzey`입니다.
+> npm 패키지 이름은 `@sponzey/fleet`이지만 현재 실행 명령은 `fleet`입니다.
 
 ## 준비물
 
@@ -35,17 +35,17 @@ npm --version
 
 ## 설치하기
 
-어느 터미널에서든 `sponzey` 명령을 사용할 수 있도록 전역 설치합니다.
+어느 터미널에서든 `fleet` 명령을 사용할 수 있도록 전역 설치합니다.
 
 ```bash
 npm install -g @sponzey/fleet
-sponzey --version
+fleet --version
 ```
 
-`npm install @sponzey/fleet`처럼 프로젝트 안에만 설치했다면 `sponzey` 대신
-`npx sponzey`로 실행합니다.
+`npm install @sponzey/fleet`처럼 프로젝트 안에만 설치했다면 `fleet` 대신
+`npx fleet`로 실행합니다.
 
-설치 후 `sponzey: command not found`가 나온다면 npm 명령 설치 경로를 확인합니다.
+설치 후 `fleet: command not found`가 나온다면 npm 명령 설치 경로를 확인합니다.
 
 ```bash
 echo "$(npm prefix -g)/bin"
@@ -60,7 +60,7 @@ cargo build -p fleet-cli
 ./target/debug/fleet --version
 ```
 
-소스 빌드를 사용할 때는 아래 예시의 `sponzey`를 `./target/debug/fleet`로 바꾸면
+소스 빌드를 사용할 때는 아래 예시의 `fleet`를 `./target/debug/fleet`로 바꾸면
 됩니다.
 
 ## 명령 하나로 데모 실행하기
@@ -68,7 +68,7 @@ cargo build -p fleet-cli
 실제 설정을 시작하기 전에 데모부터 실행해 볼 수 있습니다.
 
 ```bash
-sponzey demo
+fleet demo
 ```
 
 임시 Controller와 Agent를 만들고, 작은 작업을 실행한 뒤 Web Admin 주소를 보여줍니다.
@@ -95,8 +95,8 @@ Admin token과 Enrollment token은 서로 다른 값입니다. 바꿔서 사용�
 첫 번째 터미널을 열고 실행합니다.
 
 ```bash
-mkdir -p sponzey-controller
-fleet controller init --data-dir ./sponzey-controller
+mkdir -p fleet-controller
+fleet controller init --data-dir ./fleet-controller
 ```
 
 명령을 실행하면 `admin token`이 한 번 표시됩니다. 비밀번호 관리자나 안전한 임시
@@ -113,7 +113,7 @@ Controller 초기화는 보통 처음 한 번만 합니다.
 fleet controller start \
   --host 127.0.0.1 \
   --port 7700 \
-  --data-dir ./sponzey-controller \
+  --data-dir ./fleet-controller \
   --external-url http://127.0.0.1:7700
 ```
 
@@ -140,7 +140,7 @@ http://127.0.0.1:7700/admin
 
 ```bash
 fleet enroll-token create \
-  --data-dir ./sponzey-controller \
+  --data-dir ./fleet-controller \
   --labels role=test,env=local
 ```
 
@@ -153,9 +153,9 @@ Web Admin에서도 Enrollment token을 만들 수 있습니다.
 실행합니다.
 
 ```bash
-mkdir -p sponzey-agent
+mkdir -p fleet-agent
 fleet agent init \
-  --data-dir ./sponzey-agent \
+  --data-dir ./fleet-agent \
   --url http://127.0.0.1:7700 \
   --token PASTE_ENROLLMENT_TOKEN_HERE \
   --name my-first-agent \
@@ -170,7 +170,7 @@ Agent 초기화 과정에서 Agent identity를 만들고 Controller identity를 
 두 번째 터미널에서 실행합니다.
 
 ```bash
-fleet agent start --data-dir ./sponzey-agent
+fleet agent start --data-dir ./fleet-agent
 ```
 
 이 터미널도 계속 열어 두세요. Web Admin을 새로 고치면 Agent 목록에
@@ -179,7 +179,7 @@ fleet agent start --data-dir ./sponzey-agent
 연결을 한 번만 확인하고 종료하려면 다음처럼 실행합니다.
 
 ```bash
-fleet agent start --data-dir ./sponzey-agent --once
+fleet agent start --data-dir ./fleet-agent --once
 ```
 
 일반 실행에서는 네트워크나 Controller가 잠시 끊겨도 Agent가 계속 재접속을
@@ -214,8 +214,8 @@ ipconfig getifaddr en0
 Controller 컴퓨터에서 실행합니다.
 
 ```bash
-mkdir -p sponzey-controller
-fleet controller init --data-dir ./sponzey-controller
+mkdir -p fleet-controller
+fleet controller init --data-dir ./fleet-controller
 ```
 
 출력된 admin token을 안전하게 보관한 다음 Controller를 시작합니다.
@@ -224,7 +224,7 @@ fleet controller init --data-dir ./sponzey-controller
 fleet controller start \
   --host 0.0.0.0 \
   --port 7700 \
-  --data-dir ./sponzey-controller \
+  --data-dir ./fleet-controller \
   --external-url http://192.168.0.10:7700
 ```
 
@@ -247,7 +247,7 @@ Controller 컴퓨터에서 실행합니다.
 
 ```bash
 fleet enroll-token create \
-  --data-dir ./sponzey-controller \
+  --data-dir ./fleet-controller \
   --labels role=web,env=test
 ```
 
@@ -260,9 +260,9 @@ Agent 컴퓨터에서 실행합니다.
 
 ```bash
 npm install -g @sponzey/fleet
-mkdir -p sponzey-agent
+mkdir -p fleet-agent
 fleet agent init \
-  --data-dir ./sponzey-agent \
+  --data-dir ./fleet-agent \
   --url http://192.168.0.10:7700 \
   --token PASTE_ENROLLMENT_TOKEN_HERE \
   --name web-01 \
@@ -272,7 +272,7 @@ fleet agent init \
 이어서 Agent를 시작합니다.
 
 ```bash
-fleet agent start --data-dir ./sponzey-agent
+fleet agent start --data-dir ./fleet-agent
 ```
 
 `http://192.168.0.10:7700/admin`을 열어 `web-01`이 online으로 표시되는지 확인합니다.
@@ -297,8 +297,8 @@ fleet controller start \
   --port 7700 \
   --data-dir /var/lib/fleet \
   --external-url https://fleet.example.com:7700 \
-  --tls-cert /etc/sponzey/tls/fullchain.pem \
-  --tls-key /etc/sponzey/tls/privkey.pem
+  --tls-cert /etc/fleet/tls/fullchain.pem \
+  --tls-key /etc/fleet/tls/privkey.pem
 ```
 
 TLS private key는 Controller를 실행하는 계정만 읽을 수 있어야 합니다.
@@ -393,9 +393,9 @@ fleet login \
 
 ```bash
 fleet agents remote-list
-sponzey jobs list
-sponzey approvals list
-sponzey remediations list
+fleet jobs list
+fleet approvals list
+fleet remediations list
 fleet audit export --category security --limit 100
 ```
 
@@ -436,8 +436,8 @@ SQLite에 쓰는 중이 아니도록 Controller를 먼저 종료하는 것이 �
 
 ```bash
 fleet controller backup \
-  --data-dir ./sponzey-controller \
-  --output ./sponzey-controller.backup.json
+  --data-dir ./fleet-controller \
+  --output ./fleet-controller.backup.json
 ```
 
 백업 파일에는 Controller key와 운영 데이터가 포함됩니다. 비밀 정보처럼 보관하세요.
@@ -447,7 +447,7 @@ fleet controller backup \
 ```bash
 fleet controller restore \
   --data-dir ./restore-check \
-  --input ./sponzey-controller.backup.json \
+  --input ./fleet-controller.backup.json \
   --dry-run
 ```
 
@@ -455,13 +455,13 @@ fleet controller restore \
 
 ```bash
 fleet controller restore \
-  --data-dir ./sponzey-controller-restored \
-  --input ./sponzey-controller.backup.json
+  --data-dir ./fleet-controller-restored \
+  --input ./fleet-controller.backup.json
 ```
 
 ## 자주 생기는 문제
 
-### `sponzey: command not found`
+### `fleet: command not found`
 
 전역 설치 후 새 터미널을 여세요. 그래도 안 되면 `$(npm prefix -g)/bin`을 확인하고
 해당 경로를 `PATH`에 추가합니다.

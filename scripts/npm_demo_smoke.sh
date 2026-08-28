@@ -3,7 +3,7 @@ set -eu
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 REPO_ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)"
-PACK_DIR="${TMPDIR:-/tmp}/sponzey-fleet-npm-demo-$$"
+PACK_DIR="${TMPDIR:-/tmp}/fleet-npm-demo-$$"
 
 cleanup() {
   rm -rf "$PACK_DIR"

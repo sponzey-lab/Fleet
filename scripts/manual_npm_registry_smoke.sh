@@ -1,8 +1,8 @@
 #!/usr/bin/env sh
 set -eu
 
-PACKAGE="${SPONZEY_NPM_PACKAGE:-@sponzey/fleet}"
-WORK_DIR="${TMPDIR:-/tmp}/sponzey-fleet-npm-registry-smoke-$$"
+PACKAGE="${FLEET_NPM_PACKAGE:-@sponzey/fleet}"
+WORK_DIR="${TMPDIR:-/tmp}/fleet-npm-registry-smoke-$$"
 
 cleanup() {
   rm -rf "$WORK_DIR"

@@ -3,7 +3,7 @@ set -eu
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 REPO_ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)"
-WORK_DIR="${TMPDIR:-/tmp}/sponzey-fleet-npm-platform-smoke-$$"
+WORK_DIR="${TMPDIR:-/tmp}/fleet-npm-platform-smoke-$$"
 
 cleanup() {
   rm -rf "$WORK_DIR"
@@ -53,8 +53,8 @@ chmod +x "$PLATFORM_BIN"
   NPM_CONFIG_CACHE="$WORK_DIR/npm-cache" npm pack --pack-destination "$WORK_DIR" >/dev/null
 )
 
-WRAPPER_TARBALL="$(find "$WORK_DIR" -name 'sponzey-fleet-*.tgz' ! -name '*darwin*' ! -name '*linux*' -print -quit)"
-PLATFORM_TARBALL="$(find "$WORK_DIR" -name "sponzey-fleet-$PLATFORM_OS-$PLATFORM_ARCH-*.tgz" -print -quit)"
+WRAPPER_TARBALL="$(find "$WORK_DIR" -name 'fleet-*.tgz' ! -name '*darwin*' ! -name '*linux*' -print -quit)"
+PLATFORM_TARBALL="$(find "$WORK_DIR" -name "fleet-$PLATFORM_OS-$PLATFORM_ARCH-*.tgz" -print -quit)"
 
 if [ -z "$WRAPPER_TARBALL" ] || [ -z "$PLATFORM_TARBALL" ]; then
   echo "missing wrapper or platform tarball" >&2
