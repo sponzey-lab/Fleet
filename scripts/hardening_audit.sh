@@ -11,24 +11,24 @@ fail() {
   exit 1
 }
 
-if rg -n 'std::env::set_var|std::env::remove_var' crates >/tmp/sponzey-hardening-env-mutation.txt; then
-  cat /tmp/sponzey-hardening-env-mutation.txt >&2
+if rg -n 'std::env::set_var|std::env::remove_var' crates >/tmp/fleet-hardening-env-mutation.txt; then
+  cat /tmp/fleet-hardening-env-mutation.txt >&2
   fail "production code must not mutate process environment"
 fi
 
 if rg -n 'std::env::var|std::env::vars|std::env::var_os|std::env::vars_os' crates \
-  | grep -v 'SPONZEY_TEST_POSTGRES_URL' >/tmp/sponzey-hardening-env-read.txt; then
-  cat /tmp/sponzey-hardening-env-read.txt >&2
+  | grep -v 'FLEET_TEST_POSTGRES_URL' >/tmp/fleet-hardening-env-read.txt; then
+  cat /tmp/fleet-hardening-env-read.txt >&2
   fail "production code must not read environment outside bootstrap settings"
 fi
 
-if rg -n 'tracing::(info|warn|error|debug|trace)!\([^;]*(stdout|stderr|output|private_key|token|secret)' crates >/tmp/sponzey-hardening-log-output.txt; then
-  cat /tmp/sponzey-hardening-log-output.txt >&2
+if rg -n 'tracing::(info|warn|error|debug|trace)!\([^;]*(stdout|stderr|output|private_key|token|secret)' crates >/tmp/fleet-hardening-log-output.txt; then
+  cat /tmp/fleet-hardening-log-output.txt >&2
   fail "application logs must not include command output or secret-like fields"
 fi
 
-if rg -n '/api/.*/config|runtime_config|set_config|patch_config|std::env::set_var' crates >/tmp/sponzey-hardening-runtime-config.txt; then
-  cat /tmp/sponzey-hardening-runtime-config.txt >&2
+if rg -n '/api/.*/config|runtime_config|set_config|patch_config|std::env::set_var' crates >/tmp/fleet-hardening-runtime-config.txt; then
+  cat /tmp/fleet-hardening-runtime-config.txt >&2
   fail "runtime configuration mutation endpoints are not allowed"
 fi
 

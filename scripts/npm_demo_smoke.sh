@@ -3,7 +3,7 @@ set -eu
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 REPO_ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)"
-PACK_DIR="${TMPDIR:-/tmp}/sponzey-fleet-npm-demo-$$"
+PACK_DIR="${TMPDIR:-/tmp}/fleet-npm-demo-$$"
 
 cleanup() {
   rm -rf "$PACK_DIR"
@@ -29,7 +29,7 @@ mkdir -p "$PACK_DIR/package"
 tar -xzf "$TARBALL" -C "$PACK_DIR/package" --strip-components 1
 
 set +e
-OUTPUT="$(SPONZEY_FLEET_BIN="$REPO_ROOT/target/debug/sponzey" "$PACK_DIR/package/bin/sponzey" demo 2>&1)"
+OUTPUT="$(FLEET_BIN="$REPO_ROOT/target/debug/fleet" "$PACK_DIR/package/bin/fleet" demo 2>&1)"
 STATUS=$?
 set -e
 if [ "$STATUS" -ne 0 ]; then

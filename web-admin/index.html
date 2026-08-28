@@ -8,28 +8,58 @@
     <script type="module" src="/admin/app.js"></script>
   </head>
   <body>
+    <div class="admin-shell">
+      <aside class="admin-sidebar" aria-label="Fleet Admin navigation">
+        <a class="fleet-brand" href="#overview" aria-label="Sponzey Fleet overview">
+          <span class="fleet-brand-mark" aria-hidden="true">S</span>
+          <span>
+            <strong>Sponzey Fleet</strong>
+            <small>ADMIN CONTROL</small>
+          </span>
+        </a>
+        <nav class="admin-nav" aria-label="Fleet Admin sections">
+          <a href="#overview" data-route-link="overview"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>Overview</a>
+          <a href="#agents" data-route-link="agents"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="9" cy="8" r="3"/><path d="M3 20c0-3.3 2.7-6 6-6s6 2.7 6 6M16 5a3 3 0 0 1 0 6M18 14c1.8.8 3 2.7 3 5"/></svg>Agents</a>
+          <a href="#run" data-route-link="run"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3M13 15h4"/></svg>Run</a>
+          <a href="#runbooks" data-route-link="runbooks"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3h9l3 3v15H6z"/><path d="M15 3v4h4M9 12h6M9 16h6"/></svg>Runbooks</a>
+          <a href="#policies" data-route-link="policies"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 20 7v5c0 4.7-3.3 7.8-8 9-4.7-1.2-8-4.3-8-9V7l8-4Z"/><path d="m9 12 2 2 4-4"/></svg>Policies &amp; Drift</a>
+          <a href="#remediations" data-route-link="remediations"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m14 6 4-4 4 4-4 4-4-4ZM3 21l7-7M5 12l-3-3 4-4 3 3M12 19l3 3 4-4-3-3"/></svg>Remediations</a>
+          <a href="#audit" data-route-link="audit"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 3h10v18H7zM9 8h6M9 12h6M9 16h4"/><path d="M5 6h2M5 10h2M5 14h2"/></svg>Audit</a>
+          <a href="#settings" data-route-link="settings"><svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.2 2.2-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-3.2v-.2a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L6.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.6-1H4.8v-3.2H5a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9l-.1-.1 2.2-2.2.1.1a1.7 1.7 0 0 0 1.9.3 1.7 1.7 0 0 0 1-1.6v-.2h3.2v.2a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1 2.2 2.2-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2V14H21a1.7 1.7 0 0 0-1.6 1Z"/></svg>Settings</a>
+        </nav>
+        <div class="sidebar-foot"><span><i aria-hidden="true"></i>Controller online</span><small>v0.0.18 · SQLite</small></div>
+      </aside>
     <main>
       <header class="topbar">
-        <div>
-          <h1>Sponzey Fleet Admin</h1>
-          <p>Agent inventory, snapshots, drift, and audit for the local MVP controller.</p>
+        <div class="controller-context">
+          <strong>Local controller</strong>
+          <span class="transport-chip"><i aria-hidden="true"></i>HTTP · test only</span>
         </div>
         <form id="admin-auth" class="auth-form" method="post" action="/admin/">
-          <label for="admin-token">Admin token</label>
-          <input id="admin-token" name="admin-token" type="password" autocomplete="off" />
+          <label class="sr-only" for="admin-token">Admin token</label>
+          <input id="admin-token" name="admin-token" type="password" autocomplete="off" placeholder="Admin token" />
           <button type="submit">Refresh</button>
         </form>
       </header>
 
       <section id="status" class="status" aria-live="polite">
-        Enter the one-time admin token printed by <code>sponzey controller init</code>.
+        Enter the one-time admin token printed by <code>fleet controller init</code>.
       </section>
       <section id="transport-warning" class="warning-banner" hidden>
         HTTP transport is test-only. Tokens, commands, and operational data are not encrypted.
       </section>
 
+      <header class="page-heading">
+        <h1 id="page-title">Overview</h1>
+        <p id="page-subtitle">Live operational state from the Controller — no inferred health.</p>
+      </header>
+
       <section class="layout">
-        <article class="panel agents-panel">
+        <article class="panel overview-panel" data-route="overview" data-route-focus="overview" tabindex="-1">
+          <div id="overview-summary" class="overview-summary empty">Authenticate to load the current fleet summary.</div>
+        </article>
+
+        <article class="panel agents-panel" data-route="agents" data-route-focus="agents" tabindex="-1">
           <div class="panel-heading">
             <h2>Agents</h2>
             <div class="panel-actions">
@@ -41,29 +71,24 @@
           <div id="agent-detail" class="detail-panel empty">Select an agent.</div>
         </article>
 
-        <article class="panel token-panel">
+        <article class="panel token-panel" data-route="settings" data-route-focus="settings" tabindex="-1">
           <div class="panel-heading">
             <h2>Enrollment</h2>
             <span class="muted">One-time agent tokens</span>
           </div>
           <form id="enrollment-token-form" class="token-form">
-            <label for="token-labels">Labels</label>
-            <input id="token-labels" name="labels" autocomplete="off" placeholder="role=web,env=prod" />
-            <label for="token-max-uses">Max uses</label>
-            <input id="token-max-uses" name="max-uses" type="number" min="1" value="1" />
-            <label for="token-expiry">Expiry seconds</label>
-            <input id="token-expiry" name="expires-in-seconds" type="number" min="1" value="3600" />
-            <label for="token-controller-url">Controller URL</label>
-            <input id="token-controller-url" name="controller-url" autocomplete="off" placeholder="https://fleet.example.com" />
-            <label for="token-agent-name">Agent name</label>
-            <input id="token-agent-name" name="agent-name" autocomplete="off" placeholder="prod-web-01" />
-            <button type="submit">Create token</button>
+            <div class="form-field"><label for="token-labels">Labels</label><input id="token-labels" name="labels" autocomplete="off" placeholder="role=web,env=prod" /></div>
+            <div class="form-field"><label for="token-max-uses">Max uses</label><input id="token-max-uses" name="max-uses" type="number" min="1" value="1" /></div>
+            <div class="form-field"><label for="token-expiry">Expiry seconds</label><input id="token-expiry" name="expires-in-seconds" type="number" min="1" value="3600" /></div>
+            <div class="form-field form-field-wide"><label for="token-controller-url">Controller URL</label><input id="token-controller-url" name="controller-url" autocomplete="off" placeholder="https://fleet.example.com" /></div>
+            <div class="form-field"><label for="token-agent-name">Agent name</label><input id="token-agent-name" name="agent-name" autocomplete="off" placeholder="prod-web-01" /></div>
+            <div class="form-actions"><button type="submit">Create token</button></div>
           </form>
           <pre id="created-enrollment-token" class="snapshot token-secret">Create a token to show the one-time value here.</pre>
           <div id="enrollment-tokens-list" class="list empty">No enrollment tokens loaded.</div>
         </article>
 
-        <article id="signing-rotation-panel" class="panel signing-panel">
+        <article id="signing-rotation-panel" class="panel signing-panel" data-route="settings">
           <div class="panel-heading">
             <h2>Controller Signing</h2>
             <div class="panel-actions">
@@ -73,22 +98,17 @@
           </div>
           <div id="signing-rotation-status" class="signing-grid empty">No signing status loaded.</div>
           <form id="staged-trust-bundle-form" class="signing-form">
-            <label for="staged-previous-public-key-path">Previous public key path</label>
-            <input id="staged-previous-public-key-path" name="previous-public-key-path" autocomplete="off" placeholder="/var/lib/sponzey-fleet/controller/controller_public.key.bak" />
-            <label for="staged-agent-ids">Agent IDs</label>
-            <textarea id="staged-agent-ids" name="agent-ids" rows="3" placeholder="agent-1, agent-2"></textarea>
-            <label for="staged-batch-size">Batch size</label>
-            <input id="staged-batch-size" name="batch-size" type="number" min="1" value="10" />
-            <label for="staged-max-failures">Max failures</label>
-            <input id="staged-max-failures" name="max-failures" type="number" min="0" value="1" />
-            <label for="staged-ack-timeout-seconds">Ack timeout seconds</label>
-            <input id="staged-ack-timeout-seconds" name="ack-timeout-seconds" type="number" min="1" value="30" />
-            <button type="submit">Run staged tick</button>
+            <div class="form-field form-field-full"><label for="staged-previous-public-key-path">Previous public key path</label><input id="staged-previous-public-key-path" name="previous-public-key-path" autocomplete="off" placeholder="/var/lib/fleet/controller/controller_public.key.bak" /></div>
+            <div class="form-field form-field-full"><label for="staged-agent-ids">Agent IDs</label><textarea id="staged-agent-ids" name="agent-ids" rows="3" placeholder="agent-1, agent-2"></textarea></div>
+            <div class="form-field"><label for="staged-batch-size">Batch size</label><input id="staged-batch-size" name="batch-size" type="number" min="1" value="10" /></div>
+            <div class="form-field"><label for="staged-max-failures">Max failures</label><input id="staged-max-failures" name="max-failures" type="number" min="0" value="1" /></div>
+            <div class="form-field"><label for="staged-ack-timeout-seconds">Ack timeout seconds</label><input id="staged-ack-timeout-seconds" name="ack-timeout-seconds" type="number" min="1" value="30" /></div>
+            <div class="form-actions"><button type="submit">Run staged tick</button></div>
           </form>
           <div id="staged-trust-bundle-result" class="table-view empty">No staged rollout result.</div>
         </article>
 
-        <article class="panel">
+        <article class="panel" data-route="agents">
           <div class="panel-heading">
             <h2>Facts</h2>
             <div class="panel-actions">
@@ -101,7 +121,7 @@
           <pre id="facts-panel" class="snapshot">Select an agent.</pre>
         </article>
 
-        <article class="panel">
+        <article class="panel" data-route="agents">
           <div class="panel-heading">
             <h2>Metrics</h2>
             <div class="panel-actions">
@@ -117,7 +137,7 @@
           <pre id="metrics-panel" class="snapshot">Select an agent.</pre>
         </article>
 
-        <article class="panel">
+        <article class="panel" data-route="policies" data-route-focus="policies" tabindex="-1">
           <div class="panel-heading">
             <h2>Drift</h2>
             <span class="muted">Expected vs actual</span>
@@ -126,7 +146,7 @@
           <div id="drift-history" class="list compact-list empty">Select an agent.</div>
         </article>
 
-        <article class="panel job-panel">
+        <article class="panel job-panel" data-route="run" data-route-focus="run" tabindex="-1">
           <div class="panel-heading">
             <h2>Run</h2>
             <span class="muted">Signed high-risk command</span>
@@ -157,7 +177,7 @@
           <pre id="job-output" class="snapshot output-viewer">Run a command or select a job to view output.</pre>
         </article>
 
-        <article class="panel approval-panel">
+        <article class="panel approval-panel" data-route="run runbooks">
           <div class="panel-heading">
             <h2>Approvals</h2>
             <div class="panel-actions">
@@ -168,7 +188,7 @@
           <div id="approvals-list" class="list empty">No approvals loaded.</div>
         </article>
 
-        <article class="panel remediation-panel">
+        <article class="panel remediation-panel" data-route="remediations" data-route-focus="remediations" tabindex="-1">
           <div class="panel-heading">
             <h2>Remediations</h2>
             <div class="panel-actions">
@@ -178,42 +198,32 @@
           </div>
           <div id="remediations-list" class="list compact-list empty">No remediations loaded.</div>
           <form id="remediation-form" class="remediation-form">
-            <label for="remediation-id">Remediation ID</label>
-            <input id="remediation-id" name="remediation-id" autocomplete="off" />
-            <label for="remediation-approval-id">Approval ID</label>
-            <input id="remediation-approval-id" name="approval-id" autocomplete="off" />
-            <label for="remediation-job-id">Job ID</label>
-            <input id="remediation-job-id" name="job-id" autocomplete="off" />
-            <label for="remediation-runbook-document">Approved runbook YAML</label>
-            <textarea id="remediation-runbook-document" name="runbook-document" rows="6"></textarea>
+            <div class="form-field"><label for="remediation-id">Remediation ID</label><input id="remediation-id" name="remediation-id" autocomplete="off" /></div>
+            <div class="form-field"><label for="remediation-approval-id">Approval ID</label><input id="remediation-approval-id" name="approval-id" autocomplete="off" /></div>
+            <div class="form-field"><label for="remediation-job-id">Job ID</label><input id="remediation-job-id" name="job-id" autocomplete="off" /></div>
+            <div class="form-field form-field-full"><label for="remediation-runbook-document">Approved runbook YAML</label><textarea id="remediation-runbook-document" name="runbook-document" rows="6"></textarea></div>
             <div class="button-row">
               <button id="request-remediation-approval" type="button">Request approval</button>
               <button id="approve-remediation" type="button">Approve job</button>
-              <button id="mark-remediation-running" type="button">Running</button>
-              <button id="record-remediation-success" type="button">Success</button>
-              <button id="record-remediation-failed" type="button">Failed</button>
-              <button id="verify-remediation" type="button">Verify</button>
             </div>
           </form>
           <pre id="remediation-result" class="snapshot output-viewer">Select or enter a remediation request.</pre>
         </article>
 
-        <article class="panel runbook-panel">
+        <article class="panel runbook-panel" data-route="runbooks" data-route-focus="runbooks" tabindex="-1">
           <div class="panel-heading">
             <h2>Runbooks</h2>
             <span class="muted">Signed runbook job</span>
           </div>
           <form id="runbook-form" class="runbook-form">
-            <label for="runbook-document">Runbook YAML</label>
-            <textarea id="runbook-document" name="runbook-document" rows="9">apiVersion: fleet.sponzey.dev/v1alpha1
+            <div class="form-field form-field-full"><label for="runbook-document">Runbook YAML</label><textarea id="runbook-document" name="runbook-document" rows="9">apiVersion: fleet.sponzey.dev/v1alpha1
 kind: Runbook
 name: quick-inventory
 steps:
   - id: collect-facts
     facts.collect: {}
-</textarea>
-            <label for="runbook-selector">Target selector</label>
-            <input id="runbook-selector" name="selector" autocomplete="off" placeholder="role=web" />
+</textarea></div>
+            <div class="form-field"><label for="runbook-selector">Target selector</label><input id="runbook-selector" name="selector" autocomplete="off" placeholder="role=web" /></div>
             <button id="preview-runbook-targets" type="button">Preview targets</button>
             <div id="runbook-target-preview" class="target-preview empty">No selector preview.</div>
             <label class="checkbox-row">
@@ -225,7 +235,7 @@ steps:
           <pre id="runbook-result" class="snapshot output-viewer">Create a runbook job to view status here.</pre>
         </article>
 
-        <article class="panel">
+        <article class="panel" data-route="run">
           <div class="panel-heading">
             <h2>Jobs</h2>
             <span class="muted">Recent command history</span>
@@ -233,14 +243,13 @@ steps:
           <div id="jobs-list" class="list empty">No jobs loaded.</div>
         </article>
 
-        <article class="panel policy-panel">
+        <article class="panel policy-panel" data-route="policies">
           <div class="panel-heading">
             <h2>Policies</h2>
             <span class="muted">Source, assignment, schedules</span>
           </div>
           <form id="policy-form" class="policy-form">
-            <label for="policy-source">Policy YAML</label>
-            <textarea id="policy-source" name="policy-source" rows="8">apiVersion: fleet.sponzey.dev/v1alpha1
+            <div class="form-field form-field-full"><label for="policy-source">Policy YAML</label><textarea id="policy-source" name="policy-source" rows="8">apiVersion: fleet.sponzey.dev/v1alpha1
 kind: Policy
 metadata:
   name: nginx-running
@@ -249,20 +258,19 @@ spec:
     matchLabels:
       role: web
   checks: []
-</textarea>
+</textarea></div>
             <button type="submit">Save policy</button>
           </form>
           <div id="policies-list" class="list empty">No policies loaded.</div>
           <div class="policy-actions">
             <button id="assign-policy" type="button" disabled>Assign selected policy</button>
-            <label for="policy-schedule-interval">Drift interval seconds</label>
-            <input id="policy-schedule-interval" type="number" min="1" value="300" />
+            <div class="form-field"><label for="policy-schedule-interval">Drift interval seconds</label><input id="policy-schedule-interval" type="number" min="1" value="300" /></div>
             <button id="schedule-policy" type="button" disabled>Schedule drift</button>
           </div>
           <div id="agent-policies" class="list compact-list empty">Select an agent.</div>
         </article>
 
-        <article class="panel logs-panel">
+        <article class="panel logs-panel" data-route="agents">
           <div class="panel-heading">
             <h2>Logs</h2>
             <span class="muted">Agent operational log chunks</span>
@@ -270,14 +278,21 @@ spec:
           <div id="agent-logs" class="list compact-list empty">Select an agent.</div>
         </article>
 
-        <article class="panel audit-panel">
+        <article class="panel audit-panel" data-route="audit" data-route-focus="audit" tabindex="-1">
           <div class="panel-heading">
             <h2>Audit</h2>
             <span class="muted">Product events are minimal; field debug belongs in logs.</span>
+          </div>
+          <div class="panel-actions">
+            <label for="audit-category">Category</label>
+            <select id="audit-category"><option value="">All</option><option value="agent">Agent</option><option value="enrollment">Enrollment</option><option value="job">Job</option><option value="approval">Approval</option><option value="drift">Drift</option><option value="policy">Policy</option><option value="security">Security</option></select>
+            <button id="refresh-audit" type="button">Refresh</button>
+            <button id="load-more-audit" type="button" disabled>Load more</button>
           </div>
           <div id="audit-list" class="list empty">No audit events loaded.</div>
         </article>
       </section>
     </main>
+    </div>
   </body>
 </html>

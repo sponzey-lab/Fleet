@@ -95,7 +95,7 @@ ws://127.0.0.1:7700/api/agents/ws
 
 Agent enrollment generates an Ed25519 key pair locally. The private key is stored in `agent_private.key`; the controller stores the public key and fingerprint. On Unix, `agent.conf` and `agent_private.key` must not be readable, writable, or executable by group/other.
 
-`sponzey agent start` runs as a persistent session loop by default. `--heartbeat-interval-seconds` controls liveness ticks only, not the connection cycle, facts upload, metrics upload, log upload, or task dispatch. Facts default to a lower-frequency static inventory interval controlled by `--facts-interval-seconds` (300 seconds). Metrics default to a chart-friendly interval controlled by `--metrics-interval-seconds` (30 seconds). Controller connection failures are retried indefinitely unless `--once` or `--max-reconnect-attempts` is set. For smoke tests and one-shot checks, pass `--once`.
+`fleet agent start` runs as a persistent session loop by default. `--heartbeat-interval-seconds` controls liveness ticks only, not the connection cycle, facts upload, metrics upload, log upload, or task dispatch. Facts default to a lower-frequency static inventory interval controlled by `--facts-interval-seconds` (300 seconds). Metrics default to a chart-friendly interval controlled by `--metrics-interval-seconds` (30 seconds). Controller connection failures are retried indefinitely unless `--once` or `--max-reconnect-attempts` is set. For smoke tests and one-shot checks, pass `--once`.
 
 Controller session implementation note:
 
@@ -165,7 +165,7 @@ fallback.
 
 Rotation readiness is exposed to operators through
 `GET /api/controller/signing-rotation/status` and the
-`sponzey controller signing-rotation-status` CLI command. That surface is
+`fleet controller signing-rotation-status` CLI command. That surface is
 read-only and returns state names, readiness names, fingerprint prefixes, and
 dual-trust timestamps only. It is not an agent protocol message and must not
 carry private key material, key paths, TLS certificate material, raw public key
@@ -173,7 +173,7 @@ bodies, task payload bodies, or process environment values.
 
 Rotation mutation is exposed through admin REST endpoints under
 `/api/controller/signing-rotation/*` and CLI commands under
-`sponzey controller signing-rotation`. These commands call application
+`fleet controller signing-rotation`. These commands call application
 request/validate/activate/retire/fail use cases and return the same
 secret-free readiness vocabulary as the status endpoint. They are not
 agent-controller wire messages. Candidate material validation uses explicit
@@ -255,9 +255,9 @@ public-only `agent_certificate_lifecycle_update` message for an already
 authenticated connected session. The current public controller surfaces are
 limited to read-only status and issuance request:
 `GET /api/agents/{agent_id}/certificate-lifecycle/status`,
-`sponzey agents certificate-status <agent-id>`,
+`fleet agents certificate-status <agent-id>`,
 `POST /api/agents/{agent_id}/certificate-lifecycle/request-issuance`, and
-`sponzey agents request-certificate-issuance <agent-id>`. Status requires
+`fleet agents request-certificate-issuance <agent-id>`. Status requires
 `agent_read` and returns public state/prefix fields only. Issuance request
 requires `agent_write`, stores public lifecycle state through the application
 use case, writes Security audit, and reports dispatch status only. Dispatch
@@ -372,6 +372,19 @@ Metrics snapshot:
 ```
 
 Drift report does not carry an arbitrary JSON body, so controller uses the agent message envelope `timestamp_ms` as both `checked_at_ms` and `agent_system_time_ms`.
+
+### Drift report task correlation
+
+When an agent executes a signed `drift_check` assignment, its `drift_report`
+payload includes optional `job_id` and `task_id` values copied from that signed
+task envelope. Both fields are omitted for older agents and uncorrelated
+observation reports; omission keeps the v1 wire form decodable and does not
+change `protocol_version`.
+
+These values are correlation claims, not execution authority. The controller
+must still authenticate the agent session and match the values to its persisted
+assignment before using the report as remediation evidence. A missing,
+mismatched, or unverified correlation must remain an observation-only report.
 
 Capability snapshot:
 

@@ -1,1092 +1,633 @@
-# Sponzey Fleet 개발 에이전트 규칙
+# Sponzey Fleet Development Rules
 
-이 문서는 Sponzey Fleet 프로젝트에서 코드를 작성하거나 수정하는 모든 사람과 자동화 에이전트가 따라야 하는 작업 규칙이다.  
-프로젝트의 기본 방향은 `PROJECT.md`를 따른다. 핵심은 Rust core 기반 Controller/Agent/CLI와 가벼운 Web Admin UI다.
+이 문서는 Sponzey Fleet 저장소에서 코드, 테스트, 문서, schema, 배포 구성을 변경하는
+사람과 자동화 에이전트가 따라야 하는 강제 규칙이다. 제품 방향은 `PROJECT.md`, 현재
+지원 상태는 실제 코드·test·manifest와 `docs/feature-matrix.md`를 함께 근거로 판단한다.
 
-## 1. 프로젝트 정체성
+## 1. Project Context and Method Selection
 
-Sponzey Fleet는 agent 기반 실시간 서버 운영 자동화 플랫폼이다.
+### 1.1 제품과 지배적 위험
 
-핵심 구성:
+Sponzey Fleet는 agent가 Controller에 outbound persistent WebSocket session을 유지하고,
+Controller가 인증·승인·서명된 작업을 agent에 전달하는 서버 운영 자동화 플랫폼이다.
+제품은 root 권한 실행, credential, 원격 명령, 상태 수집, drift detection, remediation,
+artifact, audit를 다룬다. 따라서 다음 위험은 일반 기능 편의보다 우선한다.
 
-- Rust core
-- 단일 Rust 바이너리 `sponzey`
-- `sponzey controller ...` 역할
-- `sponzey agent ...` 역할
-- `sponzey` CLI 역할
-- WebSocket over TLS 기반 outbound agent 연결
-- Agent가 Controller에 유지하는 persistent outbound WebSocket session
-- SQLite/Postgres storage
-- 가벼운 Web Admin UI
-- npm 설치 UX는 유지하되, npm package는 Rust 바이너리 배포 wrapper로 사용
+- 잘못된 대상 또는 승인되지 않은 명령 실행
+- agent/controller identity, token, signing key, TLS material 또는 secret 노출
+- duplicate, stale, replayed message로 인한 상태 오염이나 중복 실행
+- migration, retention, backup/restore로 인한 데이터 손실
+- WebSocket runtime state와 durable state의 혼동
+- API, protocol, persistence, Web Admin, npm package 사이의 compatibility 불일치
+- shutdown, cancel, timeout이 없는 background 또는 child-process 작업
 
-이 프로젝트는 단순 원격 쉘 도구가 아니다. root 권한 실행, 상태 수집, drift detection, remediation, audit log를 다루는 운영 플랫폼이다. 따라서 구조, 테스트, 설정, 로그, 보안 정책을 처음부터 엄격하게 가져간다.
+### 1.2 근거 우선순위
 
-## 2. 최상위 기초룰
+작업 전에 아래 순서로 근거를 확인한다.
 
-아래 규칙은 모든 코드, 문서, 테스트, 배포 스크립트에 우선 적용한다.
+1. system/developer/user의 현재 명시적 지시와 가장 가까운 `AGENTS.md`
+2. compile되는 source, 실행되는 test, manifest, migration과 public contract snapshot
+3. `docs/feature-matrix.md`, `docs/security.md`, `docs/protocol.md`, `docs/storage.md`,
+   `docs/api.md`, `docs/release-gate.md`
+4. `README.md`와 `README.ko.md`의 사용자 흐름
+5. `PROJECT.md`의 제품 목표와 장기 계획
+6. `.tasks/`의 과거 phase·task 기록
 
-1. Layered Architecture, Clean Architecture, Tidy First, TDD를 반드시 적용한다.
-2. 외부 파일에 설정되는 내용은 최소화한다.
-3. 환경 설정 내용을 프로세스 중간에 삽입하여 변경하는 방법은 반드시 거부한다.
-4. 외부 환경 상수는 최초 부팅 시점에만 받아들이고, 이후에는 프로그램 상수가 아니라 명시적 인자, 설정 객체, 요청 payload, command argument로만 전달한다.
-5. 로그는 3가지 수준으로 나눈다.
-   - 프로덕트용 최소 로그
-   - 현장 확인용 디버그 로그
-   - 개발 및 테스트용 개발 로그
+하위 근거가 상위 근거와 충돌하면 현재 구현으로 가장하거나 임의로 제품 범위를 바꾸지
+않는다. public contract, data ownership 또는 제품 범위를 바꾸는 충돌은 사용자에게
+보고하고 별도 결정으로 남긴다. `.tasks/`에 root `plan.md`가 없거나 과거 phase만 있을
+수 있으므로, 문서가 참조하는 계획 파일의 존재와 현재성을 작업마다 다시 확인한다.
 
-이 규칙은 편의보다 우선한다. 구현이 조금 길어지더라도 전역 상태, 암묵적 설정, 중간 환경 변경, 테스트 없는 핵심 로직 추가를 허용하지 않는다.
+### 1.3 확인된 현재 구현과 목표 구조
 
-## 3. 아키텍처 원칙
+작업 시작 시 manifest와 source로 다시 확인하되, 이 규칙을 정리한 시점의 기준선은
+다음과 같다.
 
-### 3.1 Layered Architecture
+- Rust 2024 edition workspace이며 제품 binary는 `fleet-cli`가 만드는 `fleet` 하나다.
+- `fleet-domain`은 project dependency와 external dependency가 없는 순수 Rust crate다.
+- `fleet-application`은 domain port와 use case를 소유한다.
+- `fleet-protocol`은 Serde JSON wire DTO와 protocol version boundary를 소유한다.
+- `fleet-store`는 SQLite 기본 store와 feature-gated Postgres adapter를 소유한다.
+- `fleet-runner`는 process, package, service, file, template 같은 host side effect를
+  소유한다.
+- `fleet-controller`는 Axum HTTP/WebSocket interface, static asset serving, controller
+  runtime composition과 worker를 포함한다.
+- `fleet-cli`는 clap entrypoint와 composition root이며, 현재 agent session/runtime와
+  일부 local operations도 포함한다.
+- `fleet-agent`는 현재 agent library의 목표 경계만 가진 얇은 crate다. agent 기능이 이미
+  이 crate에 있다고 가정하지 않는다.
+- Web Admin은 현재 React/Vite가 아니다. ES module 기반 정적 JavaScript, CSS, HTML,
+  dependency-free API client, `allowJs + checkJs` 검증과 Node test/build script를 쓴다.
+- npm은 Rust runtime이 아니라 `@sponzey/fleet` wrapper와 Darwin/Linux arm64/x64
+  platform binary package 배포에만 사용한다.
+- SQLite가 기본 production-ready store다. Postgres는 feature-gated partial path이며,
+  S3 adapter, full mTLS client-certificate enforcement, OIDC/project RBAC, HA coordination,
+  Windows service와 automatic self-update는 현재 완료된 기능으로 주장하지 않는다.
 
-코드는 다음 계층을 기준으로 나눈다.
+`PROJECT.md`가 설명하는 `fleet-agent` runtime 분리, 더 얇은 interface, Postgres 운영
+성숙도, 외부 secret/artifact adapter와 cross-platform 지원은 목표 구조다. 목표 구조로
+이동할 때 characterization test와 작은 Tidy First 단계를 사용하며, 존재하지 않는
+구조를 현재 구현처럼 문서화하지 않는다.
 
-```text
-Interface Layer
-  CLI
-  HTTP API
-  WebSocket gateway
-  Web Admin UI static serving
+### 1.4 작업별 방법론 선택
 
-Application Layer
-  use cases
-  command handlers
-  job orchestration
-  enrollment flow
-  drift check flow
-  remediation flow
-
-Domain Layer
-  entities
-  value objects
-  policies
-  task model
-  job state machine
-  agent state machine
-  domain errors
-
-Infrastructure Layer
-  SQLite/Postgres repository
-  filesystem
-  process runner
-  systemd/journald adapter
-  network transport
-  TLS/certificate store
-  clock/random/id generator
-```
-
-의존 방향:
+각 작업 시작 시 작업 기록이나 첫 진행 보고에 아래 판단을 짧게 남긴다.
 
 ```text
-Interface -> Application -> Domain
-Infrastructure -> Application/Domain contracts
-Domain -> no outer layer dependency
+현재 순간:
+대상 언어·실행 단위:
+지배적 위험:
+선택한 방법론·패턴:
+검증 근거·종료 기준:
 ```
 
-절대 금지:
+- 작고 가역적인 변경과 명확한 최초 기능은 짧은 TDD 수직 기능으로 수행한다.
+- 버그는 재현 test, 최소 수정, regression test 순서로 처리한다.
+- 기존 구조가 변경을 방해할 때만 behavior-preserving Tidy First를 먼저 분리한다.
+- 테스트가 없는 legacy path는 characterization test로 현재 동작을 고정한 뒤 바꾼다.
+- 사용자 가치나 기술 가능성이 실제로 불명확할 때만 time-boxed prototype을 쓴다.
+- 폐기형 prototype은 production path, 실제 credential, 사용자 데이터와 비가역 side
+  effect에서 격리하고 production 코드로 승격하지 않는다.
+- migration, security, protocol, public API, release, credential과 비가역 변경은 대안,
+  rehearsal, compatibility, rollback과 release gate가 있는 완전한 위험 주기로 수행한다.
+- 새 근거로 위험이나 변경 순간이 바뀌면 방법론과 검증 강도를 다시 선택한다.
 
-- Domain layer에서 DB, HTTP, WebSocket, filesystem, environment variable 직접 접근
-- Application layer에서 `std::env` 직접 접근
-- CLI argument parsing 결과를 domain object 없이 그대로 infrastructure로 전달
-- HTTP handler 안에 business logic 작성
-- Agent task runner 안에 policy 판단 로직 작성
+## 2. Architecture and Dependency Rules
 
-### 3.2 Clean Architecture
+### 2.1 논리 계층
 
-핵심 비즈니스 규칙은 framework와 분리한다.
-
-예시:
-
-- `fleet-domain`: `Agent`, `Job`, `Runbook`, `Policy`, `DriftReport`, `AuditEvent`
-- `fleet-application`: `EnrollAgent`, `DispatchJob`, `CollectFacts`, `CheckDrift`, `ApproveJob`
-- `fleet-infra`: `SqliteAgentRepository`, `PostgresJobRepository`, `TokioProcessRunner`
-- `fleet-controller`: HTTP/WebSocket controller library
-- `fleet-agent`: agent daemon library
-- `fleet-cli`: 단일 `sponzey` binary entrypoint와 subcommand UX
-
-Application service는 trait으로 필요한 기능을 받는다.
-
-```rust
-pub trait AgentRepository {
-    async fn save(&self, agent: Agent) -> Result<(), StoreError>;
-    async fn find_by_id(&self, id: AgentId) -> Result<Option<Agent>, StoreError>;
-}
-
-pub trait AuditWriter {
-    async fn write(&self, event: AuditEvent) -> Result<(), AuditError>;
-}
-```
-
-좋은 구조:
+책임을 다음 계층으로 구분하고 dependency는 내부로 향하게 한다.
 
 ```text
-HTTP request -> DTO validation -> use case input -> application service -> domain -> repository trait
+Presentation / Interface
+  clap CLI, Axum HTTP/WebSocket, static Web Admin
+            |
+            v
+Application
+  use case, port, orchestration, authorization/dispatch flow
+            |
+            v
+Domain
+  entity, value object, policy, invariant, state transition, domain error
+
+Infrastructure -> Application/Domain ports
+  SQLite/Postgres, filesystem artifact store, process runner, TLS/network,
+  clock/random/id, service manager
+
+External Interface
+  JSON wire protocol, OpenAPI/API schema, npm/release artifact contract
 ```
 
-나쁜 구조:
+- Domain은 DB, HTTP, WebSocket, filesystem, environment, process runner와 framework를
+  직접 사용하지 않는다.
+- Application은 concrete store, network client, filesystem, process environment와 UI
+  type을 직접 사용하지 않는다. 필요한 I/O는 application이 소유하는 port로 표현한다.
+- Interface는 parse, authentication, authorization, DTO validation, use case 호출과
+  response mapping만 수행한다. handler에 SQL, shell execution, state transition 규칙을
+  넣지 않는다.
+- Infrastructure는 내부 port를 구현하고 composition root에서 선택한다. infrastructure
+  error는 SQL, URL credential, key path 또는 raw payload를 외부로 그대로 누출하지 않는다.
+- wire DTO, HTTP DTO, persistence record, domain object와 Web Admin view model을 하나의
+  type으로 재사용하지 않는다. 각 boundary에서 명시적으로 변환한다.
+
+### 2.2 현재 crate dependency 계약
+
+`Cargo.toml`과 `cargo metadata --no-deps`로 다음 방향을 유지한다.
 
 ```text
-HTTP request -> SQL query -> mutable global config -> shell command -> ad hoc log
+fleet-domain       -> no project crate, no external runtime/framework dependency
+fleet-core         -> no project crate; bootstrap/settings/identity/logging support
+fleet-application  -> fleet-domain
+fleet-protocol     -> fleet-domain + serialization only
+fleet-store        -> fleet-application + fleet-domain
+fleet-runner       -> fleet-domain
+fleet-controller   -> fleet-core/application/domain/protocol/store
+fleet-agent        -> agent-specific library boundary; no independent binary
+fleet-cli          -> composition root and the only shipped binary
 ```
 
-### 3.3 Tidy First
-
-기능 변경과 구조 정리를 섞지 않는다. Tidy First 원칙에 따라 다음 순서를 지킨다.
-
-1. 먼저 작은 구조 정리를 한다.
-2. 구조 정리 commit 또는 작업 단위를 기능 변경과 분리한다.
-3. 이후 기능 변경을 한다.
-4. 기능 변경에는 테스트를 붙인다.
-
-허용되는 tidy 작업:
-
-- 이름을 명확히 바꾸기
-- 중복된 작은 helper 추출
-- trait boundary 정리
-- module 이동
-- error type 명확화
-- 테스트 fixture 정리
-
-금지되는 tidy 작업:
-
-- 기능 구현 중 대규모 폴더 재배치
-- 테스트 없이 behavior가 바뀌는 정리
-- unrelated formatting churn
-- “나중에 필요할 것 같아서” 만드는 추상화
-
-기준:
-
-- Tidy는 behavior를 바꾸지 않는다.
-- behavior가 바뀌면 feature/fix 작업이다.
-- 한 PR/작업 단위에서 tidy와 feature를 섞어야 한다면 커밋 또는 섹션을 분리한다.
-
-### 3.4 TDD
-
-핵심 로직은 테스트를 먼저 작성한다.
-
-필수 TDD 대상:
-
-- domain state machine
-- job dispatch
-- job/assignment state transition
-- agent enrollment
-- token validation
-- signed task validation
-- approval decision
-- drift detection
-- runbook parser
-- selector matching
-- selector result snapshot
-- audit event creation
-- log redaction
-- config parsing
-- storage migration/retention rule
-
-권장 흐름:
-
-1. 실패하는 테스트 작성
-2. 최소 구현
-3. 리팩터링
-4. edge case 테스트 추가
-
-테스트 없이 구현해도 되는 경우:
-
-- 문서 수정
-- 단순 화면 텍스트 수정
-- 명백한 typo 수정
-- 아직 동작 코드가 없는 계획 문서 작성
-
-단, root 권한 실행, credential, token, TLS, audit, command dispatch 관련 코드는 테스트 없이 추가하지 않는다.
-
-## 4. Rust Workspace 기준 구조
-
-권장 구조:
-
-```text
-crates/
-  fleet-core/
-  fleet-domain/
-  fleet-application/
-  fleet-protocol/
-  fleet-store/
-  fleet-runner/
-  fleet-controller/
-  fleet-agent/
-  fleet-cli/
-web-admin/
-  src/
-  dist/
-npm/
-  fleet/
-  fleet-darwin-arm64/
-  fleet-linux-x64/
-docs/
-```
-
-각 crate 책임:
-
-- `fleet-domain`: 순수 domain model과 business rule
-- `fleet-application`: use case orchestration
-- `fleet-protocol`: agent-controller message schema
-- `fleet-store`: DB schema, migration, repository 구현
-- `fleet-runner`: command/package/service/file primitive 실행
-- `fleet-controller`: `sponzey controller`가 사용하는 API server, WebSocket gateway, scheduler library
-- `fleet-agent`: `sponzey agent`가 사용하는 daemon, local collectors, local task execution library
-- `fleet-cli`: 단일 제품 바이너리 `sponzey`와 command line UX
-- `web-admin`: 얇은 Web Admin UI
-- `npm`: Rust 바이너리 배포 wrapper
-
-crate 의존 규칙:
-
-```text
-fleet-domain
-  no project crate dependency
-
-fleet-application
-  depends on fleet-domain
-
-fleet-protocol
-  depends on fleet-domain only if protocol shares domain value types intentionally
-
-fleet-store
-  depends on fleet-domain, fleet-application contracts
-
-fleet-runner
-  depends on fleet-domain task types
-
-fleet-controller
-  depends on application, store, protocol
-
-fleet-agent
-  depends on protocol, runner, domain
-
-fleet-cli
-  depends on protocol/client types
-```
-
-바이너리 정책:
-
-- 제품 배포 바이너리는 `sponzey` 하나만 둔다.
-- Controller와 Agent 역할은 별도 실행 파일이 아니라 `sponzey controller ...`, `sponzey agent ...` subcommand로 선택한다.
-- `fleet-controller`와 `fleet-agent` crate는 library crate로 유지하고 독립 `main.rs`를 만들지 않는다.
-- npm wrapper, systemd unit, release artifact는 모두 resolved absolute path의 `sponzey` 바이너리를 참조한다.
-- Agent 실행 모델은 Controller로의 outbound persistent session을 기본으로 한다. Controller가 Agent로 직접 inbound 접속하는 구조를 기본 제품 경로로 만들지 않는다.
-
-금지:
-
-- `fleet-domain`이 `tokio`, `sqlx`, `axum`, `reqwest`, `tracing_subscriber`에 직접 의존
-- `fleet-controller` 내부 model을 agent가 직접 import
-- UI TypeScript type을 Rust source of truth보다 우선
-- protocol schema를 여러 곳에서 수동 중복 정의
-
-## 5. 설정 원칙
-
-### 5.1 설정 최소화
-
-외부 파일에 저장되는 설정은 최소화한다.
-
-허용되는 설정 파일:
-
-- controller persistent config
-- agent identity/config
-- CLI user profile
-- test fixture
-- migration file
-
-허용되지 않는 설정 파일:
-
-- 기능 토글을 임의로 늘리는 별도 YAML
-- 운영 중 수동으로 수정해야만 동작하는 숨은 설정 파일
-- domain rule을 외부 파일에 흩뿌리는 방식
-- 테스트에서만 통과하는 ad hoc config
-
-원칙:
-
-- 기본값은 코드에 명확히 둔다.
-- 바꿔야 하는 값만 config로 노출한다.
-- config key는 문서화한다.
-- deprecated config는 migration 경로를 둔다.
-
-### 5.2 프로세스 중간 환경 변경 금지
-
-프로세스가 시작된 뒤 환경 변수를 주입하거나 바꿔 동작을 변경하는 방식을 거부한다.
-
-금지 예시:
-
-```rust
-std::env::set_var("FLEET_LOG_LEVEL", "debug");
-std::env::set_var("DATABASE_URL", new_url);
-std::env::remove_var("FLEET_CONFIG");
-```
-
-금지되는 패턴:
-
-- 테스트 중 `set_var`로 production code behavior 변경
-- request handler에서 env var 읽기
-- job 실행 중 env var를 바꿔 controller 설정 변경
-- Web Admin UI 요청에 따라 process env 변경
-- agent task 실행 전 global env를 변경
-
-예외:
-
-- child process에 전달하는 per-command environment는 허용한다. 단, 전역 process env가 아니라 `Command` builder에 명시적으로 넣어야 한다.
-
-허용 예시:
-
-```rust
-Command::new("ansible-playbook")
-    .env("ANSIBLE_FORCE_COLOR", "1")
-    .arg("site.yml");
-```
-
-### 5.3 외부 환경 상수는 최초에만 수집
-
-외부 환경 상수는 process bootstrap에서 한 번만 읽는다.
-
-허용:
-
-```text
-process start
-  -> read env/args/config
-  -> build Settings
-  -> validate Settings
-  -> freeze Settings inside AppContext
-  -> pass AppContext by explicit reference
-```
-
-금지:
-
-```text
-handler
-  -> std::env::var("DATABASE_URL")
-  -> connect DB
-```
-
-`Settings`는 불변 객체로 다룬다.
-
-권장 Rust 형태:
-
-```rust
-#[derive(Clone, Debug)]
-pub struct Settings {
-    pub bind_addr: SocketAddr,
-    pub database_url: DatabaseUrl,
-    pub log_profile: LogProfile,
-    pub data_dir: PathBuf,
-}
-```
-
-설정 전달 방식:
-
-- function argument
-- typed settings object
-- application context
-- explicit request payload
-- CLI argument
-
-금지:
-
-- lazy global env lookup
-- mutable singleton config
-- once_cell에 넣고 내부 값을 교체
-- runtime config patch endpoint
-- 숨은 static mut
-
-### 5.4 CLI/Controller/Agent 설정 경계
-
-Controller:
-
-- 시작 시점에 bind address, database, data directory, external URL, TLS path를 받는다.
-- 실행 중 변경은 API로 직접 process state를 바꾸지 않는다.
-- 변경이 필요하면 저장 후 restart 또는 explicit reload command를 설계한다.
-
-Agent:
-
-- enrollment 시 controller URL, agent identity, labels, service options를 저장한다.
-- agent identity는 임의 수정 불가다.
-- labels 변경은 controller API를 통해 audit와 함께 수행한다.
-
-CLI:
-
-- `~/.sponzey/config.toml`에는 user profile과 controller endpoint 정도만 둔다.
-- command별 옵션은 CLI 인자로 받는다.
-- CLI가 controller/agent 내부 config file을 직접 수정하지 않는다.
-
-Web Admin UI:
-
-- UI는 설정 편집기가 아니다.
-- MVP에서는 runtime configuration 변경 기능을 만들지 않는다.
-- 정책, runbook, labels, approval 같은 domain object만 다룬다.
-
-## 6. 로그 정책
-
-로그는 목적에 따라 3가지 수준으로 나눈다.
-
-### 6.1 Product 로그
-
-목적:
-
-- 운영 환경에서 항상 켜둘 수 있는 최소 로그
-- 고객에게 노출되어도 안전한 수준
-- 장애 발생 시 high-level event를 추적
-
-특징:
-
-- 기본값
-- 낮은 볼륨
-- secret 없음
-- command output 원문 없음
-- 개인 정보 없음
-- request body 원문 없음
-
-포함:
-
-- controller started/stopped
-- agent enrolled/disabled
-- agent online/offline transition
-- job created/started/completed/failed
-- approval requested/approved/rejected
-- drift detected/resolved
-- audit write failure
-
-금지:
-
-- token
-- password
-- private key
-- full command output
-- full HTTP body
-- environment dump
-- stack trace flood
-
-예시:
-
-```text
-INFO job_completed job_id=... status=success target_count=12 changed_count=3 duration_ms=9201
-WARN agent_offline agent_id=... last_seen_age_sec=93
-ERROR audit_write_failed event_id=... store=postgres
-```
-
-### 6.2 Field Debug 로그
-
-목적:
-
-- 고객 현장, 설치 지원, 장애 대응 중 확인
-- 운영자가 제한된 기간 동안 켜는 진단 로그
-
-특징:
-
-- product보다 자세함
-- 여전히 secret redaction 필수
-- 일정 시간 또는 session 단위로 켜는 것을 권장
-- 로그 증가량을 예측 가능하게 유지
-
-포함:
-
-- protocol message type
-- agent heartbeat interval
-- job dispatch decision
-- selector match count
-- repository latency
-- retry/backoff 정보
-- task state transition
-- redacted command metadata
-
-금지:
-
-- secret 원문
-- private key
-- enrollment token 원문
-- signed payload raw dump
-- stdout/stderr 전체 자동 기록
-
-예시:
-
-```text
-DEBUG dispatch_selected_agents job_id=... selector=role=web count=18
-DEBUG websocket_message_received agent_id=... message_type=heartbeat
-DEBUG store_query_slow operation=find_pending_jobs elapsed_ms=531
-```
-
-### 6.3 Development/Test 로그
-
-목적:
-
-- 로컬 개발과 테스트 중 내부 상태 확인
-- 테스트 실패 원인 분석
-- protocol, parser, state machine 디버깅
-
-특징:
-
-- 가장 자세함
-- production build 기본값이 아니어야 한다.
-- test fixture와 local sample data 기준으로 사용한다.
-- 실제 customer secret이 들어갈 수 있는 환경에서는 사용하지 않는다.
-
-포함 가능:
-
-- parser intermediate state
-- state machine transition detail
-- mock repository calls
-- test fixture payload
-- local-only stack trace
-
-주의:
-
-- 개발 로그도 redaction path를 우회하지 않는다.
-- 개발 편의를 위해 production code에 `println!`을 남기지 않는다.
-- 테스트에서 로그 검증이 필요하면 `tracing` subscriber를 test 전용으로 구성한다.
-
-### 6.4 로그 구현 규칙
-
-Rust:
-
-- `tracing`을 표준으로 사용한다.
-- `println!`, `dbg!`, `eprintln!`은 production path에 남기지 않는다.
-- log profile은 bootstrap에서 한 번 결정한다.
-- redaction은 logger 바깥이 아니라 structured field 생성 전 또는 field formatter에서 적용한다.
-
-권장 enum:
-
-```rust
-pub enum LogProfile {
-    Product,
-    FieldDebug,
-    Development,
-}
-```
-
-금지:
-
-- runtime 중 env var로 log level 변경
-- request parameter로 global log level 변경
-- secret redaction 없이 `?payload` dump
-- command output을 info log에 자동 기록
-
-허용:
-
-- controller restart 후 log profile 변경
-- scoped diagnostic session을 domain/audit와 함께 명시적으로 생성
-- 특정 job output은 job log storage에 저장하되 일반 application log와 분리
-
-## 7. 테스트 전략
-
-### 7.1 테스트 피라미드
-
-우선순위:
-
-1. Domain unit test
-2. Application use case test
-3. Repository contract test
-4. Protocol compatibility test
-5. Controller/Agent integration test
-6. CLI smoke test
-7. Web Admin UI component/smoke test
-
-가장 많이 작성해야 하는 테스트는 domain/application test다.
-
-### 7.2 Domain 테스트
-
-대상:
-
-- job state transition
-- agent state transition
-- selector match
-- drift diff
-- approval rule
-- redaction rule
-- settings validation
-
-특징:
-
-- DB 없음
-- network 없음
-- filesystem 없음
-- deterministic clock/random 사용
-
-### 7.3 Application 테스트
-
-대상:
-
-- enroll agent
-- create job
-- dispatch job
-- receive output
-- complete job
-- write audit
-- check drift
-
-규칙:
-
-- repository는 trait mock/fake 사용
-- clock/id generator는 fake 사용
-- env var 사용 금지
-
-### 7.4 Infrastructure 테스트
-
-대상:
-
-- SQLite/Postgres repository
-- filesystem artifact store
-- process runner
-- systemd adapter
-- log tail adapter
-
-규칙:
-
-- 외부 의존이 있으면 `#[ignore]` 또는 feature flag로 분리
-- destructive command 금지
-- root 권한 요구 테스트는 기본 test suite에 넣지 않는다.
-
-### 7.5 Protocol 테스트
-
-대상:
-
-- agent enrollment messages
-- heartbeat
-- task assignment
-- stdout/stderr chunks
-- task result
-- drift report
-
-필수:
-
-- backward compatibility fixture
-- unknown field handling
-- invalid signature handling
-- malformed payload rejection
-
-### 7.6 Web Admin UI 테스트
-
-UI는 얇게 유지한다.
-
-필수:
-
-- API client type check
-- agents list rendering
-- job live output rendering
-- dangerous action confirmation
-- drift diff rendering
-- audit list rendering
-
-금지:
-
-- UI에 domain rule 중복 구현
-- UI state로 authorization 결정
-- UI에서 secret 원문 표시
-
-## 8. 보안 개발 규칙
-
-### 8.1 기본 보안 자세
-
-Sponzey Fleet는 원격 명령 실행 플랫폼이다. 모든 기능은 잠재적 권한 상승 경로로 본다.
-
-필수:
-
-- enrollment token은 생성 시 1회만 노출
-- token 저장 시 hash 또는 안전한 secret storage 사용
-- agent identity는 key pair 기반으로 설계
-- controller identity는 key pair 기반으로 설계
-- enrollment 이후 agent는 controller public key를 pinning한다.
-- WebSocket task channel은 agent identity proof 이후에만 열린다.
-- task payload는 controller-signed envelope로만 전달한다.
-- agent는 unsigned, invalid signature, expired, replayed, target mismatch task를 실행하지 않는다.
-- audit log는 append-only 모델을 기본으로 한다.
-- secret redaction은 application log와 job output 모두에 적용한다.
-- 제품, 고객, 운영, 공동 사용, 장시간 실행 환경의 agent-controller 통신은 반드시 HTTPS/TLS를 사용한다.
-- HTTP controller URL도 기술적으로는 허용하지만 테스트 전용 transport로만 취급한다.
-- HTTP를 사용할 때마다 명확한 경고 메시지를 출력해야 한다.
-- HTTP controller URL이 controller external URL로 설정되면 Security audit에 `insecure_http_transport_enabled` 이벤트를 남긴다.
-- HTTP transport는 기밀성/무결성 보장을 제공하지 않으며 token 노출, command 탈취, 데이터 유출, 중간자 공격 위험이 있음을 문서화한다.
-
-HTTP 허용 정책:
-
-- HTTP를 허용하기 위해 별도 예외 옵션을 두지 않는다.
-- `http://127.0.0.1`, `http://localhost`, `http://192.168...`, 내부망 hostname 모두 URL 형식이 유효하면 허용하지만 테스트 용도로만 안내한다.
-- 단, `0.0.0.0` 또는 `::` 같은 wildcard bind host를 agent/controller URL로 쓰는 것은 거부한다.
-- HTTPS를 기본 제품 경로로 문서화하되, HTTP 사용 방법은 테스트 전용이라는 경고와 함께만 안내한다.
-
-### 8.2 Root 권한 실행
-
-Agent는 root로 실행될 수 있다. 따라서 실행 boundary를 엄격히 둔다.
-
-필수:
-
-- task timeout
-- allowed primitive
-- dangerous task classification
-- approval requirement
-- high-risk explicit confirmation
-- working directory 제한
-- output size limit
-- process kill on cancel/timeout
-
-금지:
-
-- controller에서 받은 문자열을 shell에 그대로 넘기는 기본 구현
-- command allowlist 없는 high-risk action
-- high-risk command를 confirmation 없이 실행
-- `/` 기준 recursive change를 쉽게 허용
-- secret을 command argument로 노출하는 API 디자인
-
-### 8.3 Secret 처리
-
-원칙:
-
-- secret은 가능한 한 저장하지 않는다.
-- 저장해야 하면 암호화한다.
-- 출력해야 하면 redact한다.
-- audit에는 secret reference만 남긴다.
-
-금지:
-
-- token을 URL query string으로 전달
-- secret을 일반 log field에 기록
-- secret 포함 payload를 debug dump
-- `.env` 파일을 운영 핵심 설정 수단으로 의존
-
-## 9. API와 Protocol 규칙
-
-### 9.1 API
-
-API handler는 얇게 유지한다.
-
-역할:
-
-- request parse
-- authentication
-- authorization check
-- DTO validation
-- use case 호출
-- response mapping
-
-금지:
-
-- DB 직접 접근
-- domain state 직접 조작
-- process env 읽기
-- shell command 실행
-- audit 누락
-
-### 9.2 Protocol
-
-Agent-controller protocol은 명시적 version을 가져야 한다.
-
-필수:
-
-- protocol version
-- message id
-- correlation id
-- agent id
-- timestamp
-- message type
-- payload schema version
-
-오류 처리:
-
-- unknown message는 reject 또는 ignore 정책을 명확히 둔다.
-- malformed payload는 audit 가능한 security event로 남긴다.
-- 재시도 가능한 오류와 치명 오류를 구분한다.
-
-### 9.3 Persistent Agent Session
-
-Sponzey Fleet의 원격 실행 경로는 Agent가 Controller에 outbound WebSocket session을 유지하는 구조를 기본으로 한다.
-
-목표:
-
-- Controller가 Agent로 직접 TCP 접속하지 않는다.
-- Agent가 Controller에 인증된 persistent session을 열어 둔다.
-- Controller는 이미 인증된 Agent session으로 task를 즉시 push한다.
-- heartbeat는 연결을 여는 주기가 아니라 session liveness signal이다.
-- facts, metrics, operational log 전송 주기는 task dispatch 즉시성과 분리한다.
-
-필수 규칙:
-
-- WebSocket task channel은 agent identity proof 이후에만 session registry에 등록한다.
-- active session registry는 runtime infrastructure state다. WebSocket handle이나 channel sender를 DB/domain object에 저장하지 않는다.
-- duplicate session은 명확한 정책을 가진다. 기본 방향은 new session wins이며, 기존 session close reason과 audit를 남긴다.
-- revoked/disabled agent의 active session은 revoke API 성공 직후 닫는다.
-- connected agent에 job을 dispatch할 때도 controller-signed task envelope, approval, expiry, nonce replay, target 검증을 우회하지 않는다.
-- DB에 job/assignment를 저장하기 전에 WebSocket으로 task를 먼저 보내지 않는다.
-- store lock을 잡은 상태에서 WebSocket read/write await를 수행하지 않는다.
-- socket writer는 session당 하나만 둔다. heartbeat, facts, metrics, log, output producer는 outbound queue로 message를 전달한다.
-- command/runbook 실행 중에도 heartbeat/liveness와 session read/write가 막히지 않아야 한다.
-- output chunk는 job output storage에 저장하고 Product application log에는 원문을 남기지 않는다.
-
-권장 구현 경계:
-
-```text
-Controller HTTP API
-  -> Application dispatch use case
-  -> Store repository
-  -> SessionRegistry/SessionDispatcher
-  -> WebSocket writer loop
-
-Agent session
-  -> read loop
-  -> single writer queue
-  -> heartbeat/facts/metrics/log ticks
-  -> task worker
-```
-
-거부해야 하는 패턴:
-
-- heartbeat 주기마다 연결을 열고 닫는 구조를 제품 기본 경로로 유지하는 것
-- 즉시성을 이유로 Controller가 Agent로 inbound 접속하는 구조
-- 여러 thread/task가 같은 WebSocket writer에 직접 쓰는 구조
-- active session이 있다는 이유로 high-risk approval을 생략하는 구조
-- UI가 agent connected/running 상태를 자체 추정하는 구조
-
-### 9.4 Job과 Assignment 상태 경계
-
-Job은 운영자가 생성하고 추적하는 실행 단위다. Assignment는 특정 Agent에 배정된 실행 단위다. 이 둘을 섞으면 multi-agent 실행, 재시도, 부분 성공, 취소, 감사 추적이 불명확해진다.
-
-필수 규칙:
-
-- Job 상태와 Assignment 상태는 domain layer의 명시적 state machine으로 관리한다.
-- Job은 target selector와 target snapshot을 가진다.
-- Assignment는 target snapshot의 개별 agent마다 생성한다.
-- WebSocket으로 task를 보내기 전에 Job/Assignment는 store에 먼저 기록되어야 한다.
-- Assignment transition은 queued, dispatched, accepted, started, output_received, succeeded, failed, rejected, canceled, expired 같은 명시 상태 중 허용된 전이만 통과한다.
-- Agent가 task를 받았다는 사실과 task 실행을 시작했다는 사실은 서로 다른 protocol event로 다룬다.
-- output chunk와 final result는 protocol, storage, UI에서 분리한다.
-- partial_success는 Job aggregate 결과이며 개별 Assignment의 성공/실패를 덮어쓰지 않는다.
-- reconnect 이후 in-flight Assignment 처리는 명시 정책과 테스트를 가져야 한다.
-- cancel과 timeout은 서로 다른 결과로 보존한다.
-
-금지:
-
-- 단일 agent 실행 가정으로 Job row 하나만 업데이트하는 multi-agent 구현
-- output chunk 수신을 성공 결과로 간주하는 구현
-- active WebSocket write 성공을 task accepted 또는 task started로 간주하는 구현
-- UI가 Job/Assignment 상태를 문자열 조합으로 자체 추론하는 구현
-- store update 없이 session registry 상태만으로 실행 상태를 판단하는 구현
-
-### 9.5 Facts, Metrics, Logs 의미 경계
-
-Facts, Metrics, Logs는 모두 Agent에서 Controller로 올라오지만 목적이 다르다. 의미가 섞이면 UI, API, retention, alerting, drift 판단이 모두 흔들린다.
-
-Facts:
-
-- 거의 변하지 않는 inventory 정보다.
-- 예: hostname, OS, arch, CPU logical count, memory total, memory module count, disk inventory, partition, mount, filesystem, network interface identity.
-- 메모리 사용률, 디스크 사용률, CPU 사용률 같은 시간 변동 값은 Facts에 넣지 않는다.
-- Facts에는 agent system time과 controller stored time을 함께 보존한다.
-
-Metrics:
-
-- 시간에 따라 변하는 usage telemetry다.
-- 예: CPU usage, memory used/available, disk used/available, load, process/resource counters.
-- Metrics는 paging, retention, chart range를 전제로 저장한다.
-- Metrics schema는 chart 편의를 위해 domain 의미를 잃어서는 안 된다.
-
-Logs:
-
-- Agent가 올리는 operational log/event stream이다.
-- command stdout/stderr 원문과 application product log를 혼동하지 않는다.
-- job output은 job output storage에 저장하고, 일반 Product log에는 원문 전체를 남기지 않는다.
-- log upload interval은 heartbeat interval과 독립적이어야 한다.
-
-필수 규칙:
-
-- Facts/Metrics/Logs schema 변경은 API 문서와 Web Admin 표시를 함께 갱신한다.
-- retention 정책은 Metrics/Logs/Job output/Audit를 구분한다.
-- Audit는 일반 retention worker가 임의 삭제하지 않는다.
-- system time field의 의미를 API와 UI에서 명확히 표시한다.
-
-## 10. Web Admin UI 규칙
-
-Web Admin UI는 얇은 운영 표면이다.
-
-해야 할 것:
-
-- agent 상태 확인
-- job 실행
-- live output 확인
-- facts/metrics snapshot 확인
-- drift diff 확인
-- approval 처리
-- audit 조회
-
-하지 말 것:
-
-- 복잡한 workflow designer
-- 무거운 dashboard builder
-- 설정 파일 편집기
-- runtime env editor
-- domain rule 재구현
-- 별도 Node.js web server 운영
-
-UI 기술:
-
-- React/Vite 또는 SvelteKit static export
-- TypeScript
-- generated API client
-- CSS는 단순하고 유지 가능한 방식
-- controller가 static asset으로 서빙
-
-권한:
-
-- UI는 authorization을 결정하지 않는다.
-- 모든 권한 판단은 controller application layer에서 한다.
-- UI는 forbidden response를 명확히 보여주는 역할만 한다.
-
-## 11. 코드 스타일
-
-### 11.1 Rust
-
-원칙:
-
-- `cargo fmt` 기준을 따른다.
-- `cargo clippy` 경고를 무시하지 않는다.
-- error는 `thiserror` 또는 명확한 enum으로 모델링한다.
-- binary entrypoint는 작게 유지한다.
-- `unwrap`, `expect`는 테스트 또는 bootstrap fatal path에서만 제한적으로 사용한다.
-- domain error와 infrastructure error를 구분한다.
-
-금지:
-
-- `anyhow::Result`를 domain layer public API에 노출
-- global mutable state
-- runtime env lookup
-- blocking IO를 async executor에서 무분별하게 실행
-- production path의 `println!`/`dbg!`
-
-권장:
-
-- typed id newtype
-- explicit state enum
-- small module
-- trait boundary
-- `tracing` span
-- deterministic tests
-
-### 11.2 TypeScript/Web
-
-원칙:
-
-- UI는 얇게 유지한다.
-- generated API type을 사용한다.
-- domain rule을 복제하지 않는다.
-- secret 표시를 기본 금지한다.
-- dangerous action에는 명확한 confirmation을 둔다.
-
-금지:
-
-- 전역 mutable config store
-- 브라우저 localStorage에 token 장기 저장
-- UI에서 env/runtime 설정 변경
-- API 에러 무시
-
-## 12. 변경 절차
-
-### 12.1 새 기능
-
-순서:
-
-1. 요구사항을 `PROJECT.md`와 비교한다.
-2. domain/application 영향 범위를 정한다.
-3. 실패하는 테스트를 작성한다.
-4. 최소 구현한다.
-5. logging/audit/security 영향을 확인한다.
-6. CLI/API/UI 노출이 필요하면 얇게 연결한다.
-7. 문서를 갱신한다.
-
-### 12.2 버그 수정
-
-순서:
-
-1. 재현 테스트 작성
-2. 원인 위치 확인
-3. 최소 수정
-4. regression test 유지
-5. 로그 또는 audit 누락 여부 확인
-
-### 12.3 리팩터링
-
-순서:
-
-1. behavior 보존 테스트 확인
-2. 작은 단위로 정리
-3. 이름/경계/의존성 개선
-4. 기능 변경과 분리
-
-## 13. 거부해야 하는 요청
-
-다음 요청은 프로젝트 규칙 위반으로 거부하거나 대안을 제시한다.
-
-- 실행 중인 process env를 바꿔 설정을 변경하자는 요청
-- request handler에서 env var를 읽자는 요청
-- UI에서 controller runtime config를 직접 patch하자는 요청
-- domain layer에서 DB나 filesystem을 직접 쓰자는 요청
-- 테스트 없이 enrollment/token/task signature를 구현하자는 요청
-- controller 서명 없는 task를 agent가 실행하게 하자는 요청
-- 제품/운영 용도에서 HTTP transport를 사용하거나 권장하자는 요청
-- high-risk command를 confirmation 없이 실행하자는 요청
-- production log에 command output 전체를 남기자는 요청
-- secret redaction 없이 debug dump를 남기자는 요청
-- Ansible full compatibility를 MVP로 넣자는 요청
-- Web Admin UI를 무거운 standalone web platform으로 키우자는 요청
-- root shell execution을 기본 primitive로 무제한 허용하자는 요청
-
-대안:
-
-- 설정 변경은 explicit config object와 restart/reload command로 설계한다.
-- 위험 명령은 approval과 audit를 거친다.
-- domain rule은 Rust application/domain layer에 둔다.
-- UI는 API를 호출하고 결과를 보여준다.
-
-## 14. 완료 기준
-
-작업 완료 전 확인한다.
-
-- Layered/Clean Architecture 의존 방향을 지켰는가
-- Tidy 작업과 behavior 변경을 구분했는가
-- 핵심 로직 테스트가 있는가
-- env var를 중간에 읽거나 바꾸지 않았는가
-- 외부 설정 파일을 불필요하게 늘리지 않았는가
-- log profile 3단계 원칙에 맞는가
-- secret redaction이 적용되는가
-- HTTP transport를 테스트 전용으로만 안내하고, 사용 시 경고/audit가 남는가
-- controller public key pinning이 동작하는가
-- authenticated agent만 task channel을 사용하는가
-- controller-signed task envelope를 검증하는가
-- unsigned/invalid/expired/replayed/target mismatch task를 거부하는가
-- high-risk command confirmation을 요구하는가
-- audit가 필요한 이벤트에 audit가 남는가
-- root 권한 실행 boundary가 명확한가
-- Web Admin UI에 domain rule이 중복되지 않았는가
-- 문서가 필요한 변경이면 문서를 갱신했는가
-
-## 15. 프로젝트 기본 명령 후보
-
-실제 구현 후 명령은 달라질 수 있지만, 작업자는 다음 방향을 기준으로 설계한다.
+- `fleet-domain`에 `tokio`, Axum, database client, Serde wire schema, filesystem adapter,
+  `tracing-subscriber`를 추가하지 않는다.
+- `fleet-application`에서 `std::env`, SQL, Axum, reqwest, tungstenite 또는 concrete store를
+  사용하지 않는다.
+- `fleet-protocol`은 transport serialization을 소유하지만 domain behavior를 복제하지
+  않는다. domain type 공유는 의도적인 value boundary에만 허용한다.
+- `fleet-store`와 `fleet-runner`는 서로를 import하지 않는다.
+- `fleet-controller` 또는 `fleet-cli`의 내부 DTO를 protocol source of truth로 사용하지
+  않는다.
+- `fleet-controller`와 `fleet-agent`에 `main.rs`를 만들지 않는다. binary와 service unit,
+  npm wrapper, release archive는 모두 resolved `fleet` binary를 사용한다.
+- `fleet-cli`가 현재 agent runtime을 포함한다는 사실은 migration 대상이지 새 domain
+  rule을 계속 넣을 허가가 아니다. agent-specific runtime을 `fleet-agent`로 옮길 때는
+  behavior test를 먼저 고정하고 작은 이동을 별도 tidy 단위로 수행한다.
+
+### 2.3 state와 side-effect owner
+
+- canonical persistent state의 write owner는 repository를 호출하는 application use case다.
+  HTTP handler, Web Admin, protocol decoder는 직접 write owner가 되지 않는다.
+- active WebSocket handle, channel sender, connection ack와 session liveness는 controller
+  runtime의 `SessionRegistry` 계열 state다. DB/domain object에 저장하지 않는다.
+- Job과 Assignment는 별도 canonical state다. Job aggregate가 Assignment terminal 상태를
+  덮어쓰지 않으며, target snapshot 이후 label 변화로 기존 target을 다시 계산하지 않는다.
+- output chunk, final result, Product Log, agent operational log, audit event와 rendered
+  artifact를 서로 다른 저장·retention 경계로 유지한다.
+- 한 canonical state에는 하나의 write owner만 둔다. 다른 component는 command 또는
+  typed port로 변경을 요청한다.
+
+### 2.4 component 분리 기준
+
+작은 module은 함께 둘 수 있다. 다음 중 하나가 생길 때만 물리적으로 분리한다.
+
+- 독립 변경 이유와 public contract가 있다.
+- 외부 I/O 또는 security boundary가 다르다.
+- 별도 lifecycle, cancellation 또는 resource owner가 있다.
+- 독립 contract/integration test가 필요하다.
+
+이 조건이 없으면 추측성 interface, repository, facade, wrapper 또는 새 crate를 만들지
+않는다. 큰 파일이라는 이유만으로 대규모 이동하지 않고 변경 축과 검증 가능한 seam을
+먼저 만든다.
+
+## 3. Language and Design Pattern Rules
+
+### 3.1 Rust
+
+- workspace `edition = "2024"`와 stable Rust에서 유효한 관용구를 사용한다. 저장소에
+  `rust-toolchain` pin이 없으므로 local compiler version을 repository requirement로
+  임의 고정하지 않는다.
+- 불변식과 식별자는 enum, newtype, private field와 validated constructor로 표현한다.
+- 상태 전이는 enum과 명시적 method/pure reducer를 우선하고 GoF class 계층을 복제하지
+  않는다.
+- 오류는 분류 가능한 enum/struct로 만들고 `Display`와 `Error` contract를 제공한다.
+  Domain public API에 `anyhow::Result`, raw SQL/network error 또는 문자열-only 상태를
+  노출하지 않는다.
+- `unwrap`과 `expect`는 test 또는 복구 불가능한 bootstrap invariant에서만 사용하고,
+  bootstrap에서도 민감 정보가 panic text에 포함되지 않게 한다.
+- async executor에서 blocking DB/process/filesystem 작업을 직접 오래 수행하지 않는다.
+  현재 blocking Postgres pool과 process runner는 infrastructure boundary에 격리하고,
+  async 호출자가 lock을 잡은 채 blocking 또는 network await를 하지 않게 한다.
+- `unsafe`를 추가하면 `# Safety` contract, 최소 범위, invariant test와 대안 검토를 같은
+  변경에 포함한다.
+- formatter는 `cargo fmt --all --check`, lint는
+  `cargo clippy --workspace --all-targets -- -D warnings`를 기준으로 한다.
+
+### 3.2 Web Admin JavaScript
+
+- 현재 Web Admin은 browser-native ES module과 static export다. 별도 승인된 architecture
+  변경 없이 React, Vite, Svelte, bundler, runtime Node server 또는 무거운 state framework를
+  추가하지 않는다.
+- `web-admin/tsconfig.json`의 `allowJs`, `checkJs`, `strict`, `noEmit` contract를 유지한다.
+- browser UI는 단방향 local view state와 `api-client.js` command/effect boundary를 쓴다.
+  render 중 직접 persistence, credential discovery 또는 controller 설정 변경을 하지 않는다.
+- API client type과 endpoint coverage는 `api.schema.json`, `docs/openapi.json`,
+  `scripts/typecheck.js`, `scripts/test.js`로 함께 검증한다.
+- admin token을 `localStorage`, 장기 browser storage, URL query 또는 rendered HTML에
+  저장하지 않는다.
+
+### 3.3 Shell, Node packaging과 workflow
+
+- shell script는 기존 interpreter(`sh` 또는 명시된 `bash`)의 문법 범위를 지키고,
+  `set -eu` 또는 `set -euo pipefail`을 해당 shell에 맞게 사용한다.
+- script 입력, destructive side effect와 exit behavior가 자명하지 않으면 shebang 직후에
+  설명한다. 경로와 인자는 quote하고 broad glob 또는 unresolved environment variable을
+  destructive target으로 쓰지 않는다.
+- npm/Node 코드는 Web Admin 검증과 binary distribution wrapper만 담당한다. Rust domain
+  behavior나 controller runtime을 JavaScript로 복제하지 않는다.
+- workflow expression, shell variable와 npm metadata 변경은 local check script로 검증한다.
+  release workflow는 GitHub-hosted runner와 npm Trusted Publishing OIDC를 유지한다.
+
+### 3.4 패턴 선택
+
+- Repository는 aggregate persistence, backend 교체와 shared contract test가 실제로
+  필요할 때만 쓴다. entity마다 repository를 만들지 않는다.
+- Adapter는 SQLite/Postgres, local/remote artifact, service/package manager, HTTP/wire DTO
+  변환 같은 실제 외부 경계에만 둔다.
+- Command/use case는 approval, audit, retry, queue 또는 지연 실행이 필요한 operation에
+  쓴다. 단순 동기 helper를 command object로 감싸지 않는다.
+- State machine은 retry, cancel, resume, arbitration 또는 둘 이상의 async 단계가 결합된
+  lifecycle에만 쓴다. 단순 parse/transform 흐름에는 만들지 않는다.
+- Supervisor/worker owner는 long-running restart/shutdown 책임이 있을 때만 둔다.
+- Strategy는 실제 교체되는 policy 축이 있을 때만 쓰고, 단일 함수나 closure로 충분하면
+  추가 trait 계층을 만들지 않는다.
+- process-local observer/stream은 일시 알림에만 쓴다. durable queue, replay source 또는
+  canonical write 경로를 대신하지 않는다.
+
+## 4. Code Documentation and Comments
+
+### 4.1 `source.md` 탐색 인덱스
+
+현재 저장소에는 `source.md`가 없다. 기존 누락을 한 번에 문서화하는 대규모 churn을 만들지
+않고 다음 source 변경부터 touched boundary에 점진적으로 도입한다.
+
+- 사람이 유지하는 production/test/tool/script source가 직접 3개 이상이거나, 독립된
+  ownership·architecture boundary·entrypoint가 있는 의미 있는 source directory에
+  `source.md`를 둔다.
+- 위 조건을 만족하는 `crates/*/src`, `web-admin`, 독립 `web-admin/scripts`, `scripts`,
+  `npm/fleet`과 `npm/fleet/scripts` 경계를 변경하면 가장 가까운 index를 생성하거나
+  갱신한다. 작은 하위 directory는 가장 가까운 상위 index에 포함한다.
+- index가 생긴 범위의 handwritten source는 가장 가까운 `source.md`에 정확히 한 번만
+  등재한다. 자체 index가 있는 하위 경계는 상위에서 개별 file을 중복하지 않고 index
+  link와 책임만 기록한다.
+- generated, vendored, dependency, fixture/snapshot, binary asset와 build output(`target`,
+  `web-admin/dist`, `dist`, platform binary)은 파일별 등재에서 제외한다. generator source,
+  schema 또는 handwritten wrapper만 등재한다.
+- 형식은 `Path | Kind | Responsibility | Boundary / Side effects`를 사용한다. Kind는
+  `Domain`, `Application`, `Protocol`, `Infrastructure`, `Interface`, `UI`, `Tooling`,
+  `Packaging`, `Test` 중 실제 책임에 맞는 값을 쓴다.
+- symbol/signature 목록, 알고리즘, 구현 절차, 진행 상태, 작성자, 변경 이력을 넣지 않는다.
+- `source.md`는 “어디에 무엇이 있는가”만 답하는 비권위 탐색 cache다. 코드, manifest,
+  test, schema와 승인된 public contract를 대신하지 않는다. index로 대상을 찾은 후 관련
+  source와 test를 직접 읽고 수정한다.
+
+Source 추가·삭제·이동 또는 책임·계층·state owner·중요 side effect가 바뀌면 같은
+변경에서 index를 갱신한다. private helper 추출, symbol rename 또는 formatting처럼 file
+책임이 유지되면 index를 바꾸지 않는다. 완료 전에 path, link, 누락, 중복과 실제 책임을
+확인한다.
+
+### 4.2 file/module와 declaration 문서
+
+- `source.md`는 위치, file/module header는 경계가 존재하는 이유, declaration 문서는
+  호출자 contract만 소유한다. 같은 설명을 반복하지 않는다.
+- Rust public module 또는 path만으로 ownership·invariant·I/O가 명확하지 않은 module은
+  파일 시작 `//!` rustdoc을 쓴다. public API, port/adapter boundary, security/state/
+  concurrency contract와 비자명한 algorithm은 `///`를 쓴다.
+- Rustdoc은 signature를 번역하지 않는다. 필요할 때만 domain parameter 의미, `# Returns`,
+  `# Errors`, `# Panics`, `# Safety`를 기록한다.
+- JavaScript public module 또는 복잡한 boundary는 `/** @file ... */`, exported function은
+  JSDoc을 사용한다. TypeScript type을 주석에서 반복하지 않고 입력 의미, side effect와
+  failure를 설명한다.
+- Shell function은 인자, stdout/stderr, exit status 또는 destructive side effect가
+  이름만으로 명확하지 않을 때 인접 `#` 주석을 쓴다.
+- 자명한 private helper, getter, test fixture, 짧은 adapter glue와 모든 named symbol에
+  문서를 강제하지 않는다. “무엇을 하는지”를 코드를 그대로 되풀이하는 주석은 삭제한다.
+- credential, 실제 사용자 데이터, raw token/key를 example에 넣지 않는다. 변경 이력은
+  주석이 아니라 version control에 둔다.
+
+### 4.3 contract 문서 동기화
+
+- REST route, request/response, permission 또는 error contract 변경은
+  `docs/api.md`, `docs/openapi.json`, 필요 시 `web-admin/api.schema.json`, API client와
+  coverage test를 같은 변경에서 갱신한다.
+- `docs/openapi.json`과 `web-admin/api.schema.json`은 현재 test로 검증되는 handwritten
+  contract snapshot이다. generator가 도입되기 전까지 서로 자동 생성물이라고 가정하지
+  않는다. generator 도입 후에는 generator source를 수정하고 output을 재생성한다.
+- wire message, version, lifecycle 또는 compatibility 변경은 `fleet-protocol` test와
+  `docs/protocol.md`를 함께 갱신한다.
+- schema, repository, migration, retention 또는 backup contract 변경은
+  `docs/storage.md`와 migration fixture/gate를 함께 갱신한다.
+- security, trust, auth, secret, approval 또는 audit boundary 변경은 `docs/security.md`와
+  `docs/security-checklist.md`를 갱신한다.
+- 사용자 command, 설치, warning 또는 workflow가 바뀌면 영어 `README.md`와 한국어
+  `README.ko.md`를 같은 변경에서 동기화한다.
+- 지원 상태가 바뀌면 `docs/feature-matrix.md`와 해당 release note의 current/partial/planned
+  표현을 실제 구현과 맞춘다.
+
+## 5. Configuration, Security, and Runtime
+
+### 5.1 bootstrap-only configuration
+
+- CLI argument, config file와 허용된 process environment는 process bootstrap에서 한 번
+  읽고 typed settings로 parse·validate한 뒤 immutable value로 명시적으로 전달한다.
+- Application/Domain, request handler, task execution 중간, Web Admin action과 background
+  worker에서 process environment 또는 config file을 다시 읽어 동작을 바꾸지 않는다.
+- `std::env::set_var`, `remove_var`, mutable global config, service locator, replaceable
+  singleton과 runtime config patch endpoint를 금지한다.
+- `std::env::consts`, `temp_dir`, `current_exe` 같은 platform/process 정보는 설정 재조회가
+  아니지만, 이 값으로 domain policy를 숨기지 않는다.
+- ignored Postgres integration test의 `FLEET_TEST_POSTGRES_URL`처럼 외부 integration
+  입력이 필요한 경우 test bootstrap에서만 한 번 읽고 production path와 분리한다.
+- child process별 환경이 필요하면 `Command` builder에 명시적으로 전달한다. parent process
+  environment를 변경하지 않는다.
+- npm postinstall/test script의 `process.env`는 해당 installer/test process의 입력
+  boundary로만 사용한다. Rust runtime 설정이나 숨은 product feature toggle로 확장하지
+  않는다.
+
+외부 설정 파일은 controller data/identity, agent identity/config, CLI credential profile,
+migration/fixture처럼 lifecycle과 owner가 명확한 경우에만 둔다. UI는 runtime 설정
+editor가 아니며 controller/agent config를 직접 수정하지 않는다.
+
+### 5.2 secret, identity와 transport
+
+- raw admin/enrollment token은 생성 시 한 번만 표시하고 hash만 저장한다. URL query,
+  Product/Field Log, audit, API response history, Web Admin state에 남기지 않는다.
+- secret은 typed `SecretRef` 또는 secure provider boundary로 전달한다. raw secret을 일반
+  file/DB/event에 저장하지 않고 `Display`/`Debug`/error에서 redact한다.
+- TLS server identity, controller Ed25519 signing identity, agent Ed25519 identity와 future
+  agent client certificate trust를 분리한다. fingerprint, key path와 certificate material을
+  서로 대체하지 않는다.
+- Agent는 signed task의 target, expiry, signing trust, nonce replay를 검증하고 하나라도
+  실패하면 실행하지 않는다. unsigned, invalid, expired, replayed, target-mismatch task는
+  typed rejection과 Security audit로 처리한다.
+- Agent task channel은 agent identity proof가 끝난 후에만 연다. enrollment token을
+  heartbeat/task channel credential로 재사용하지 않는다.
+- Controller task delivery 전에 Job/Assignment와 signed envelope를 durable store에 먼저
+  저장한다. active socket write 성공은 accepted 또는 started가 아니다.
+
+### 5.3 HTTP/TLS 정책
+
+- `http://` controller URL은 loopback, LAN, internal hostname을 포함해 기술적으로 허용하지만
+  setup check, local/lab test와 short-lived validation 전용이다.
+- product, customer, production, shared 또는 long-running 환경은 HTTPS/WSS를 사용한다.
+- HTTP 사용마다 명확한 insecure warning을 출력하고, Controller external URL이 HTTP이면
+  `insecure_http_transport_enabled` Security audit를 남긴다.
+- HTTP 허용을 위한 숨은 exception flag를 만들지 않는다. `0.0.0.0`과 `::`는 bind host로는
+  사용할 수 있어도 agent/controller external URL target으로는 거부한다.
+- `--agent-client-ca-cert`는 listener enforcement가 완성되기 전 fail-closed로 거부한다.
+  public certificate lifecycle metadata foundation을 full mTLS 지원이라고 문서화하지 않는다.
+
+### 5.4 root task와 authorization
+
+- root 또는 privileged task에는 allowed primitive, risk classification, approval, timeout,
+  cancel/kill, working-directory/path boundary, output limit와 audit를 둔다.
+- program과 args를 구조화해 process runner에 전달한다. Controller에서 받은 raw string을
+  기본 shell command로 연결하거나 recursive `/` 변경을 쉽게 허용하지 않는다.
+- high-risk confirmation flag는 compatibility acknowledgement일 뿐 approval을 대체하지
+  않는다. Controller application의 approval state가 dispatch authority다.
+- authenticated admin context가 actor와 permission을 결정한다. UI/request body의 actor,
+  role, confirmation text를 authorization 근거로 신뢰하지 않는다.
+- UI는 forbidden response를 표시할 수 있지만 권한, job state, agent state와 drift 결과를
+  자체 추론하거나 canonical write하지 않는다.
+
+### 5.5 persistence와 release security
+
+- Audit는 API/Application 경계에서 append-only이며 일반 retention에서 제외한다. 현재
+  SQLite audit를 tamper-proof WORM이라고 주장하지 않는다.
+- destructive migration은 backup, previous-schema fixture, rehearsal, explicit operator
+  confirmation과 rollback 없이 수행하지 않는다.
+- npm release workflow는 GitHub Actions OIDC Trusted Publisher를 사용한다. long-lived
+  `NPM_TOKEN`을 workflow에 다시 추가하거나 secret 값을 읽고 출력하려 하지 않는다.
+- repository license, Cargo/npm package metadata와 배포 binary license는
+  `AGPL-3.0-only`로 일치시킨다.
+
+## 6. State, Concurrency, and Logging
+
+### 6.1 state machine 규칙
+
+다음처럼 retry, approval, cancellation, resume, rotation 또는 여러 async 단계가 결합된
+lifecycle은 Domain state machine으로 관리한다.
+
+- Job과 Assignment
+- Approval과 remediation
+- Agent certificate lifecycle
+- Controller signing key rotation과 staged trust rollout
+- 향후 signed update/rollback lifecycle
+
+각 state machine은 state, event/operation, guard, effect, timestamp/sequence, failure와
+terminal state를 정의한다. happy path뿐 아니라 invalid transition, duplicate, stale,
+late result, cancel/timeout race, snapshot restore와 replay를 test한다. 단순 동기 parse,
+formatting 또는 one-shot command에 state machine을 만들지 않는다.
+
+### 6.2 WebSocket과 background concurrency
+
+- Agent가 Controller에 outbound session을 열며 Controller는 Agent로 inbound 접속하지
+  않는다. heartbeat는 connection open cycle이나 task dispatch cadence가 아니다.
+- session당 WebSocket writer는 하나만 둔다. heartbeat, task, telemetry producer는 bounded
+  outbound queue로 writer에 전달한다.
+- store mutex/transaction/connection checkout을 잡은 상태에서 WebSocket read/write await를
+  하지 않는다.
+- duplicate session은 new session wins를 기본으로 하고 이전 session close reason과 audit를
+  남긴다. revoked/disabled agent session은 revoke 성공 직후 닫는다.
+- queue overflow, disconnect와 send failure가 durable Assignment를 잃게 하지 않는다.
+  queued/dispatched claim과 release transition은 repository contract를 통과한다.
+- output chunk와 result는 sequence/idempotency 규칙을 갖는다. 같은 key와 같은 body는
+  duplicate로 허용할 수 있지만, 같은 key와 다른 body는 raw body 없이 security conflict로
+  처리한다.
+- background worker와 spawned task에는 owner, bounded interval/backoff, cancellation,
+  progress/timeout 기준, error reporting과 graceful shutdown path를 둔다. owner 없는 detached
+  task를 추가하지 않는다.
+- scheduled drift, retention, signing staged rollout은 현재 single-controller runtime
+  limitation을 유지한다. lease/leader election 없이 HA-safe라고 주장하지 않는다.
+- agent command/runbook execution이 session read/write와 heartbeat를 막지 않게 하고,
+  cancel/timeout 시 child process를 종료한 후 별도 terminal status를 보고한다.
+
+### 6.3 세 가지 로그 profile
+
+모든 application log는 다음 중 하나로 분류한다. 분류할 수 없으면 추가하지 않는다.
+
+- `Product`: 기본값. 사용자 영향, lifecycle 시작/종료와 terminal result만 낮은 volume의
+  structured field로 기록한다.
+- `FieldDebug`: bootstrap에서 승인된 범위·기간·보존 정책 안에서 protocol type, retry,
+  selector count, latency와 redacted transition detail을 기록한다.
+- `Development`: local/test 전용의 상세 진단이다. production 기본 profile로 활성화하지
+  않고 실제 customer secret 환경에서 사용하지 않는다.
+
+Rust application log는 `tracing`을 사용한다. `println!`/`eprintln!`은 CLI의 명시적 사용자
+출력, warning과 fatal result에만 허용하고 application event logging에 사용하지 않는다.
+`dbg!`는 production path에 남기지 않는다.
+
+어떤 profile에도 raw token/password/private key/certificate body, request body 전체,
+environment dump, command stdout/stderr, rendered secret artifact body, private key path 또는
+stack trace flood를 기록하지 않는다. job stdout/stderr는 job output storage, agent product-safe
+operational event는 agent log storage에 둔다. 민감 field는 structured field를 만들기 전에
+redact하며 raw error 문자열을 Product/Field Log에 그대로 전달하지 않는다.
+
+## 7. TDD, Tidy First, and Delivery Workflow
+
+### 7.1 production behavior 변경
+
+1. 관련 `AGENTS.md`, `source.md`, source, test, public docs, current diff를 읽는다.
+2. 작업별 방법론과 위험을 기록한다.
+3. 예상한 이유로 실패하는 가장 작은 test를 작성하고 실제 실패를 확인한다.
+4. test를 통과시키는 최소 production 구현을 한다.
+5. 관련 unit/contract/integration test와 security/logging 영향을 확인한다.
+6. behavior를 보존하며 이름, 중복과 boundary를 정리한다.
+7. public contract, source index와 문서를 같은 변경에서 동기화한다.
+8. formatter, lint, test, smoke와 diff gate를 위험에 비례해 실행한다.
+
+문서-only, typo, 단순 사용자 문구 변경은 failing test를 먼저 만들 필요가 없다. 다만 link,
+command, schema reference, 영어/한국어 동기화와 `git diff --check`를 검증한다. test 삭제,
+assertion 약화 또는 fake success fallback으로 실패를 숨기지 않는다.
+
+### 7.2 Tidy First
+
+Tidy First는 모든 작업 앞에 자동으로 수행하는 단계가 아니다. 기존 구조가 필요한 변경을
+방해할 때만 다음 behavior-preserving 정리를 먼저 분리한다.
+
+- 이름 명확화, 작은 helper 추출, duplicate fixture 정리
+- 실제 boundary에 맞춘 trait seam 또는 module 이동
+- error type과 dependency 방향 정리
+- `fleet-cli`의 agent runtime을 `fleet-agent`로 옮기기 위한 작은 characterization seam
+
+tidy에 schema, protocol, public API, 사용자 behavior, unrelated formatting, 대규모 folder
+이동 또는 미래를 위한 abstraction을 섞지 않는다. tidy와 feature를 같은 요청에서 수행해야
+하면 diff section, task 또는 commit을 분리한다.
+
+### 7.3 compatibility, migration과 성능
+
+- public API, OpenAPI, protocol, persistence, serialization과 npm package 변경은 version
+  compatibility, old/new 양쪽 contract test, migration과 rollback 근거를 포함한다.
+- protocol unknown field/version/rejection policy를 명시하고 legacy fixture를 유지한다.
+- SQLite schema 변경은 `CURRENT_SCHEMA_VERSION`, repeatable migration, previous-version
+  fixture, legacy row 보존, backup newer-schema rejection을 검증한다.
+- Postgres 변경은 `postgres` feature와 shared repository contract를 별도로 검증한다.
+- destructive migration, key rotation, release tag와 package publish는 rehearsal과 rollback
+  없이 실행하지 않는다.
+- 성능 변경은 baseline, 측정 방법, representative load와 회귀 허용치를 먼저 정의한다.
+  근거 없이 batch size, concurrency, cache, DB index, SQLite pragma를 바꾸지 않는다.
+
+### 7.4 검증 명령 선택
+
+가장 작은 관련 gate부터 실행하고 위험이 커질수록 넓힌다.
 
 ```bash
-cargo fmt
-cargo clippy --workspace --all-targets
+# Rust targeted/full
+cargo test -p <crate> <test-name>
+cargo fmt --all --check
 cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo tree -p fleet-domain
 
-npm install
-npm run build --workspace web-admin
+# Postgres feature 변경
+cargo test -p fleet-store --features postgres
+cargo test -p fleet-controller --features postgres
+
+# Web Admin
 npm test --workspace web-admin
+npm run typecheck --workspace web-admin
+npm run build --workspace web-admin
+
+# npm wrapper/release metadata
+npm test --workspace @sponzey/fleet
+
+# security/release
+./scripts/hardening_audit.sh
+./scripts/release_readiness_gate.sh
+git diff --check
 ```
 
-npm은 Rust core 런타임이 아니라 Web Admin UI 빌드와 바이너리 배포 wrapper에 사용한다.
+manual Linux/root, real Postgres, registry publish와 external account 검증은 자동 local gate와
+구분해 보고한다. 실행하지 않은 command를 통과했다고 쓰지 않는다. 전체 release 기준은
+`docs/release-gate.md`가 소유하며, 변경 범위에 해당하는 focused/manual gate도 적용한다.
 
-## 16. 최종 원칙
+### 7.5 release와 Git
 
-Sponzey Fleet는 운영 자동화 제품이다. 빠른 데모보다 중요한 것은 신뢰 가능한 실행 경계, 감사 가능성, 설정의 명시성, 테스트 가능한 구조다.
+- release version은 root `Cargo.toml`, `Cargo.lock`, root/npm package manifests와 platform
+  optional dependency version을 함께 맞춘다.
+- 다섯 npm package의 name, repository, `AGPL-3.0-only` license와 version을 검증한다.
+- `.github/workflows/npm-release.yml`의 Trusted Publisher identity는 organization
+  `sponzey-lab`, repository `Fleet`, workflow `npm-release.yml`과 일치해야 한다.
+- publish job에만 `id-token: write`를 주고, 필요한 release upload 범위에만
+  `contents: write`를 둔다.
+- 이미 publish된 tag를 이동하거나 재사용하지 않는다. 수정은 새 version commit과 새 tag로
+  release한다.
+- 이 repository를 GitHub에 push/publish하기 전 remote가
+  `sponzey-lab/Fleet`인지, active `gh` account가 `Leonard-Sponzey`인지 확인한다.
+- commit, tag, push, publish, release 생성은 사용자가 명시적으로 요청했을 때만 수행한다.
+  요청을 받으면 working tree, branch, remote, version gate와 registry 결과를 확인한다.
 
-개발자는 다음 판단 기준을 계속 사용한다.
+## 8. Code Review and Prohibited Patterns
 
-- 이 코드는 테스트 가능한가
-- 이 설정은 언제, 어디서, 한 번만 결정되는가
-- 이 로그는 누구를 위한 로그인가
-- 이 기능은 domain/application/infrastructure 중 어디에 속하는가
-- 이 실행은 audit와 approval이 필요한가
-- 이 UI는 얇은 운영 표면인가, 아니면 business rule을 복제하고 있는가
+### 8.1 Code Review Checklist
 
-이 질문에 명확히 답하지 못하면 구현을 멈추고 구조를 먼저 정리한다.
+- 선택한 방법론과 패턴이 현재 순간, 위험, Rust/JavaScript/Shell 특성과 실행 단위에
+  맞는가?
+- 현재 구현과 목표 구조를 구분했고 존재하지 않는 기능을 완료로 주장하지 않았는가?
+- 계층 책임, crate dependency 방향, canonical state owner와 side-effect boundary가
+  유지되는가?
+- DTO, domain, persistence, view model과 wire schema가 boundary에서 변환되는가?
+- 설정·secret·log·event에 runtime env lookup, hidden global 또는 민감 정보가 없는가?
+- task signature, target, expiry, replay, approval와 authorization guard를 우회하지 않는가?
+- background/concurrent 작업의 bounded queue, cancellation, stale/duplicate event, retry와
+  shutdown이 검증되는가?
+- WebSocket write 전에 durable Job/Assignment가 저장되고 store lock이 await를 가로지르지
+  않는가?
+- public API/protocol/schema/persistence 변경에 compatibility, migration, rollback과 양쪽
+  contract test가 있는가?
+- index 적용 범위의 handwritten source가 가장 가까운 `source.md`에 정확히 한 번 등재되고
+  path/link/책임/boundary가 실제 source와 맞는가?
+- file/module/declaration 문서가 언어 관용구와 실제 contract를 따르며 `source.md` 또는
+  signature를 반복하지 않는가?
+- failing test를 구현 전에 실행했고 formatter, static analysis, 관련 test/smoke를 실제로
+  실행했는가?
+- 자동 검증과 외부 계정, registry, real DB, root/device/운영 환경의 수동 검증을 구분했는가?
+- 영어/한국어 README와 current feature/security/protocol/storage 문서가 서로 일치하는가?
+
+### 8.2 Prohibited Patterns
+
+다음을 추가하거나 권장하지 않는다.
+
+- 추측성 interface/abstraction, interface-per-class, 깊은 상속, pattern 이름만 위한 wrapper
+- global mutable state, service locator, runtime-replaceable singleton, owner 없는 task
+- 문자열 topic/dynamic payload EventBus로 durable state나 typed protocol을 대체하는 구조
+- Domain/Application의 DB, filesystem, network, environment 또는 concrete client 접근
+- HTTP handler/Web Admin의 직접 SQL, process execution, credential/config mutation
+- UI가 authorization, Job/Assignment/Agent state 또는 drift policy를 재구현하는 구조
+- 여러 producer가 같은 WebSocket writer를 직접 소유하거나 socket handle을 DB에 저장하는 구조
+- DB write 전 task 전송, output chunk를 success로 해석, send success를 accepted로 해석하는 구조
+- controller-signed envelope, approval, expiry, replay 또는 target validation 우회
+- unrestricted shell, broad recursive root path, timeout/output limit/cancel 없는 privileged task
+- raw secret/token/key/certificate/output/request/environment를 log, audit, API, UI에 dump하는 코드
+- production failure를 fake data, seeded response, success-looking fallback으로 숨기는 코드
+- runtime env/config patch, hidden YAML feature toggle, UI runtime settings editor
+- source를 읽지 않고 stale `source.md`만 믿는 변경, 깨진 link·누락·중복 index
+- 모든 file/symbol에 강제하는 상투적 주석, signature 반복, 코드와 어긋난 stale comment
+- generated/build output 직접 수정, test 삭제, assertion 약화, unrelated formatting churn
+- 근거 없는 concurrency/cache/index/pragma/retention 변경
+- full mTLS, S3, HA, OIDC, Windows/auto-update를 foundation만으로 구현 완료라고 표시하는 문서
+- npm release workflow의 long-lived `NPM_TOKEN`, published tag 이동 또는 version 불일치 publish
+
+## 9. Required Agent Behavior and Decision Rules
+
+- 작업 전에 이 문서, 더 가까운 `AGENTS.md`, 관련 `source.md`, source, test, public docs,
+  manifest, current branch와 `git diff`를 읽는다.
+- 검색은 `rg`와 `rg --files`를 우선하고, index로 찾은 target은 수정 전에 직접 읽는다.
+- 사용자 변경과 unrelated dirty worktree를 되돌리거나 덮어쓰지 않는다. overlap을 피할 수
+  없으면 중단하고 사용자에게 정확한 충돌을 보고한다.
+- production behavior 변경은 failing test를 먼저 실행한다. 예상과 다른 이유로 실패하면
+  구현 전에 test 또는 가정을 교정한다.
+- source 추가·이동·삭제 또는 책임 변경 시 가장 가까운 `source.md`를 같은 변경에서
+  생성·갱신한다. public/boundary contract 변경 시 언어 관용적인 documentation도 함께
+  갱신한다.
+- API, schema, protocol, 설정, 사용자 문구, permission, data ownership, migration,
+  retention과 release contract 변경을 최종 보고에서 명시한다.
+- secret이나 GitHub Actions secret 값을 읽어 공개하려 하지 않는다. secret 이름/설정
+  존재 확인과 raw value 접근을 구분한다.
+- destructive action은 정확한 target을 read-only로 확인하고 recovery/backup을 확보한다.
+  workspace root, home 또는 unresolved broad path를 recursive delete target으로 사용하지 않는다.
+- 현재 요청과 무관한 문제는 scope를 확대해 즉석 수정하지 않는다. 목표, 입력, 출력,
+  검증과 완료 기준이 있는 follow-up으로 기록한다.
+- 실행한 command와 과거 기록을 구분하고, 실행하지 않은 test·manual gate·external publish를
+  완료로 보고하지 않는다.
+- 요구가 제품 범위, public contract, canonical owner 또는 security posture를 바꾸며 근거로
+  결정할 수 없으면 임의 선택하지 않고 선택지와 trade-off를 사용자에게 요청한다.
+- 완료 시 변경 file, behavior/contract 영향, 실제 검증 결과, 남은 manual/external gate와
+  알려진 limitation을 간결하게 보고한다.

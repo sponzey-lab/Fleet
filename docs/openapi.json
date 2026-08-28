@@ -28,7 +28,7 @@
         "type": "http",
         "scheme": "bearer",
         "bearerFormat": "admin-token",
-        "description": "Paste the admin token printed by `sponzey controller init`. Do not use real tokens in examples or logs."
+        "description": "Paste the admin token printed by `fleet controller init`. Do not use real tokens in examples or logs."
       }
     },
     "schemas": {
@@ -218,8 +218,8 @@
             "type": "array",
             "items": { "type": "string" },
             "example": [
-              "sponzey controller signing-rotation-status --controller-url <controller-url>",
-              "sponzey controller signing-rotation restart-plan --controller-url <controller-url>"
+              "fleet controller signing-rotation-status --controller-url <controller-url>",
+              "fleet controller signing-rotation restart-plan --controller-url <controller-url>"
             ]
           },
           "safety_notes": {
@@ -288,14 +288,14 @@
           "selected_signing_fingerprint_prefix": { "type": "string", "example": "new-fp-12345678" },
           "service_command": {
             "type": "string",
-            "example": "sponzey controller restart-service --dry-run"
+            "example": "fleet controller restart-service --dry-run"
           },
           "verification_commands": {
             "type": "array",
             "items": { "type": "string" },
             "example": [
-              "sponzey controller signing-rotation-status --controller-url <controller-url>",
-              "sponzey controller signing-rotation restart-plan --controller-url <controller-url>"
+              "fleet controller signing-rotation-status --controller-url <controller-url>",
+              "fleet controller signing-rotation restart-plan --controller-url <controller-url>"
             ]
           },
           "safety_notes": {
@@ -343,12 +343,12 @@
           "candidate_public_key_path": {
             "type": "string",
             "description": "Controller-local candidate public key file path.",
-            "example": "/var/lib/sponzey-fleet/controller/candidate_public.key"
+            "example": "/var/lib/fleet/controller/candidate_public.key"
           },
           "candidate_private_key_path": {
             "type": "string",
             "description": "Controller-local candidate private key file path. The response never echoes this value.",
-            "example": "/var/lib/sponzey-fleet/controller/candidate_private.key"
+            "example": "/var/lib/fleet/controller/candidate_private.key"
           },
           "reason": { "type": ["string", "null"], "example": "candidate keypair validated on controller host" }
         },
@@ -368,7 +368,7 @@
           "previous_public_key_path": {
             "type": ["string", "null"],
             "description": "Controller-local public key file path for the previous signing key during dual-trust rollout. The path is not returned or logged.",
-            "example": "/var/lib/sponzey-fleet/controller/controller_public.key.bak"
+            "example": "/var/lib/fleet/controller/controller_public.key.bak"
           },
           "agent_ids": {
             "type": "array",
@@ -442,7 +442,7 @@
           "previous_public_key_path": {
             "type": ["string", "null"],
             "description": "Controller-local public key file path for the previous signing key during dual-trust rollout. The path is used only to build the public-only trust bundle and is not returned or logged.",
-            "example": "/var/lib/sponzey-fleet/controller/controller_public.key.bak"
+            "example": "/var/lib/fleet/controller/controller_public.key.bak"
           },
           "agent_ids": {
             "type": "array",
@@ -1378,6 +1378,7 @@
           "approval_required",
           "risk_summary",
           "job_id",
+          "lifecycle_source",
           "created_at_ms",
           "updated_at_ms"
         ],
@@ -1391,6 +1392,11 @@
           "approval_required": { "type": "boolean", "example": true },
           "risk_summary": { "type": "string", "example": "drifted policy requires approved remediation" },
           "job_id": { "type": ["string", "null"], "example": "job-remediation-01" },
+          "lifecycle_source": { "type": "string", "enum": ["persisted"], "description": "Lifecycle fields are derived from persisted remediation, assignment, and evidence rows." },
+          "verification_job_id": { "type": "string", "description": "Correlated verification drift Job, when scheduled." },
+          "verification_assignment_status": { "type": "string", "description": "Persisted verification assignment state; `failed` means verification did not establish remediation success." },
+          "verification_evidence_status": { "type": "string", "enum": ["compliant", "drifted", "unknown"], "description": "Persisted correlated verification evidence status, when received." },
+          "legacy_state": { "type": "string", "enum": ["legacy_unverified", "legacy_blocked"], "description": "Historical provenance-free row state. It is not promoted to verified automatically." },
           "created_at_ms": { "type": "integer", "example": 1710000000000 },
           "updated_at_ms": { "type": "integer", "example": 1710000000000 }
         },
@@ -1452,6 +1458,7 @@
         "additionalProperties": false
       },
       "RemediationJobRunningRequest": {
+        "deprecated": true,
         "type": "object",
         "required": ["job_id"],
         "properties": {
@@ -1460,6 +1467,7 @@
         "additionalProperties": false
       },
       "RemediationJobResultRequest": {
+        "deprecated": true,
         "type": "object",
         "required": ["job_id", "status"],
         "properties": {
@@ -1474,6 +1482,7 @@
         "additionalProperties": false
       },
       "RemediationVerifyRequest": {
+        "deprecated": true,
         "type": "object",
         "required": ["agent_id", "policy_id", "policy_name", "job_id"],
         "properties": {
@@ -2149,8 +2158,8 @@
             "application/json": {
               "schema": { "$ref": "#/components/schemas/ControllerSigningRotationValidateBody" },
               "example": {
-                "candidate_public_key_path": "/var/lib/sponzey-fleet/controller/candidate_public.key",
-                "candidate_private_key_path": "/var/lib/sponzey-fleet/controller/candidate_private.key",
+                "candidate_public_key_path": "/var/lib/fleet/controller/candidate_public.key",
+                "candidate_private_key_path": "/var/lib/fleet/controller/candidate_private.key",
                 "reason": "candidate keypair validated on controller host"
               }
             }
@@ -2277,7 +2286,7 @@
             "application/json": {
               "schema": { "$ref": "#/components/schemas/ControllerSigningTrustBundleRolloutBody" },
               "example": {
-                "previous_public_key_path": "/var/lib/sponzey-fleet/controller/controller_public.key.bak",
+                "previous_public_key_path": "/var/lib/fleet/controller/controller_public.key.bak",
                 "agent_ids": ["agent-1", "agent-2"]
               }
             }
@@ -2311,7 +2320,7 @@
             "application/json": {
               "schema": { "$ref": "#/components/schemas/ControllerSigningTrustBundleStagedRolloutBody" },
               "example": {
-                "previous_public_key_path": "/var/lib/sponzey-fleet/controller/controller_public.key.bak",
+                "previous_public_key_path": "/var/lib/fleet/controller/controller_public.key.bak",
                 "agent_ids": ["agent-1", "agent-2", "agent-3"],
                 "batch_size": 10,
                 "max_failures": 1,
@@ -2348,7 +2357,7 @@
             "application/json": {
               "schema": { "$ref": "#/components/schemas/ControllerSigningTrustBundleRolloutBody" },
               "example": {
-                "previous_public_key_path": "/var/lib/sponzey-fleet/controller/controller_public.key.bak",
+                "previous_public_key_path": "/var/lib/fleet/controller/controller_public.key.bak",
                 "agent_ids": ["agent-1", "agent-2", "agent-3"],
                 "max_agent_count": 25
               }
@@ -3370,7 +3379,7 @@
       "get": {
         "tags": ["Remediations"],
         "summary": "List remediation requests.",
-        "description": "Returns remediation metadata only. Raw runbook bodies, rendered artifacts, command output, tokens, and secrets are not returned.",
+        "description": "Returns persisted remediation lifecycle metadata, including correlated verification state and legacy markers. Raw runbook bodies, rendered artifacts, command output, tokens, and secrets are not returned.",
         "security": [{ "bearerAuth": [] }],
         "parameters": [
           {
@@ -3421,7 +3430,7 @@
       "get": {
         "tags": ["Remediations"],
         "summary": "Get remediation request metadata.",
-        "description": "Returns one remediation metadata record without raw runbook bodies, rendered artifacts, command output, tokens, or secrets.",
+        "description": "Returns one persisted remediation lifecycle record without raw runbook bodies, rendered artifacts, command output, tokens, or secrets.",
         "security": [{ "bearerAuth": [] }],
         "parameters": [
           { "name": "remediation_id", "in": "path", "required": true, "schema": { "type": "string" } }
@@ -3512,8 +3521,9 @@
     "/api/remediations/{remediation_id}/running": {
       "post": {
         "tags": ["Remediations"],
-        "summary": "Mark remediation job running.",
-        "description": "Moves a job_created remediation to running after the linked job starts. The request must provide the matching job id.",
+        "summary": "Deprecated manual remediation running transition.",
+        "description": "Deprecated compatibility endpoint. It always returns 409 and cannot write lifecycle state; authenticated agent task events are authoritative.",
+        "deprecated": true,
         "security": [{ "bearerAuth": [] }],
         "parameters": [
           { "name": "remediation_id", "in": "path", "required": true, "schema": { "type": "string" } }
@@ -3527,26 +3537,18 @@
           }
         },
         "responses": {
-          "200": {
-            "description": "Updated remediation metadata.",
-            "content": {
-              "application/json": {
-                "schema": { "$ref": "#/components/schemas/RemediationRequestResponse" }
-              }
-            }
-          },
-          "400": { "$ref": "#/components/responses/BadRequest" },
+          "409": { "$ref": "#/components/responses/Conflict" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
-          "403": { "$ref": "#/components/responses/Forbidden" },
-          "404": { "$ref": "#/components/responses/NotFound" }
+          "403": { "$ref": "#/components/responses/Forbidden" }
         }
       }
     },
     "/api/remediations/{remediation_id}/result": {
       "post": {
         "tags": ["Remediations"],
-        "summary": "Record remediation job result.",
-        "description": "Records the linked remediation job result. Success moves the remediation to succeeded_pending_verify; it does not mark drift resolved until verification evidence matches.",
+        "summary": "Deprecated manual remediation result transition.",
+        "description": "Deprecated compatibility endpoint. It always returns 409 and cannot write lifecycle state; authenticated agent task results are authoritative.",
+        "deprecated": true,
         "security": [{ "bearerAuth": [] }],
         "parameters": [
           { "name": "remediation_id", "in": "path", "required": true, "schema": { "type": "string" } }
@@ -3560,26 +3562,18 @@
           }
         },
         "responses": {
-          "200": {
-            "description": "Updated remediation metadata.",
-            "content": {
-              "application/json": {
-                "schema": { "$ref": "#/components/schemas/RemediationRequestResponse" }
-              }
-            }
-          },
-          "400": { "$ref": "#/components/responses/BadRequest" },
+          "409": { "$ref": "#/components/responses/Conflict" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
-          "403": { "$ref": "#/components/responses/Forbidden" },
-          "404": { "$ref": "#/components/responses/NotFound" }
+          "403": { "$ref": "#/components/responses/Forbidden" }
         }
       }
     },
     "/api/remediations/{remediation_id}/verify": {
       "post": {
         "tags": ["Remediations"],
-        "summary": "Verify remediation resolution.",
-        "description": "Marks remediation resolved only when agent id, policy id, policy name, job id, and latest drift evidence match. Mismatched evidence is rejected.",
+        "summary": "Deprecated manual remediation verification.",
+        "description": "Deprecated compatibility endpoint. It always returns 409 and cannot resolve remediation; persisted successful verification results and fresh correlated evidence are authoritative.",
+        "deprecated": true,
         "security": [{ "bearerAuth": [] }],
         "parameters": [
           { "name": "remediation_id", "in": "path", "required": true, "schema": { "type": "string" } }
@@ -3593,18 +3587,9 @@
           }
         },
         "responses": {
-          "200": {
-            "description": "Resolved remediation metadata.",
-            "content": {
-              "application/json": {
-                "schema": { "$ref": "#/components/schemas/RemediationRequestResponse" }
-              }
-            }
-          },
-          "400": { "$ref": "#/components/responses/BadRequest" },
+          "409": { "$ref": "#/components/responses/Conflict" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
-          "403": { "$ref": "#/components/responses/Forbidden" },
-          "404": { "$ref": "#/components/responses/NotFound" }
+          "403": { "$ref": "#/components/responses/Forbidden" }
         }
       }
     },

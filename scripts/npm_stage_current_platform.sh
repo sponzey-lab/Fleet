@@ -10,7 +10,7 @@ usage() {
   cat >&2 <<EOF
 usage: $0 [--out-dir <directory>] [--profile release|debug]
 
-Builds the Rust sponzey binary for the current OS/architecture and stages the
+Builds the Rust fleet binary for the current OS/architecture and stages the
 matching npm platform package under <directory>/fleet-<os>-<arch>.
 EOF
 }
@@ -68,11 +68,11 @@ esac
 case "$BUILD_PROFILE" in
   release)
     CARGO_PROFILE_ARG="--release"
-    BINARY_PATH="$REPO_ROOT/target/release/sponzey"
+    BINARY_PATH="$REPO_ROOT/target/release/fleet"
     ;;
   debug)
     CARGO_PROFILE_ARG=""
-    BINARY_PATH="$REPO_ROOT/target/debug/sponzey"
+    BINARY_PATH="$REPO_ROOT/target/debug/fleet"
     ;;
   *)
     echo "unsupported build profile: $BUILD_PROFILE" >&2
@@ -96,7 +96,7 @@ rm -rf "$STAGED_PLATFORM_DIR"
 mkdir -p "$STAGED_PLATFORM_DIR/bin"
 cp "$PLATFORM_SOURCE_DIR/package.json" "$STAGED_PLATFORM_DIR/package.json"
 cp "$PLATFORM_SOURCE_DIR/README.md" "$STAGED_PLATFORM_DIR/README.md"
-cp "$BINARY_PATH" "$STAGED_PLATFORM_DIR/bin/sponzey"
-chmod +x "$STAGED_PLATFORM_DIR/bin/sponzey"
+cp "$BINARY_PATH" "$STAGED_PLATFORM_DIR/bin/fleet"
+chmod +x "$STAGED_PLATFORM_DIR/bin/fleet"
 
 echo "staged @sponzey/$PLATFORM_PACKAGE at $STAGED_PLATFORM_DIR"

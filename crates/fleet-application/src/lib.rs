@@ -2,11 +2,12 @@ use fleet_domain::{
     Agent, AgentCapabilitySnapshot, AgentError, AgentId, AgentLabel, AgentStatus, ApprovalId,
     ApprovalRequest, ApprovalStatus, ArtifactChecksum, ArtifactId, ArtifactRetentionClass,
     AuditActor, AuditCategory, AuditEvent, AuditTarget, AuditValue, CapabilitySnapshotStatus,
-    CommandTask, DriftCheckTask, DriftReport, Job, JobError, JobId, JobStatus, JobTarget, Policy,
+    CommandTask, DriftCheckTask, DriftJobProvenance, DriftReport, DriftReportId,
+    DriftReportProvenance, DriftStatus, Job, JobError, JobId, JobStatus, JobTarget, Policy,
     RemediationRequest, RemediationStatus, RenderedArtifactMetadata, RunbookExecutionTask,
     RuntimePrimitive, SecretRef, Selector, TaskEnvelope, TaskExpiry, TaskId, TaskKind, TaskNonce,
     TaskSignature, TemplateRenderError, TemplateSecretResolutionFailure, TemplateVariableValue,
-    approval_requirement_for_task, scheduled_drift_due,
+    VerifiedDriftEvidence, approval_requirement_for_task, scheduled_drift_due,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Debug, Display, Formatter};
@@ -424,6 +425,17 @@ pub trait DriftCheckJobRepository:
             self.save_assignment(assignment.clone())?;
         }
         Ok(())
+    }
+
+    fn save_drift_check_job_with_assignments_and_provenance(
+        &mut self,
+        job: Job,
+        task: &DriftCheckTask,
+        assignments: &[TaskEnvelope],
+        provenance: Option<&DriftJobProvenance>,
+    ) -> Result<(), <Self as TaskAssignmentRepository>::Error> {
+        let _ = provenance;
+        self.save_drift_check_job_with_assignments(job, task, assignments)
     }
 }
 
@@ -915,15 +927,21 @@ fn retention_summary_value(summary: RetentionCleanupSummary) -> String {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DriftReportRecord {
+    pub id: DriftReportId,
     pub agent_id: String,
     pub report: DriftReport,
+    /// Only controller-verified provenance may make this report automation evidence.
+    pub provenance: DriftReportProvenance,
     pub checked_at: SystemTime,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DriftReportPageRecord {
+    pub id: DriftReportId,
     pub agent_id: String,
     pub report: DriftReport,
+    /// Carries the same authority boundary as the non-paged report record.
+    pub provenance: DriftReportProvenance,
     pub checked_at: SystemTime,
     pub cursor: SnapshotPageCursor,
 }
@@ -937,6 +955,19 @@ pub trait DriftRepository {
         report: &DriftReport,
         checked_at: SystemTime,
     ) -> Result<(), Self::Error>;
+
+    /// Persists provenance only when the caller has independently verified it.
+    /// Implementations must not infer authority from report payload fields.
+    fn insert_drift_report_with_provenance(
+        &mut self,
+        agent_id: &str,
+        report: &DriftReport,
+        provenance: &DriftReportProvenance,
+        checked_at: SystemTime,
+    ) -> Result<(), Self::Error> {
+        let _ = provenance;
+        self.insert_drift_report(agent_id, report, checked_at)
+    }
     fn latest_drift_report(&self, agent_id: &str)
     -> Result<Option<DriftReportRecord>, Self::Error>;
     fn list_drift_reports(
@@ -2042,8 +2073,7 @@ pub struct RemediationApprovalInput {
 pub struct CreateRemediationRequestInput {
     pub remediation_id: String,
     pub policy: Policy,
-    pub drift_report: DriftReport,
-    pub agent_id: String,
+    pub origin: VerifiedDriftEvidence,
     pub actor: String,
     pub requested_at: SystemTime,
 }
@@ -2059,8 +2089,65 @@ pub struct RemediationRequestRecord {
     pub approval_required: bool,
     pub risk_summary: String,
     pub job_id: Option<String>,
+    pub origin_drift_report_id: Option<DriftReportId>,
+    pub policy_version: Option<u32>,
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemediationProposalSave {
+    pub remediation: RemediationRequestRecord,
+    pub created: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistVerifiedDriftProposalInput {
+    pub agent_id: String,
+    pub report: DriftReport,
+    pub provenance: DriftReportProvenance,
+    pub remediation: RemediationRequestRecord,
+    pub drift_audit: AuditEvent,
+    pub proposal_audit: AuditEvent,
+    pub checked_at: SystemTime,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistVerifiedDriftProposalUseCaseInput {
+    pub remediation_id: String,
+    pub policy: Policy,
+    pub agent_id: String,
+    pub report: DriftReport,
+    pub provenance: DriftReportProvenance,
+    pub actor: String,
+    pub requested_at: SystemTime,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistVerifiedDriftProposalOutput {
+    pub report: DriftReportRecord,
+    pub proposal: RemediationProposalSave,
+}
+
+/// Persists a verified drift report and its first remediation proposal as one durable operation.
+pub trait VerifiedDriftProposalRepository {
+    type Error;
+
+    fn save_verified_drift_proposal(
+        &mut self,
+        input: PersistVerifiedDriftProposalInput,
+    ) -> Result<PersistVerifiedDriftProposalOutput, Self::Error>;
+}
+
+/// Owns the narrow transaction that writes a proposal and its corresponding audit event.
+pub trait RemediationProposalRepository {
+    type Error;
+
+    fn save_remediation_proposal(
+        &mut self,
+        remediation: RemediationRequestRecord,
+        audit: AuditEvent,
+    ) -> Result<RemediationProposalSave, Self::Error>;
 }
 
 pub trait RemediationRequestRepository {
@@ -2074,6 +2161,11 @@ pub trait RemediationRequestRepository {
     fn find_remediation_request(
         &self,
         request_id: &str,
+    ) -> Result<Option<RemediationRequestRecord>, Self::Error>;
+
+    fn find_remediation_request_by_job_id(
+        &self,
+        job_id: &str,
     ) -> Result<Option<RemediationRequestRecord>, Self::Error>;
 
     fn list_remediation_requests(
@@ -2090,6 +2182,294 @@ pub trait RemediationRequestRepository {
         job_id: Option<&str>,
         updated_at: SystemTime,
     ) -> Result<(), Self::Error>;
+}
+
+/// Persists one task-assignment transition and its optional remediation lifecycle transition.
+/// Implementations commit every supplied record and audit event together or roll back all of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemediationExecutionPersistenceInput {
+    pub task_id: String,
+    pub assignment_status: String,
+    pub assignment_last_error: Option<String>,
+    pub occurred_at: SystemTime,
+    pub remediation: Option<RemediationRequestRecord>,
+    pub remediation_audit: Option<AuditEvent>,
+}
+
+pub trait RemediationExecutionPersistenceRepository {
+    type Error;
+
+    fn persist_remediation_execution_transition(
+        &mut self,
+        input: RemediationExecutionPersistenceInput,
+    ) -> Result<bool, Self::Error>;
+}
+
+/// The all-or-nothing persistence boundary for a remediation's post-execution verification.
+///
+/// The returned job identity is authoritative: a duplicate success event must return the
+/// pre-existing correlation rather than create another signed assignment or audit event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemediationVerificationJobPersistenceInput {
+    pub remediation_id: String,
+    pub job: Job,
+    pub task: DriftCheckTask,
+    pub assignment: TaskEnvelope,
+    pub provenance: DriftJobProvenance,
+    pub audit: AuditEvent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemediationVerificationJobSave {
+    pub job_id: String,
+    pub created: bool,
+}
+
+/// Owns the durable one-to-one verification job correlation for a remediation request.
+///
+/// Implementations must commit the Job, its sole assignment, the v19 correlation, and audit
+/// together, or leave none of those writes behind.
+pub trait RemediationVerificationJobRepository:
+    RemediationRequestRepository
+    + PolicyRepository<Error = <Self as RemediationRequestRepository>::Error>
+{
+    fn find_remediation_verification_job(
+        &self,
+        remediation_id: &str,
+    ) -> Result<Option<String>, <Self as RemediationRequestRepository>::Error>;
+
+    fn save_remediation_verification_job(
+        &mut self,
+        input: RemediationVerificationJobPersistenceInput,
+    ) -> Result<RemediationVerificationJobSave, <Self as RemediationRequestRepository>::Error>;
+}
+
+/// Lists the restart-recovery candidates that still need a remediation verification job.
+///
+/// The returned records intentionally include legacy rows with an absent execution job or policy
+/// version. The create use case remains the invariant gate and the caller records a redacted
+/// recovery-skip audit instead of dispatching those rows.
+pub trait RemediationVerificationRecoveryRepository {
+    type Error;
+
+    fn list_pending_remediation_verification_recovery(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<RemediationRequestRecord>, Self::Error>;
+}
+
+/// The hard upper bound for one controller-start recovery pass.
+pub const MAX_REMEDIATION_VERIFICATION_RECOVERY_BATCH: usize = 100;
+
+/// Selects the bounded durable backlog that a controller may reconcile before listener readiness.
+pub struct ListPendingRemediationVerificationRecovery;
+
+impl ListPendingRemediationVerificationRecovery {
+    pub fn execute<R>(repo: &R, limit: usize) -> Result<Vec<RemediationRequestRecord>, R::Error>
+    where
+        R: RemediationVerificationRecoveryRepository,
+    {
+        repo.list_pending_remediation_verification_recovery(
+            limit.clamp(1, MAX_REMEDIATION_VERIFICATION_RECOVERY_BATCH),
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateRemediationVerificationJobInput {
+    pub remediation_id: String,
+    pub verification_job_id: String,
+    pub timeout: Duration,
+    pub actor: String,
+    pub issued_at: SystemTime,
+    pub expires_at: SystemTime,
+    pub nonce_prefix: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateRemediationVerificationJobOutput {
+    pub job_id: String,
+    pub created: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CreateRemediationVerificationJobError<RepoError, SignError> {
+    NotFound(&'static str),
+    InvalidRemediation(String),
+    PolicyVersionMismatch { expected: u32, actual: u32 },
+    Domain(JobError),
+    Agent(AgentError),
+    Repository(RepoError),
+    Sign(SignError),
+}
+
+impl<RepoError, SignError> Display for CreateRemediationVerificationJobError<RepoError, SignError>
+where
+    RepoError: Display,
+    SignError: Display,
+{
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound(resource) => write!(formatter, "{resource} was not found"),
+            Self::InvalidRemediation(message) => formatter.write_str(message),
+            Self::PolicyVersionMismatch { expected, actual } => write!(
+                formatter,
+                "remediation policy version mismatch: expected {expected}, found {actual}"
+            ),
+            Self::Domain(error) => Display::fmt(error, formatter),
+            Self::Agent(error) => Display::fmt(error, formatter),
+            Self::Repository(error) => write!(formatter, "repository error: {error}"),
+            Self::Sign(error) => write!(formatter, "sign error: {error}"),
+        }
+    }
+}
+
+impl<RepoError, SignError> std::error::Error
+    for CreateRemediationVerificationJobError<RepoError, SignError>
+where
+    RepoError: std::error::Error + 'static,
+    SignError: std::error::Error + 'static,
+{
+}
+
+pub type CreateRemediationVerificationJobResult<R, S> = Result<
+    CreateRemediationVerificationJobOutput,
+    CreateRemediationVerificationJobError<
+        <R as RemediationRequestRepository>::Error,
+        <S as TaskEnvelopeSigner>::Error,
+    >,
+>;
+
+/// Creates the single signed drift check that verifies a successful remediation.
+pub struct CreateRemediationVerificationJob;
+
+impl CreateRemediationVerificationJob {
+    pub fn execute<R, S>(
+        repo: &mut R,
+        signer: &mut S,
+        input: CreateRemediationVerificationJobInput,
+    ) -> CreateRemediationVerificationJobResult<R, S>
+    where
+        R: RemediationVerificationJobRepository,
+        S: TaskEnvelopeSigner,
+    {
+        if let Some(job_id) = repo
+            .find_remediation_verification_job(&input.remediation_id)
+            .map_err(CreateRemediationVerificationJobError::Repository)?
+        {
+            return Ok(CreateRemediationVerificationJobOutput {
+                job_id,
+                created: false,
+            });
+        }
+
+        let Some(record) = repo
+            .find_remediation_request(&input.remediation_id)
+            .map_err(CreateRemediationVerificationJobError::Repository)?
+        else {
+            return Err(CreateRemediationVerificationJobError::NotFound(
+                "remediation",
+            ));
+        };
+        let request = remediation_record_to_request(&record).map_err(|error| {
+            CreateRemediationVerificationJobError::InvalidRemediation(error.to_string())
+        })?;
+        if request.status != RemediationStatus::SucceededPendingVerify || record.job_id.is_none() {
+            return Err(CreateRemediationVerificationJobError::InvalidRemediation(
+                "verification requires a successful persisted remediation execution".to_owned(),
+            ));
+        }
+
+        let Some(policy) = repo
+            .find_policy(&record.policy_id)
+            .map_err(CreateRemediationVerificationJobError::Repository)?
+        else {
+            return Err(CreateRemediationVerificationJobError::NotFound("policy"));
+        };
+        let Some(expected_policy_version) = record.policy_version else {
+            return Err(CreateRemediationVerificationJobError::InvalidRemediation(
+                "verification requires a persisted remediation policy version".to_owned(),
+            ));
+        };
+        if policy.version != expected_policy_version {
+            return Err(
+                CreateRemediationVerificationJobError::PolicyVersionMismatch {
+                    expected: expected_policy_version,
+                    actual: policy.version,
+                },
+            );
+        }
+
+        let task = DriftCheckTask::new(policy.source, input.timeout)
+            .map_err(CreateRemediationVerificationJobError::Domain)?;
+        let mut job = Job::new(
+            JobId::new(input.verification_job_id.clone())
+                .map_err(CreateRemediationVerificationJobError::Domain)?,
+            task.risk(),
+            fleet_domain::ApprovalRequirement::NotRequired,
+            input.timeout,
+        );
+        job.queue(false)
+            .map_err(CreateRemediationVerificationJobError::Domain)?;
+        let target = JobTarget {
+            agent_id: AgentId::new(record.agent_id.clone())
+                .map_err(CreateRemediationVerificationJobError::Agent)?,
+        };
+        let payload_hash = drift_check_payload_hash(&task, &target, 0);
+        let signature = signer
+            .sign(&payload_hash)
+            .map_err(CreateRemediationVerificationJobError::Sign)?;
+        let assignment = TaskEnvelope {
+            job_id: JobId::new(input.verification_job_id.clone())
+                .map_err(CreateRemediationVerificationJobError::Domain)?,
+            task_id: TaskId::new(format!("{}-task-0", input.verification_job_id))
+                .map_err(CreateRemediationVerificationJobError::Domain)?,
+            target_agent_id: target.agent_id.clone(),
+            issued_at: input.issued_at,
+            expires_at: TaskExpiry::new(input.expires_at),
+            nonce: TaskNonce::new(format!("{}-0", input.nonce_prefix))
+                .map_err(CreateRemediationVerificationJobError::Domain)?,
+            payload_hash,
+            signature: Some(
+                TaskSignature::new(signature)
+                    .map_err(CreateRemediationVerificationJobError::Domain)?,
+            ),
+        };
+        let provenance = DriftJobProvenance::remediation_verification(
+            record.policy_id.clone(),
+            expected_policy_version,
+        );
+        let audit = AuditEvent {
+            category: AuditCategory::Policy,
+            action: "remediation_verification_created".to_owned(),
+            actor: AuditActor::new(input.actor),
+            target: AuditTarget::new(record.agent_id.clone()),
+            value: AuditValue::Plain(format!(
+                "remediation_id={},policy_id={},agent_id={},job_id={},purpose={}",
+                record.id,
+                record.policy_id,
+                record.agent_id,
+                input.verification_job_id,
+                provenance.purpose.as_str(),
+            )),
+            occurred_at: input.issued_at,
+        };
+        let saved = repo
+            .save_remediation_verification_job(RemediationVerificationJobPersistenceInput {
+                remediation_id: record.id,
+                job,
+                task,
+                assignment: assignment.clone(),
+                provenance,
+                audit,
+            })
+            .map_err(CreateRemediationVerificationJobError::Repository)?;
+
+        Ok(CreateRemediationVerificationJobOutput {
+            job_id: saved.job_id,
+            created: saved.created,
+        })
+    }
 }
 
 pub trait RemediationApprovalRepository:
@@ -2201,6 +2581,95 @@ pub type ApproveRemediationRunbookJobResult<R, A, S> = Result<
 pub enum RemediationJobResultStatus {
     Succeeded,
     Failed,
+    Canceled,
+    Expired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemediationExecutionTransition {
+    Started,
+    Result(RemediationJobResultStatus),
+}
+
+pub struct PrepareRemediationExecutionTransition;
+
+impl PrepareRemediationExecutionTransition {
+    /// Produces the durable remediation update and its audit event without performing I/O.
+    pub fn execute(
+        record: RemediationRequestRecord,
+        job_id: &str,
+        transition: RemediationExecutionTransition,
+        actor: &str,
+        occurred_at: SystemTime,
+    ) -> Result<Option<(RemediationRequestRecord, AuditEvent)>, String> {
+        let mut request =
+            remediation_record_to_request(&record).map_err(|error| format!("{error:?}"))?;
+        if request.job_id.as_deref() != Some(job_id) {
+            return Err("remediation execution job mismatch".to_owned());
+        }
+        let action = match transition {
+            RemediationExecutionTransition::Started
+                if request.status == RemediationStatus::JobCreated =>
+            {
+                request
+                    .mark_running()
+                    .map_err(|error| format!("{error:?}"))?;
+                "remediation_job_running"
+            }
+            RemediationExecutionTransition::Result(RemediationJobResultStatus::Succeeded)
+                if request.status == RemediationStatus::Running =>
+            {
+                request
+                    .job_succeeded()
+                    .map_err(|error| format!("{error:?}"))?;
+                "remediation_job_succeeded_pending_verify"
+            }
+            RemediationExecutionTransition::Result(RemediationJobResultStatus::Failed)
+                if !request.status.is_terminal() =>
+            {
+                request
+                    .mark_failed()
+                    .map_err(|error| format!("{error:?}"))?;
+                "remediation_job_failed"
+            }
+            RemediationExecutionTransition::Result(RemediationJobResultStatus::Canceled)
+                if !request.status.is_terminal() =>
+            {
+                request.cancel().map_err(|error| format!("{error:?}"))?;
+                "remediation_job_canceled"
+            }
+            RemediationExecutionTransition::Result(RemediationJobResultStatus::Expired)
+                if !request.status.is_terminal() =>
+            {
+                request.expire().map_err(|error| format!("{error:?}"))?;
+                "remediation_job_expired"
+            }
+            _ => return Ok(None),
+        };
+        let updated = RemediationRequestRecord {
+            status: request.status.as_str().to_owned(),
+            job_id: request.job_id.clone(),
+            updated_at: occurred_at,
+            ..record
+        };
+        let audit = AuditEvent {
+            category: AuditCategory::Policy,
+            action: action.to_owned(),
+            actor: AuditActor::new(actor.to_owned()),
+            target: AuditTarget::new(request.agent_id.clone()),
+            value: AuditValue::Plain(format!(
+                "remediation_id={},policy_id={},policy_name={},agent_id={},job_id={},status={}",
+                request.id,
+                request.policy_id,
+                request.policy_name,
+                request.agent_id,
+                job_id,
+                request.status.as_str()
+            )),
+            occurred_at,
+        };
+        Ok(Some((updated, audit)))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2556,6 +3025,7 @@ impl RunDueScheduledDrift {
                     job_id: job_id.clone(),
                     target_agent_ids: vec![schedule.agent_id.clone()],
                     policy_document: policy.source,
+                    provenance: Some(DriftJobProvenance::scheduled(policy.id, policy.version)),
                     timeout: input.job_timeout,
                     created_by: input.actor.clone(),
                     issued_at: input.now,
@@ -2651,19 +3121,95 @@ pub struct CreateRemediationApproval;
 
 pub struct CreateRemediationRequestProposal;
 
-impl CreateRemediationRequestProposal {
-    pub fn execute<A>(
-        audit: &mut A,
-        input: CreateRemediationRequestInput,
-    ) -> Result<RemediationRequestRecord, PolicyUseCaseError<(), A::Error>>
+pub struct PersistVerifiedDriftProposal;
+
+impl PersistVerifiedDriftProposal {
+    pub fn execute<R>(
+        repo: &mut R,
+        input: PersistVerifiedDriftProposalUseCaseInput,
+    ) -> Result<PersistVerifiedDriftProposalOutput, PolicyUseCaseError<R::Error, R::Error>>
     where
-        A: AuditWriter,
+        R: VerifiedDriftProposalRepository,
     {
+        VerifiedDriftEvidence::validate_remediation_candidate(
+            &input.report,
+            &input.provenance,
+            &input.policy,
+        )
+        .map_err(|error| PolicyUseCaseError::Domain(format!("{error:?}")))?;
         let request = RemediationRequest::propose_from_drift(
             input.remediation_id,
             &input.policy,
-            input.agent_id,
-            &input.drift_report,
+            input.agent_id.clone(),
+            &input.report,
+        )
+        .map_err(|error| PolicyUseCaseError::Domain(format!("{error:?}")))?;
+        let remediation = RemediationRequestRecord {
+            id: request.id.clone(),
+            policy_id: request.policy_id.clone(),
+            policy_name: request.policy_name.clone(),
+            agent_id: request.agent_id.clone(),
+            runbook_ref: request.runbook_ref.clone(),
+            status: request.status.as_str().to_owned(),
+            approval_required: request.approval_required,
+            risk_summary: request.risk_summary.clone(),
+            job_id: request.job_id.clone(),
+            origin_drift_report_id: None,
+            policy_version: input.provenance.policy_version,
+            created_at: input.requested_at,
+            updated_at: input.requested_at,
+        };
+        let drift_audit = AuditEvent {
+            category: AuditCategory::Drift,
+            action: "drift_report_received".to_owned(),
+            actor: AuditActor::new("agent"),
+            target: AuditTarget::new(input.agent_id.clone()),
+            value: AuditValue::Plain(format!(
+                "policy_name={},status=drifted",
+                input.report.policy_name
+            )),
+            occurred_at: input.requested_at,
+        };
+        let proposal_audit = AuditEvent {
+            category: AuditCategory::Policy,
+            action: "remediation_requested".to_owned(),
+            actor: AuditActor::new(input.actor),
+            target: AuditTarget::new(remediation.agent_id.clone()),
+            value: AuditValue::Plain(format!(
+                "remediation_id={},policy_id={},agent_id={},runbook_ref={},status={}",
+                remediation.id,
+                remediation.policy_id,
+                remediation.agent_id,
+                remediation.runbook_ref,
+                remediation.status
+            )),
+            occurred_at: input.requested_at,
+        };
+        repo.save_verified_drift_proposal(PersistVerifiedDriftProposalInput {
+            agent_id: input.agent_id,
+            report: input.report,
+            provenance: input.provenance,
+            remediation,
+            drift_audit,
+            proposal_audit,
+            checked_at: input.requested_at,
+        })
+        .map_err(PolicyUseCaseError::Repository)
+    }
+}
+
+impl CreateRemediationRequestProposal {
+    pub fn execute<R>(
+        repo: &mut R,
+        input: CreateRemediationRequestInput,
+    ) -> Result<RemediationProposalSave, PolicyUseCaseError<R::Error, R::Error>>
+    where
+        R: RemediationProposalRepository,
+    {
+        let request = RemediationRequest::propose_from_verified_drift(
+            input.remediation_id,
+            &input.policy,
+            &input.origin,
         )
         .map_err(|error| PolicyUseCaseError::Domain(format!("{error:?}")))?;
         let record = RemediationRequestRecord {
@@ -2676,23 +3222,24 @@ impl CreateRemediationRequestProposal {
             approval_required: request.approval_required,
             risk_summary: request.risk_summary.clone(),
             job_id: request.job_id.clone(),
+            origin_drift_report_id: Some(input.origin.report_id),
+            policy_version: input.origin.provenance.policy_version,
             created_at: input.requested_at,
             updated_at: input.requested_at,
         };
-        audit
-            .write(AuditEvent {
-                category: AuditCategory::Policy,
-                action: "remediation_requested".to_owned(),
-                actor: AuditActor::new(input.actor),
-                target: AuditTarget::new(record.agent_id.clone()),
-                value: AuditValue::Plain(format!(
-                    "remediation_id={},policy_id={},agent_id={},runbook_ref={},status={}",
-                    record.id, record.policy_id, record.agent_id, record.runbook_ref, record.status
-                )),
-                occurred_at: input.requested_at,
-            })
-            .map_err(PolicyUseCaseError::Audit)?;
-        Ok(record)
+        let audit = AuditEvent {
+            category: AuditCategory::Policy,
+            action: "remediation_requested".to_owned(),
+            actor: AuditActor::new(input.actor),
+            target: AuditTarget::new(record.agent_id.clone()),
+            value: AuditValue::Plain(format!(
+                "remediation_id={},policy_id={},agent_id={},runbook_ref={},status={}",
+                record.id, record.policy_id, record.agent_id, record.runbook_ref, record.status
+            )),
+            occurred_at: input.requested_at,
+        };
+        repo.save_remediation_proposal(record, audit)
+            .map_err(PolicyUseCaseError::Repository)
     }
 }
 
@@ -3047,6 +3594,11 @@ impl MarkRemediationJobRunning {
         let mut request = remediation_record_to_request(&record)
             .map_err(RemediationResultUseCaseError::Domain)?;
         ensure_remediation_job_matches(&request, &input.job_id)?;
+        if request.status == RemediationStatus::Running {
+            return Ok(RemediationLifecycleOutput {
+                remediation: record,
+            });
+        }
         request
             .mark_running()
             .map_err(|error| RemediationResultUseCaseError::Domain(format!("{error:?}")))?;
@@ -3087,16 +3639,38 @@ impl RecordRemediationJobResult {
         ensure_remediation_job_matches(&request, &input.job_id)?;
         let action = match input.status {
             RemediationJobResultStatus::Succeeded => {
+                if request.status != RemediationStatus::Running {
+                    return Ok(RemediationLifecycleOutput {
+                        remediation: record,
+                    });
+                }
                 request
                     .job_succeeded()
                     .map_err(|error| RemediationResultUseCaseError::Domain(format!("{error:?}")))?;
                 "remediation_job_succeeded_pending_verify"
             }
             RemediationJobResultStatus::Failed => {
+                if request.status == RemediationStatus::Failed {
+                    return Ok(RemediationLifecycleOutput {
+                        remediation: record,
+                    });
+                }
                 request
                     .mark_failed()
                     .map_err(|error| RemediationResultUseCaseError::Domain(format!("{error:?}")))?;
                 "remediation_job_failed"
+            }
+            RemediationJobResultStatus::Canceled => {
+                request
+                    .cancel()
+                    .map_err(|error| RemediationResultUseCaseError::Domain(format!("{error:?}")))?;
+                "remediation_job_canceled"
+            }
+            RemediationJobResultStatus::Expired => {
+                request
+                    .expire()
+                    .map_err(|error| RemediationResultUseCaseError::Domain(format!("{error:?}")))?;
+                "remediation_job_expired"
             }
         };
         let updated = update_remediation_record::<R, A>(repo, record, &request, input.occurred_at)?;
@@ -3114,6 +3688,131 @@ impl RecordRemediationJobResult {
 }
 
 pub struct VerifyRemediationResolution;
+
+/// Persisted evidence required to resolve a remediation after its verification drift job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolveRemediationVerificationEvidenceInput {
+    pub remediation_id: String,
+    pub verification_job_id: String,
+    pub verification_task_id: String,
+    pub evidence_report_id: DriftReportId,
+    pub agent_id: String,
+    pub policy_id: String,
+    pub policy_name: String,
+    pub policy_version: u32,
+    pub status: DriftStatus,
+    pub checked_at: SystemTime,
+    /// Terminal completion time of the remediation execution Job, not the
+    /// verification Job that emits this evidence.
+    pub remediation_execution_completed_at: SystemTime,
+    pub actor: String,
+}
+
+/// Commits the resolved remediation, its origin drift report, and audit together.
+pub trait RemediationVerificationResolutionRepository:
+    RemediationVerificationJobRepository
+{
+    fn resolve_remediation_verification_evidence(
+        &mut self,
+        remediation: RemediationRequestRecord,
+        origin_drift_report_id: DriftReportId,
+        evidence_report_id: DriftReportId,
+        verification_job_id: &str,
+        verification_task_id: &str,
+        audit: AuditEvent,
+    ) -> Result<RemediationRequestRecord, <Self as RemediationRequestRepository>::Error>;
+}
+
+/// Resolves only an evidence record that is fresh, compliant, and bound to the verification job.
+pub struct ResolveRemediationVerificationEvidence;
+
+impl ResolveRemediationVerificationEvidence {
+    pub fn execute<R, A>(
+        repo: &mut R,
+        _audit: &mut A,
+        input: ResolveRemediationVerificationEvidenceInput,
+    ) -> Result<
+        Option<RemediationLifecycleOutput>,
+        RemediationResultUseCaseError<<R as RemediationRequestRepository>::Error, A::Error>,
+    >
+    where
+        R: RemediationVerificationResolutionRepository,
+        A: AuditWriter,
+    {
+        if input.status != DriftStatus::Compliant
+            || input.checked_at <= input.remediation_execution_completed_at
+        {
+            return Ok(None);
+        }
+        let Some(record) = repo
+            .find_remediation_request(&input.remediation_id)
+            .map_err(RemediationResultUseCaseError::Repository)?
+        else {
+            return Err(RemediationResultUseCaseError::NotFound("remediation"));
+        };
+        if repo
+            .find_remediation_verification_job(&input.remediation_id)
+            .map_err(RemediationResultUseCaseError::Repository)?
+            .as_deref()
+            != Some(input.verification_job_id.as_str())
+        {
+            return Ok(None);
+        }
+        let mut request = remediation_record_to_request(&record)
+            .map_err(RemediationResultUseCaseError::Domain)?;
+        if record.policy_version != Some(input.policy_version)
+            || ensure_remediation_evidence_matches::<
+                <R as RemediationRequestRepository>::Error,
+                A::Error,
+            >(
+                &request,
+                &input.agent_id,
+                &input.policy_id,
+                &input.policy_name,
+                request.job_id.as_deref().unwrap_or_default(),
+            )
+            .is_err()
+        {
+            return Ok(None);
+        }
+        request
+            .verify_resolved()
+            .map_err(|error| RemediationResultUseCaseError::Domain(format!("{error:?}")))?;
+        let Some(origin_drift_report_id) = record.origin_drift_report_id else {
+            return Ok(None);
+        };
+        let updated = repo
+            .resolve_remediation_verification_evidence(
+                RemediationRequestRecord {
+                    status: request.status.as_str().to_owned(),
+                    job_id: request.job_id.clone(),
+                    updated_at: input.checked_at,
+                    ..record
+                },
+                origin_drift_report_id,
+                input.evidence_report_id,
+                &input.verification_job_id,
+                &input.verification_task_id,
+                AuditEvent {
+                    category: AuditCategory::Policy,
+                    action: "remediation_resolved_by_verification".to_owned(),
+                    actor: AuditActor::new(input.actor),
+                    target: AuditTarget::new(request.agent_id.clone()),
+                    value: AuditValue::Plain(format!(
+                        "remediation_id={},verification_job_id={},evidence_report_id={}",
+                        request.id,
+                        input.verification_job_id,
+                        input.evidence_report_id.as_i64()
+                    )),
+                    occurred_at: input.checked_at,
+                },
+            )
+            .map_err(RemediationResultUseCaseError::Repository)?;
+        Ok(Some(RemediationLifecycleOutput {
+            remediation: updated,
+        }))
+    }
+}
 
 impl VerifyRemediationResolution {
     pub fn execute<R, A>(
@@ -3554,6 +4253,7 @@ pub struct CreateDriftCheckJobInput {
     pub job_id: String,
     pub target_agent_ids: Vec<String>,
     pub policy_document: String,
+    pub provenance: Option<DriftJobProvenance>,
     pub timeout: Duration,
     pub created_by: String,
     pub issued_at: SystemTime,
@@ -3675,8 +4375,13 @@ impl CreateDriftCheckJob {
             });
         }
 
-        repo.save_drift_check_job_with_assignments(job, &task, &envelopes)
-            .map_err(CreateDriftCheckJobError::Repository)?;
+        repo.save_drift_check_job_with_assignments_and_provenance(
+            job,
+            &task,
+            &envelopes,
+            input.provenance.as_ref(),
+        )
+        .map_err(CreateDriftCheckJobError::Repository)?;
         let approval_request =
             if approval_requirement != fleet_domain::ApprovalRequirement::NotRequired {
                 let approval = ApprovalRequest::new(
@@ -6118,6 +6823,7 @@ mod tests {
                 job_id: "drift-job-1".to_owned(),
                 target_agent_ids: vec!["web-01".to_owned()],
                 policy_document: "apiVersion: fleet.sponzey.dev/v1alpha1".to_owned(),
+                provenance: None,
                 timeout: Duration::from_secs(30),
                 created_by: "admin".to_owned(),
                 issued_at: SystemTime::UNIX_EPOCH,
@@ -6505,6 +7211,7 @@ mod tests {
             },
         });
         repo.drift = Some(DriftReportRecord {
+            id: DriftReportId::new(1).unwrap(),
             agent_id: "agent-1".to_owned(),
             report: DriftReport {
                 policy_name: "nginx-running".to_owned(),
@@ -6514,9 +7221,11 @@ mod tests {
                 expected: "service nginx running".to_owned(),
                 actual: "service nginx running".to_owned(),
             },
+            provenance: DriftReportProvenance::uncorrelated(),
             checked_at: SystemTime::UNIX_EPOCH,
         });
         repo.drift_pages.push(DriftReportPageRecord {
+            id: DriftReportId::new(1).unwrap(),
             agent_id: "agent-1".to_owned(),
             report: DriftReport {
                 policy_name: "nginx-running".to_owned(),
@@ -6526,6 +7235,7 @@ mod tests {
                 expected: "service nginx running".to_owned(),
                 actual: "service nginx running".to_owned(),
             },
+            provenance: DriftReportProvenance::uncorrelated(),
             checked_at: SystemTime::UNIX_EPOCH,
             cursor: SnapshotPageCursor {
                 occurred_at: SystemTime::UNIX_EPOCH,
@@ -6709,6 +7419,10 @@ mod tests {
                 .iter()
                 .any(|event| event.action == "scheduled_drift_job_created")
         );
+        assert_eq!(
+            repo.saved_drift_job_provenance,
+            Some(DriftJobProvenance::scheduled("nginx-running", 1))
+        );
     }
 
     #[test]
@@ -6843,31 +7557,46 @@ spec:
 "#,
         )
         .unwrap();
-        let drift = DriftReport::drifted("nginx-running", "expected", "actual");
-        let mut audit = FakeAuditWriter::default();
+        let origin = VerifiedDriftEvidence {
+            report_id: DriftReportId::new(1).unwrap(),
+            agent_id: "agent-1".to_owned(),
+            report: DriftReport::drifted("nginx-running", "expected", "actual"),
+            provenance: DriftReportProvenance::verified(
+                JobId::new("job-drift").unwrap(),
+                TaskId::new("task-drift").unwrap(),
+                "nginx-running",
+                policy.version,
+                fleet_domain::DriftCheckPurpose::Evaluation,
+            ),
+        };
+        let mut repo = FakeProposalRepository::default();
 
-        let record = CreateRemediationRequestProposal::execute(
-            &mut audit,
-            CreateRemediationRequestInput {
-                remediation_id: "rem-1".to_owned(),
-                policy,
-                drift_report: drift,
-                agent_id: "agent-1".to_owned(),
-                actor: "operator-1".to_owned(),
-                requested_at: SystemTime::UNIX_EPOCH,
-            },
-        )
-        .unwrap();
+        let input = CreateRemediationRequestInput {
+            remediation_id: "rem-1".to_owned(),
+            policy,
+            origin,
+            actor: "operator-1".to_owned(),
+            requested_at: SystemTime::UNIX_EPOCH,
+        };
+        let record = CreateRemediationRequestProposal::execute(&mut repo, input.clone()).unwrap();
 
-        assert_eq!(record.id, "rem-1");
-        assert_eq!(record.status, "proposed");
-        assert_eq!(record.policy_id, "nginx-running");
-        assert_eq!(record.agent_id, "agent-1");
-        assert_eq!(record.runbook_ref, "runbooks/nginx-remediate.yml");
-        assert!(record.job_id.is_none());
-        assert_eq!(audit.events.len(), 1);
-        assert_eq!(audit.events[0].action, "remediation_requested");
-        let audit_value = match &audit.events[0].value {
+        assert!(record.created);
+        assert_eq!(record.remediation.id, "rem-1");
+        assert_eq!(record.remediation.status, "proposed");
+        assert_eq!(record.remediation.policy_id, "nginx-running");
+        assert_eq!(record.remediation.agent_id, "agent-1");
+        assert_eq!(
+            record.remediation.runbook_ref,
+            "runbooks/nginx-remediate.yml"
+        );
+        assert!(record.remediation.job_id.is_none());
+        assert_eq!(
+            record.remediation.origin_drift_report_id,
+            Some(DriftReportId::new(1).unwrap())
+        );
+        assert_eq!(repo.audits.len(), 1);
+        assert_eq!(repo.audits[0].action, "remediation_requested");
+        let audit_value = match &repo.audits[0].value {
             AuditValue::Plain(value) => value.as_str(),
             _ => panic!("expected plain remediation audit value"),
         };
@@ -6875,6 +7604,56 @@ spec:
         assert!(audit_value.contains("runbook_ref=runbooks/nginx-remediate.yml"));
         assert!(!audit_value.contains("kind: Runbook"));
         assert!(!audit_value.contains("secret"));
+
+        let duplicate = CreateRemediationRequestProposal::execute(&mut repo, input).unwrap();
+        assert!(!duplicate.created);
+        assert_eq!(duplicate.remediation.id, "rem-1");
+        assert_eq!(repo.audits.len(), 1);
+    }
+
+    #[test]
+    fn remediation_proposal_rejects_uncorrelated_origin_without_audit() {
+        let policy = fleet_domain::parse_policy_document(
+            r#"
+apiVersion: fleet.sponzey.dev/v1alpha1
+kind: Policy
+metadata:
+  name: nginx-running
+spec:
+  selector:
+    matchLabels:
+      role: web
+  checks:
+    - id: nginx-service
+      service:
+        name: nginx
+        state: running
+  remediation:
+    runbookRef: runbooks/nginx-remediate.yml
+    approvalRequired: true
+"#,
+        )
+        .unwrap();
+        let mut repo = FakeProposalRepository::default();
+
+        let result = CreateRemediationRequestProposal::execute(
+            &mut repo,
+            CreateRemediationRequestInput {
+                remediation_id: "rem-uncorrelated".to_owned(),
+                policy,
+                origin: VerifiedDriftEvidence {
+                    report_id: DriftReportId::new(2).unwrap(),
+                    agent_id: "agent-1".to_owned(),
+                    report: DriftReport::drifted("nginx-running", "expected", "actual"),
+                    provenance: DriftReportProvenance::uncorrelated(),
+                },
+                actor: "operator-1".to_owned(),
+                requested_at: SystemTime::UNIX_EPOCH,
+            },
+        );
+
+        assert!(matches!(result, Err(PolicyUseCaseError::Domain(_))));
+        assert!(repo.audits.is_empty());
     }
 
     #[test]
@@ -7123,6 +7902,69 @@ spec:
     }
 
     #[test]
+    fn successful_remediation_creates_one_signed_verification_job() {
+        let mut repo = scheduled_drift_repo_fixture(SystemTime::UNIX_EPOCH);
+        repo.remediation_requests = vec![RemediationRequestRecord {
+            policy_version: Some(1),
+            ..remediation_request_record_with_job("succeeded_pending_verify", "job-remediation-1")
+        }];
+        let mut signer = FakeSigner;
+        let input = CreateRemediationVerificationJobInput {
+            remediation_id: "rem-1".to_owned(),
+            verification_job_id: "job-remediation-verify-1".to_owned(),
+            timeout: Duration::from_secs(30),
+            actor: "controller".to_owned(),
+            issued_at: SystemTime::UNIX_EPOCH + Duration::from_secs(31),
+            expires_at: SystemTime::UNIX_EPOCH + Duration::from_secs(91),
+            nonce_prefix: "nonce-remediation-verify".to_owned(),
+        };
+
+        let first =
+            CreateRemediationVerificationJob::execute(&mut repo, &mut signer, input.clone())
+                .unwrap();
+        let duplicate =
+            CreateRemediationVerificationJob::execute(&mut repo, &mut signer, input).unwrap();
+
+        assert!(first.created);
+        assert!(!duplicate.created);
+        assert_eq!(first.job_id, "job-remediation-verify-1");
+        assert_eq!(duplicate.job_id, first.job_id);
+        assert_eq!(repo.saved_assignments.len(), 1);
+        assert_eq!(repo.remediation_verification_audits.len(), 1);
+        assert_eq!(
+            repo.saved_drift_job_provenance,
+            Some(DriftJobProvenance::remediation_verification(
+                "nginx-running",
+                1
+            ))
+        );
+    }
+
+    #[test]
+    fn pending_remediation_verification_recovery_is_bounded_and_excludes_correlated_rows() {
+        let repo = FakePolicyRepository {
+            remediation_requests: vec![
+                remediation_request_record_with_job("succeeded_pending_verify", "job-rem-1"),
+                RemediationRequestRecord {
+                    id: "rem-2".to_owned(),
+                    ..remediation_request_record_with_job("succeeded_pending_verify", "job-rem-2")
+                },
+                RemediationRequestRecord {
+                    id: "rem-3".to_owned(),
+                    ..remediation_request_record_with_job("succeeded_pending_verify", "job-rem-3")
+                },
+            ],
+            remediation_verification_jobs: vec![("rem-2".to_owned(), "job-verify-2".to_owned())],
+            ..Default::default()
+        };
+
+        let records = ListPendingRemediationVerificationRecovery::execute(&repo, 1).unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, "rem-1");
+    }
+
+    #[test]
     fn remediation_job_failure_marks_failed() {
         let mut repo = FakePolicyRepository {
             remediation_requests: vec![remediation_request_record_with_job(
@@ -7154,6 +7996,45 @@ spec:
                 .iter()
                 .any(|event| event.action == "remediation_job_failed")
         );
+    }
+
+    #[test]
+    fn remediation_job_cancel_and_timeout_keep_distinct_terminal_states() {
+        for (status, expected, action) in [
+            (
+                RemediationJobResultStatus::Canceled,
+                "canceled",
+                "remediation_job_canceled",
+            ),
+            (
+                RemediationJobResultStatus::Expired,
+                "expired",
+                "remediation_job_expired",
+            ),
+        ] {
+            let mut repo = FakePolicyRepository {
+                remediation_requests: vec![remediation_request_record_with_job(
+                    "running",
+                    "job-rem-1",
+                )],
+                ..Default::default()
+            };
+            let mut audit = FakeAuditWriter::default();
+            let result = RecordRemediationJobResult::execute(
+                &mut repo,
+                &mut audit,
+                RecordRemediationJobResultInput {
+                    remediation_id: "rem-1".to_owned(),
+                    job_id: "job-rem-1".to_owned(),
+                    status,
+                    actor: "agent-1".to_owned(),
+                    occurred_at: SystemTime::UNIX_EPOCH,
+                },
+            )
+            .unwrap();
+            assert_eq!(result.remediation.status, expected);
+            assert!(audit.events.iter().any(|event| event.action == action));
+        }
     }
 
     #[test]
@@ -7211,6 +8092,96 @@ spec:
                 .iter()
                 .all(|event| !plain_audit_value(event).contains("secret"))
         );
+    }
+
+    #[test]
+    fn fresh_compliant_verification_evidence_rejects_stale_noncompliant_and_mismatched_reports() {
+        let mut repo = FakePolicyRepository {
+            remediation_requests: vec![RemediationRequestRecord {
+                policy_version: Some(1),
+                ..remediation_request_record_with_job("succeeded_pending_verify", "job-rem-1")
+            }],
+            remediation_verification_jobs: vec![("rem-1".to_owned(), "job-verify-1".to_owned())],
+            resolve_latest_result: true,
+            ..Default::default()
+        };
+        let mut audit = FakeAuditWriter::default();
+        let input = ResolveRemediationVerificationEvidenceInput {
+            remediation_id: "rem-1".to_owned(),
+            verification_job_id: "job-verify-1".to_owned(),
+            verification_task_id: "task-verify-1".to_owned(),
+            evidence_report_id: DriftReportId::new(1).unwrap(),
+            agent_id: "agent-1".to_owned(),
+            policy_id: "nginx-running".to_owned(),
+            policy_name: "nginx-running".to_owned(),
+            policy_version: 1,
+            status: DriftStatus::Compliant,
+            checked_at: SystemTime::UNIX_EPOCH + Duration::from_secs(20),
+            remediation_execution_completed_at: SystemTime::UNIX_EPOCH + Duration::from_secs(30),
+            actor: "controller".to_owned(),
+        };
+        let stale =
+            ResolveRemediationVerificationEvidence::execute(&mut repo, &mut audit, input.clone());
+
+        assert!(matches!(stale, Ok(None)));
+        assert_eq!(
+            repo.remediation_requests[0].status,
+            "succeeded_pending_verify"
+        );
+        assert!(audit.events.is_empty());
+
+        repo.remediation_requests[0].origin_drift_report_id = Some(DriftReportId::new(7).unwrap());
+        for status in [DriftStatus::Drifted, DriftStatus::Unknown] {
+            let rejected = ResolveRemediationVerificationEvidence::execute(
+                &mut repo,
+                &mut audit,
+                ResolveRemediationVerificationEvidenceInput {
+                    status,
+                    checked_at: SystemTime::UNIX_EPOCH + Duration::from_secs(20),
+                    remediation_execution_completed_at: SystemTime::UNIX_EPOCH
+                        + Duration::from_secs(10),
+                    ..input.clone()
+                },
+            );
+            assert!(matches!(rejected, Ok(None)));
+        }
+        let mismatched = ResolveRemediationVerificationEvidence::execute(
+            &mut repo,
+            &mut audit,
+            ResolveRemediationVerificationEvidenceInput {
+                policy_id: "other-policy".to_owned(),
+                checked_at: SystemTime::UNIX_EPOCH + Duration::from_secs(20),
+                remediation_execution_completed_at: SystemTime::UNIX_EPOCH
+                    + Duration::from_secs(10),
+                ..input.clone()
+            },
+        );
+        assert!(matches!(mismatched, Ok(None)));
+        assert_eq!(
+            repo.remediation_requests[0].status,
+            "succeeded_pending_verify"
+        );
+        assert!(audit.events.is_empty());
+
+        let fresh = ResolveRemediationVerificationEvidence::execute(
+            &mut repo,
+            &mut audit,
+            ResolveRemediationVerificationEvidenceInput {
+                evidence_report_id: DriftReportId::new(2).unwrap(),
+                // A verification report can be emitted before its final TaskResult. It is
+                // still fresh when it follows the remediation execution completion.
+                checked_at: SystemTime::UNIX_EPOCH + Duration::from_secs(20),
+                remediation_execution_completed_at: SystemTime::UNIX_EPOCH
+                    + Duration::from_secs(10),
+                ..input
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(fresh.remediation.status, "resolved");
+        assert_eq!(repo.remediation_requests[0].status, "resolved");
+        assert_eq!(repo.remediation_verification_audits.len(), 1);
     }
 
     #[test]
@@ -7363,6 +8334,8 @@ spec:
             risk_summary: "drifted policy nginx-running requires approved runbook remediation"
                 .to_owned(),
             job_id: None,
+            origin_drift_report_id: None,
+            policy_version: None,
             created_at: SystemTime::UNIX_EPOCH,
             updated_at: SystemTime::UNIX_EPOCH,
         }
@@ -7584,6 +8557,17 @@ spec:
                 .remediation_requests
                 .iter()
                 .find(|request| request.id == request_id)
+                .cloned())
+        }
+
+        fn find_remediation_request_by_job_id(
+            &self,
+            job_id: &str,
+        ) -> Result<Option<RemediationRequestRecord>, Self::Error> {
+            Ok(self
+                .remediation_requests
+                .iter()
+                .find(|request| request.job_id.as_deref() == Some(job_id))
                 .cloned())
         }
 
@@ -8044,8 +9028,10 @@ spec:
             checked_at: SystemTime,
         ) -> Result<(), Self::Error> {
             self.drift = Some(DriftReportRecord {
+                id: DriftReportId::new(1).unwrap(),
                 agent_id: agent_id.to_owned(),
                 report: report.clone(),
+                provenance: DriftReportProvenance::uncorrelated(),
                 checked_at,
             });
             Ok(())
@@ -8394,6 +9380,7 @@ spec:
         assignments: Vec<PolicyAssignmentRecord>,
         schedules: Vec<ScheduledDriftRecord>,
         saved_drift_policies: Vec<String>,
+        saved_drift_job_provenance: Option<DriftJobProvenance>,
         saved_assignments: Vec<TaskEnvelope>,
         approval_requests: Vec<ApprovalRequestRecord>,
         approval_status_updates: Vec<(String, JobStatus)>,
@@ -8401,6 +9388,8 @@ spec:
         resolved_reports: Vec<(String, String, String)>,
         resolve_latest_result: bool,
         remediation_requests: Vec<RemediationRequestRecord>,
+        remediation_verification_jobs: Vec<(String, String)>,
+        remediation_verification_audits: Vec<AuditEvent>,
     }
 
     impl AgentRepository for FakePolicyRepository {
@@ -8589,6 +9578,17 @@ spec:
                 .cloned())
         }
 
+        fn find_remediation_request_by_job_id(
+            &self,
+            job_id: &str,
+        ) -> Result<Option<RemediationRequestRecord>, Self::Error> {
+            Ok(self
+                .remediation_requests
+                .iter()
+                .find(|request| request.job_id.as_deref() == Some(job_id))
+                .cloned())
+        }
+
         fn list_remediation_requests(
             &self,
             agent_id: Option<&str>,
@@ -8622,6 +9622,89 @@ spec:
                 request.updated_at = updated_at;
             }
             Ok(())
+        }
+    }
+
+    impl RemediationVerificationJobRepository for FakePolicyRepository {
+        fn find_remediation_verification_job(
+            &self,
+            remediation_id: &str,
+        ) -> Result<Option<String>, <Self as RemediationRequestRepository>::Error> {
+            Ok(self
+                .remediation_verification_jobs
+                .iter()
+                .find(|(existing_remediation_id, _)| existing_remediation_id == remediation_id)
+                .map(|(_, job_id)| job_id.clone()))
+        }
+
+        fn save_remediation_verification_job(
+            &mut self,
+            input: RemediationVerificationJobPersistenceInput,
+        ) -> Result<RemediationVerificationJobSave, <Self as RemediationRequestRepository>::Error>
+        {
+            if let Some(job_id) = self.find_remediation_verification_job(&input.remediation_id)? {
+                return Ok(RemediationVerificationJobSave {
+                    job_id,
+                    created: false,
+                });
+            }
+            let job_id = input.job.id().as_str().to_owned();
+            self.remediation_verification_jobs
+                .push((input.remediation_id, job_id.clone()));
+            self.saved_drift_policies
+                .push(input.task.policy_document().to_owned());
+            self.saved_drift_job_provenance = Some(input.provenance);
+            self.saved_assignments.push(input.assignment);
+            self.remediation_verification_audits.push(input.audit);
+            Ok(RemediationVerificationJobSave {
+                job_id,
+                created: true,
+            })
+        }
+    }
+
+    impl RemediationVerificationResolutionRepository for FakePolicyRepository {
+        fn resolve_remediation_verification_evidence(
+            &mut self,
+            remediation: RemediationRequestRecord,
+            _origin_drift_report_id: DriftReportId,
+            _evidence_report_id: DriftReportId,
+            _verification_job_id: &str,
+            _verification_task_id: &str,
+            audit: AuditEvent,
+        ) -> Result<RemediationRequestRecord, <Self as RemediationRequestRepository>::Error>
+        {
+            self.update_remediation_request_status(
+                &remediation.id,
+                &remediation.status,
+                remediation.job_id.as_deref(),
+                remediation.updated_at,
+            )?;
+            self.remediation_verification_audits.push(audit);
+            Ok(remediation)
+        }
+    }
+
+    impl RemediationVerificationRecoveryRepository for FakePolicyRepository {
+        type Error = Infallible;
+
+        fn list_pending_remediation_verification_recovery(
+            &self,
+            limit: usize,
+        ) -> Result<Vec<RemediationRequestRecord>, Self::Error> {
+            Ok(self
+                .remediation_requests
+                .iter()
+                .filter(|request| request.status == "succeeded_pending_verify")
+                .filter(|request| {
+                    !self
+                        .remediation_verification_jobs
+                        .iter()
+                        .any(|(remediation_id, _)| remediation_id == &request.id)
+                })
+                .take(limit)
+                .cloned()
+                .collect())
         }
     }
 
@@ -8709,6 +9792,17 @@ spec:
                 .push(task.policy_document().to_owned());
             Ok(())
         }
+
+        fn save_drift_check_job_with_assignments_and_provenance(
+            &mut self,
+            job: Job,
+            task: &DriftCheckTask,
+            assignments: &[TaskEnvelope],
+            provenance: Option<&DriftJobProvenance>,
+        ) -> Result<(), <Self as TaskAssignmentRepository>::Error> {
+            self.saved_drift_job_provenance = provenance.cloned();
+            self.save_drift_check_job_with_assignments(job, task, assignments)
+        }
     }
 
     #[derive(Default)]
@@ -8722,6 +9816,42 @@ spec:
         fn write(&mut self, event: AuditEvent) -> Result<(), Self::Error> {
             self.events.push(event);
             Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeProposalRepository {
+        remediations: Vec<RemediationRequestRecord>,
+        audits: Vec<AuditEvent>,
+    }
+
+    impl RemediationProposalRepository for FakeProposalRepository {
+        type Error = Infallible;
+
+        fn save_remediation_proposal(
+            &mut self,
+            remediation: RemediationRequestRecord,
+            audit: AuditEvent,
+        ) -> Result<RemediationProposalSave, Self::Error> {
+            if let Some(existing) = self.remediations.iter().find(|existing| {
+                existing.agent_id == remediation.agent_id
+                    && existing.policy_id == remediation.policy_id
+                    && !matches!(
+                        existing.status.as_str(),
+                        "resolved" | "failed" | "rejected" | "expired" | "canceled"
+                    )
+            }) {
+                return Ok(RemediationProposalSave {
+                    remediation: existing.clone(),
+                    created: false,
+                });
+            }
+            self.remediations.push(remediation.clone());
+            self.audits.push(audit);
+            Ok(RemediationProposalSave {
+                remediation,
+                created: true,
+            })
         }
     }
 

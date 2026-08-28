@@ -18,8 +18,8 @@ MVP includes an explicit cleanup command and a controller-managed background
 worker. Both paths use the same application retention use case.
 
 ```bash
-sponzey retention cleanup --data-dir .sponzey --older-than-days 30 --dry-run
-sponzey retention cleanup --data-dir .sponzey --older-than-days 30
+fleet retention cleanup --data-dir .fleet --older-than-days 30 --dry-run
+fleet retention cleanup --data-dir .fleet --older-than-days 30
 ```
 
 The explicit command:

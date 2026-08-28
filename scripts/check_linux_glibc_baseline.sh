@@ -1,8 +1,8 @@
 #!/usr/bin/env sh
 set -eu
 
-BIN="${1:-target/release/sponzey}"
-MAX_GLIBC="${SPONZEY_MAX_GLIBC:-2.35}"
+BIN="${1:-target/release/fleet}"
+MAX_GLIBC="${FLEET_MAX_GLIBC:-2.35}"
 
 if [ "$(uname -s)" != "Linux" ]; then
   echo "glibc baseline check skipped on non-Linux host: $(uname -s)"

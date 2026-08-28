@@ -3,12 +3,12 @@ const os = require("os");
 const path = require("path");
 const { spawnSync } = require("child_process");
 
-const bin = path.join(__dirname, "..", "bin", "sponzey");
+const bin = path.join(__dirname, "..", "bin", "fleet");
 const postinstall = path.join(__dirname, "postinstall.js");
 const packageJson = require(path.join(__dirname, "..", "package.json"));
 
 if (!fs.existsSync(bin)) {
-  console.error("missing bin/sponzey");
+  console.error("missing bin/fleet");
   process.exit(1);
 }
 
@@ -25,35 +25,35 @@ if (!fs.existsSync(postinstall)) {
 const body = fs.readFileSync(bin, "utf8");
 
 if (!body.startsWith("#!/usr/bin/env sh")) {
-  console.error("bin/sponzey must be a portable shell shim");
+  console.error("bin/fleet must be a portable shell shim");
   process.exit(1);
 }
 
-if (!body.includes("target/debug/sponzey")) {
-  console.error("bin/sponzey must point to the Rust development binary");
+if (!body.includes("target/debug/fleet")) {
+  console.error("bin/fleet must point to the Rust development binary");
   process.exit(1);
 }
 
-if (!body.includes("SPONZEY_FLEET_BIN")) {
-  console.error("bin/sponzey must support explicit binary override for local pack smoke");
+if (!body.includes("FLEET_BIN")) {
+  console.error("bin/fleet must support explicit binary override for local pack smoke");
   process.exit(1);
 }
 
 if (!body.includes("fleet-$PLATFORM_OS-$PLATFORM_ARCH")) {
-  console.error("bin/sponzey must support platform binary package lookup");
+  console.error("bin/fleet must support platform binary package lookup");
   process.exit(1);
 }
 
 if (!body.includes("node_modules/@sponzey/fleet-$PLATFORM_OS-$PLATFORM_ARCH")) {
-  console.error("bin/sponzey must support npm nested optional dependency lookup");
+  console.error("bin/fleet must support npm nested optional dependency lookup");
   process.exit(1);
 }
 
 const unsupported = spawnSync(bin, ["--help"], {
   env: {
     ...process.env,
-    SPONZEY_FLEET_NPM_OS: "plan9",
-    SPONZEY_FLEET_NPM_ARCH: "mips",
+    FLEET_NPM_OS: "plan9",
+    FLEET_NPM_ARCH: "mips",
   },
   encoding: "utf8",
 });
@@ -68,15 +68,15 @@ if (!unsupported.stderr.includes("unsupported platform for @sponzey/fleet")) {
   process.exit(1);
 }
 
-const prefix = fs.mkdtempSync(path.join(os.tmpdir(), "sponzey-postinstall-"));
-const pathBin = fs.mkdtempSync(path.join(os.tmpdir(), "sponzey-path-bin-"));
+const prefix = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-postinstall-"));
+const pathBin = fs.mkdtempSync(path.join(os.tmpdir(), "fleet-path-bin-"));
 const postinstallRun = spawnSync(process.execPath, [postinstall], {
   env: {
     ...process.env,
     npm_config_global: "true",
     npm_config_prefix: prefix,
     PATH: pathBin,
-    SPONZEY_FLEET_POSTINSTALL_LINK_DIRS: pathBin,
+    FLEET_POSTINSTALL_LINK_DIRS: pathBin,
   },
   encoding: "utf8",
 });
@@ -91,26 +91,26 @@ if (!postinstallRun.stderr.includes("npm global bin is not in PATH")) {
   process.exit(1);
 }
 
-const installedLauncher = path.join(prefix, "bin", "sponzey");
+const installedLauncher = path.join(prefix, "bin", "fleet");
 if (!fs.existsSync(installedLauncher)) {
-  console.error("postinstall must create a global sponzey launcher when npm did not");
+  console.error("postinstall must create a global fleet launcher when npm did not");
   process.exit(1);
 }
 
-if (!postinstallRun.stderr.includes("sponzey launcher installed at")) {
+if (!postinstallRun.stderr.includes("fleet launcher installed at")) {
   console.error("postinstall must show the installed launcher path");
   process.exit(1);
 }
 
-const pathVisibleLauncher = path.join(pathBin, "sponzey");
+const pathVisibleLauncher = path.join(pathBin, "fleet");
 if (!fs.existsSync(pathVisibleLauncher)) {
-  console.error("postinstall must create a PATH-visible launcher when possible");
+  console.error("postinstall must create a PATH-visible fleet launcher when possible");
   process.exit(1);
 }
 
-if (!postinstallRun.stderr.includes("Created PATH-visible sponzey launcher at")) {
+if (!postinstallRun.stderr.includes("Created PATH-visible fleet launcher at")) {
   console.error("postinstall must show the PATH-visible launcher path");
   process.exit(1);
 }
 
-console.log("bin/sponzey wrapper checks passed");
+console.log("bin/fleet wrapper checks passed");

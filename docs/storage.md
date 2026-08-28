@@ -11,7 +11,7 @@ ad hoc으로 추가하지 않도록 하는 것이다.
 현재 production-ready 기본 store는 SQLite다.
 
 - 기본 controller DB는 data directory 아래 `controller/fleet.db`에 둔다.
-- `sponzey controller start --db sqlite://...`로 SQLite DB 경로를 bootstrap 시점에 명시할 수 있다.
+- `fleet controller start --db sqlite://...`로 SQLite DB 경로를 bootstrap 시점에 명시할 수 있다.
 - `postgres://...`와 `postgresql://...` URL은 typed `DatabaseSettings`에서
   Postgres backend로 분류된다. `fleet-controller --features postgres`에서는
   explicit typed `PostgresConnectionSettings`로 `PostgresStore`를 열고 migration을
@@ -166,7 +166,7 @@ schema_migrations
   version = CURRENT_SCHEMA_VERSION
 ```
 
-현재 `CURRENT_SCHEMA_VERSION`은 15이다.
+현재 `CURRENT_SCHEMA_VERSION`은 19이다.
 
 반복 실행 규칙:
 
@@ -190,6 +190,51 @@ Existing DB migration:
 - 없는 column은 `ensure_column`으로 추가한다.
 - 기존 column의 의미를 바꾸거나 삭제하지 않는다.
 - backward fixture test로 기존 DB shape에서 현재 schema로 올라오는지 확인한다.
+
+### Drift report provenance
+
+Schema v16 adds nullable `job_id`, `task_id`, `policy_id`, `policy_version`,
+and `purpose` columns to `drift_reports` in both SQLite and the feature-gated
+Postgres migration. A report is automation-eligible only when all five values
+form Controller-verified provenance for a stored drift assignment. The database
+does not treat agent-provided wire values as verified by itself.
+
+Existing rows keep all provenance columns `NULL` and are read as
+`uncorrelated`; they remain visible but cannot become remediation evidence.
+The partial unique index `drift_reports_correlated_task_unique_idx` rejects a
+second row only when both `job_id` and `task_id` are present. It therefore
+preserves multiple legacy or observation-only rows without inventing a
+correlation.
+
+The primary-key report id is carried only by the typed application/store read
+record as a stable remediation-origin reference. It does not make a row
+eligible: proposal code must still require a drifted report and matching
+Controller-verified policy id and version.
+
+Schema v17 adds nullable `drift_policy_id`, `drift_policy_version`, and
+`drift_purpose` columns to `jobs`. Scheduled drift jobs write the policy
+identity and purpose together with their stored policy document and signed task
+assignments. Controller intake verifies a report's claimed job/task pair against
+that persisted assignment before it writes report provenance. Manual raw-policy
+drift jobs retain `NULL` typed fields, so their reports remain uncorrelated.
+
+Schema v18 adds nullable `origin_drift_report_id` and `policy_version` to
+`remediation_requests`. A verified drifted intake writes its drift report,
+allocated typed origin id, remediation request, and redacted Drift/Policy audit
+events in one SQLite/Postgres transaction. If any of those writes fails, the
+transaction rolls back all of them. A duplicate `(job_id, task_id)` returns the
+existing report/request without another audit. The partial unique index
+`remediation_requests_active_policy_unique_idx` permits at most one active
+origin-bearing request per `(agent_id, policy_id)`; a duplicate returns that
+request without a second proposal audit. Its `origin_drift_report_id IS NOT
+NULL` predicate preserves legacy nullable rows without treating them as
+verified episodes.
+
+Schema v19 adds `remediation_verification_jobs` as a one-to-one durable
+correlation between a remediation request and its signed verification drift
+Job. `remediation_id` is the primary key and `job_id` is unique, so retry or
+duplicate execution results can find the existing verification Job without
+adding nullable lifecycle fields to legacy remediation rows.
 
 현재 migration fixture:
 
@@ -217,6 +262,9 @@ transaction을 연다.
 | typed job + assignments create | `save_*_job_with_assignments` repository method | job insert 후 assignment insert가 실패하면 job과 이전 assignment가 함께 rollback되어야 한다. | 단일 store transaction 기준이다. |
 | dispatch claim | `claim_assignment_for_dispatch` | `queued -> dispatched` 전이만 성공한다. non-queued, missing, terminal assignment는 상태를 바꾸지 않고 false/no-op로 처리한다. | multi-controller duplicate dispatch 방지는 Phase 10 lease/advisory lock 작업이다. |
 | dispatch claim release | `release_assignment_dispatch_claim` | send failure 후 `dispatched -> queued`만 허용한다. rejected/succeeded/failed/canceled/expired 같은 terminal 상태는 requeue하지 않는다. | active WebSocket send 성공을 accepted/started로 간주하지 않는다. |
+| remediation execution transition | `persist_remediation_execution_transition` | authenticated task event의 assignment transition, matching remediation lifecycle transition, Policy audit은 하나의 SQLite/Postgres transaction으로 commit한다. missing/terminal assignment와 late/duplicate remediation transition은 false/no-op이며, supplied remediation/audit write가 실패하면 assignment도 rollback한다. | WebSocket event 자체는 authority가 아니며 persisted task assignment와 remediation Job correlation만 canonical input이다. |
+| remediation verification Job create/recovery | `save_remediation_verification_job` + `list_pending_remediation_verification_recovery` | successful remediation 뒤 signed drift Job, single-target assignment, v19 one-to-one correlation, Policy audit을 하나의 SQLite/Postgres transaction으로 commit한다. duplicate correlation은 existing Job id를 반환하고 새 assignment/audit을 만들지 않으며, Job 또는 assignment insert 실패는 모든 새 row를 rollback한다. Controller bootstrap은 listener bind 전 correlation 없는 `succeeded_pending_verify` row를 최대 100개만 조회해 같은 create use case로 수렴시킨다. policy/version/execution Job을 검증할 수 없는 legacy row는 dispatch하지 않고 identifier와 reason code만 담은 `remediation_verification_recovery_skipped` audit을 남긴다. | Controller는 commit 뒤에만 dispatch를 시도한다. disconnected agent는 queued assignment를 유지한다. recovery는 startup 한 번만 실행하며 periodic retry/HA claim은 제공하지 않는다. |
+| remediation verification resolution | `resolve_remediation_verification_evidence` | successful verification assignment와 remediation execution completion 뒤의 compliant evidence가 모두 있을 때 remediation status, origin drift의 `resolved_at`/`resolution_job_id`, Policy audit을 하나의 SQLite/Postgres transaction으로 commit한다. evidence row는 typed id, agent, verification job/task, policy/version, `remediation_verification` purpose와 compliant status를 transaction 안에서 다시 확인한다. missing/mismatched/stale/noncompliant evidence와 missing origin은 no-op 또는 rollback이며 unrelated/latest drift를 갱신하지 않는다. | report와 final result의 delivery order는 Controller가 두 persisted records를 재조회해 수렴시킨다. verification task completion은 success guard이며 freshness timestamp가 아니다. |
 | scheduled drift worker | `due_scheduled_drift_checks` + `record_scheduled_drift_check` | 현재는 단일 controller worker 기준으로 due list 조회 후 job 생성과 schedule update를 순차 수행한다. | HA-safe claim/lease는 아직 없으며 Phase 10 전까지 multi-controller 중복 실행 가능성을 지원 상태로 표현하지 않는다. |
 | retention cleanup | `cleanup_retention` | dry-run은 count만 수행하고 삭제하지 않는다. 실제 cleanup은 artifact type별 cutoff를 사용한다. Audit table은 삭제 대상이 아니다. | HA-safe retention lease는 Phase 10 작업이다. |
 
@@ -233,32 +281,32 @@ transaction을 연다.
 공식 controller backup command:
 
 ```bash
-sponzey controller backup \
-  --data-dir .sponzey \
-  --output ./sponzey-controller.backup.json
+fleet controller backup \
+  --data-dir .fleet \
+  --output ./fleet-controller.backup.json
 ```
 
 공식 restore command:
 
 ```bash
-sponzey controller restore \
-  --data-dir .sponzey-restored \
-  --input ./sponzey-controller.backup.json
+fleet controller restore \
+  --data-dir .fleet-restored \
+  --input ./fleet-controller.backup.json
 ```
 
 위험을 줄이기 위해 먼저 dry-run을 실행할 수 있다.
 
 ```bash
-sponzey controller restore \
-  --data-dir .sponzey-restored \
-  --input ./sponzey-controller.backup.json \
+fleet controller restore \
+  --data-dir .fleet-restored \
+  --input ./fleet-controller.backup.json \
   --dry-run
 ```
 
 Archive format:
 
 - JSON file
-- `format = sponzey-controller-backup`
+- `format = fleet-controller-backup`
 - `format_version = 1`
 - `package_version`
 - `created_at_ms`
@@ -342,7 +390,7 @@ Audit:
 - `audit_events`
 
 `audit_events`는 controller API/application 경계에서 append-only로 다룬다.
-운영 export는 `/api/audit/export` 또는 `sponzey audit export`의 category
+운영 export는 `/api/audit/export` 또는 `fleet audit export`의 category
 filter와 cursor paging을 사용한다. SQLite MVP 저장소는 물리적 WORM 보관소가
 아니므로 장기 보존, 변조 방지, 규정 준수는 외부 백업/export 보관 정책으로
 보완해야 한다.
@@ -538,29 +586,29 @@ cargo test -p fleet-cli controller_restore_refuses_incompatible_schema_version
 Postgres가 있는 개발 환경에서만 실행하는 ignored gate:
 
 ```bash
-SPONZEY_TEST_POSTGRES_URL=postgresql://... \
+FLEET_TEST_POSTGRES_URL=postgresql://... \
   cargo test -p fleet-store --features postgres postgres_migration_records_current_schema_version -- --ignored
-SPONZEY_TEST_POSTGRES_URL=postgresql://... \
+FLEET_TEST_POSTGRES_URL=postgresql://... \
   cargo test -p fleet-store --features postgres postgres_bootstrap_repositories_roundtrip -- --ignored
-SPONZEY_TEST_POSTGRES_URL=postgresql://... \
+FLEET_TEST_POSTGRES_URL=postgresql://... \
   cargo test -p fleet-store --features postgres postgres_enrollment_token_repository_roundtrip -- --ignored
-SPONZEY_TEST_POSTGRES_URL=postgresql://... \
+FLEET_TEST_POSTGRES_URL=postgresql://... \
   cargo test -p fleet-store --features postgres postgres_audit_repository_roundtrip -- --ignored
-SPONZEY_TEST_POSTGRES_URL=postgresql://... \
+FLEET_TEST_POSTGRES_URL=postgresql://... \
   cargo test -p fleet-store --features postgres postgres_approval_repository_roundtrip -- --ignored
-SPONZEY_TEST_POSTGRES_URL=postgresql://... \
+FLEET_TEST_POSTGRES_URL=postgresql://... \
   cargo test -p fleet-store --features postgres postgres_job_assignment_repository_roundtrip -- --ignored
-SPONZEY_TEST_POSTGRES_URL=postgresql://... \
+FLEET_TEST_POSTGRES_URL=postgresql://... \
   cargo test -p fleet-store --features postgres postgres_typed_job_repository_roundtrip -- --ignored
-SPONZEY_TEST_POSTGRES_URL=postgresql://... \
+FLEET_TEST_POSTGRES_URL=postgresql://... \
   cargo test -p fleet-store --features postgres postgres_dispatch_assignment_repository_roundtrip -- --ignored
-SPONZEY_TEST_POSTGRES_URL=postgresql://... \
+FLEET_TEST_POSTGRES_URL=postgresql://... \
   cargo test -p fleet-store --features postgres postgres_output_telemetry_repository_roundtrip -- --ignored
-SPONZEY_TEST_POSTGRES_URL=postgresql://... \
+FLEET_TEST_POSTGRES_URL=postgresql://... \
   cargo test -p fleet-store --features postgres postgres_drift_policy_capability_repository_roundtrip -- --ignored
-SPONZEY_TEST_POSTGRES_URL=postgresql://... \
+FLEET_TEST_POSTGRES_URL=postgresql://... \
   cargo test -p fleet-store --features postgres postgres_query_artifact_retention_repository_roundtrip -- --ignored
-SPONZEY_TEST_POSTGRES_URL=postgresql://... \
+FLEET_TEST_POSTGRES_URL=postgresql://... \
   cargo test -p fleet-store --features postgres postgres_remediation_request_repository_roundtrip -- --ignored
 ```
 

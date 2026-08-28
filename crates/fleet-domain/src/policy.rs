@@ -1,3 +1,4 @@
+use crate::{JobId, TaskId};
 use crate::{Selector, SelectorError};
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
@@ -85,6 +86,166 @@ pub struct DriftReport {
     pub acknowledgement: DriftAcknowledgement,
     pub expected: String,
     pub actual: String,
+}
+
+/// Stable database identity for a stored drift observation used as a remediation origin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DriftReportId(i64);
+
+impl DriftReportId {
+    pub fn new(value: i64) -> Result<Self, RemediationEvidenceError> {
+        if value > 0 {
+            Ok(Self(value))
+        } else {
+            Err(RemediationEvidenceError::InvalidOriginId)
+        }
+    }
+
+    pub fn as_i64(self) -> i64 {
+        self.0
+    }
+}
+
+/// Identifies why a verified drift task was issued.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriftCheckPurpose {
+    Evaluation,
+    RemediationVerification,
+}
+
+/// Controller-issued policy identity retained by a drift-check job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriftJobProvenance {
+    pub policy_id: String,
+    pub policy_version: u32,
+    pub purpose: DriftCheckPurpose,
+}
+
+impl DriftJobProvenance {
+    pub fn scheduled(policy_id: impl Into<String>, policy_version: u32) -> Self {
+        Self {
+            policy_id: policy_id.into(),
+            policy_version,
+            purpose: DriftCheckPurpose::Evaluation,
+        }
+    }
+
+    pub fn remediation_verification(policy_id: impl Into<String>, policy_version: u32) -> Self {
+        Self {
+            policy_id: policy_id.into(),
+            policy_version,
+            purpose: DriftCheckPurpose::RemediationVerification,
+        }
+    }
+}
+
+impl DriftCheckPurpose {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Evaluation => "evaluation",
+            Self::RemediationVerification => "remediation_verification",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "evaluation" => Some(Self::Evaluation),
+            "remediation_verification" => Some(Self::RemediationVerification),
+            _ => None,
+        }
+    }
+}
+
+/// Persisted evidence binding for a drift report.
+///
+/// A report is eligible for remediation automation only when every value was
+/// established by the Controller from a stored assignment, not merely echoed
+/// by an agent message.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DriftReportProvenance {
+    pub job_id: Option<JobId>,
+    pub task_id: Option<TaskId>,
+    pub policy_id: Option<String>,
+    pub policy_version: Option<u32>,
+    pub purpose: Option<DriftCheckPurpose>,
+}
+
+impl DriftReportProvenance {
+    pub fn uncorrelated() -> Self {
+        Self::default()
+    }
+
+    pub fn verified(
+        job_id: JobId,
+        task_id: TaskId,
+        policy_id: impl Into<String>,
+        policy_version: u32,
+        purpose: DriftCheckPurpose,
+    ) -> Self {
+        Self {
+            job_id: Some(job_id),
+            task_id: Some(task_id),
+            policy_id: Some(policy_id.into()),
+            policy_version: Some(policy_version),
+            purpose: Some(purpose),
+        }
+    }
+
+    pub fn is_automation_eligible(&self) -> bool {
+        self.job_id.is_some()
+            && self.task_id.is_some()
+            && self.policy_id.is_some()
+            && self.policy_version.is_some()
+            && self.purpose.is_some()
+    }
+}
+
+/// Stored drift evidence that can be checked before a remediation proposal is created.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedDriftEvidence {
+    pub report_id: DriftReportId,
+    pub agent_id: String,
+    pub report: DriftReport,
+    pub provenance: DriftReportProvenance,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemediationEvidenceError {
+    InvalidOriginId,
+    UnverifiedProvenance,
+    DriftNotEligible,
+    PolicyMismatch,
+}
+
+impl VerifiedDriftEvidence {
+    /// Validates Controller-verified report fields before storage allocates the report identity.
+    pub fn validate_remediation_candidate(
+        report: &DriftReport,
+        provenance: &DriftReportProvenance,
+        policy: &Policy,
+    ) -> Result<(), RemediationEvidenceError> {
+        if !provenance.is_automation_eligible() {
+            return Err(RemediationEvidenceError::UnverifiedProvenance);
+        }
+        if report.status != DriftStatus::Drifted {
+            return Err(RemediationEvidenceError::DriftNotEligible);
+        }
+        if report.policy_name != policy.name
+            || provenance.policy_id.as_deref() != Some(policy.id.as_str())
+            || provenance.policy_version != Some(policy.version)
+        {
+            return Err(RemediationEvidenceError::PolicyMismatch);
+        }
+        Ok(())
+    }
+
+    /// Confirms this immutable observation is evidence for exactly this policy version.
+    pub fn is_eligible_for_remediation(
+        &self,
+        policy: &Policy,
+    ) -> Result<(), RemediationEvidenceError> {
+        Self::validate_remediation_candidate(&self.report, &self.provenance, policy)
+    }
 }
 
 impl DriftReport {
@@ -261,6 +422,7 @@ pub enum RemediationError {
     MissingRemediation,
     ApprovalRequired,
     DriftNotEligible,
+    EvidenceNotEligible(RemediationEvidenceError),
     InvalidTransition {
         from: RemediationStatus,
         event: &'static str,
@@ -323,6 +485,18 @@ impl RemediationRequest {
             ),
             job_id: None,
         })
+    }
+
+    /// Creates a proposal only from a stored, policy-version-matched drift origin.
+    pub fn propose_from_verified_drift(
+        id: impl Into<String>,
+        policy: &Policy,
+        evidence: &VerifiedDriftEvidence,
+    ) -> Result<Self, RemediationError> {
+        evidence
+            .is_eligible_for_remediation(policy)
+            .map_err(RemediationError::EvidenceNotEligible)?;
+        Self::propose_from_drift(id, policy, evidence.agent_id.clone(), &evidence.report)
     }
 
     pub fn plan(&self) -> RemediationPlan {
@@ -405,6 +579,8 @@ impl RemediationRequest {
             &[
                 RemediationStatus::Proposed,
                 RemediationStatus::PendingApproval,
+                RemediationStatus::JobCreated,
+                RemediationStatus::Running,
             ],
             RemediationStatus::Expired,
         )
@@ -945,6 +1121,19 @@ spec:
     }
 
     #[test]
+    fn remediation_verification_provenance_keeps_policy_identity_and_purpose() {
+        let provenance = DriftJobProvenance::remediation_verification("nginx-running", 3);
+
+        assert_eq!(provenance.policy_id, "nginx-running");
+        assert_eq!(provenance.policy_version, 3);
+        assert_eq!(
+            provenance.purpose,
+            DriftCheckPurpose::RemediationVerification
+        );
+        assert_eq!(provenance.purpose.as_str(), "remediation_verification");
+    }
+
+    #[test]
     fn remediation_request_requires_approval() {
         let policy = parse_policy_document(&format!(
             "{NGINX_RUNNING}\nremediation:\n  runbookRef: fix-nginx.yml\n  approvalRequired: true\n"
@@ -994,6 +1183,56 @@ spec:
         assert!(matches!(
             RemediationRequest::propose_from_drift("rem-1", &no_remediation, "agent-1", &drifted),
             Err(RemediationError::MissingRemediation)
+        ));
+    }
+
+    #[test]
+    fn verified_drift_evidence_requires_drifted_report_and_matching_policy_provenance() {
+        let policy = parse_policy_document(&format!(
+            "{NGINX_RUNNING}\nremediation:\n  runbookRef: fix-nginx.yml\n  approvalRequired: true\n"
+        ))
+        .unwrap();
+        let evidence = VerifiedDriftEvidence {
+            report_id: DriftReportId::new(42).unwrap(),
+            agent_id: "agent-1".to_owned(),
+            report: DriftReport::drifted("nginx-running", "expected", "actual"),
+            provenance: DriftReportProvenance::verified(
+                JobId::new("job-drift").unwrap(),
+                TaskId::new("task-drift").unwrap(),
+                "nginx-running",
+                policy.version,
+                DriftCheckPurpose::Evaluation,
+            ),
+        };
+
+        assert!(evidence.is_eligible_for_remediation(&policy).is_ok());
+
+        let mut compliant = evidence.clone();
+        compliant.report.status = DriftStatus::Compliant;
+        assert!(matches!(
+            compliant.is_eligible_for_remediation(&policy),
+            Err(RemediationEvidenceError::DriftNotEligible)
+        ));
+
+        let mut unknown = evidence.clone();
+        unknown.report.status = DriftStatus::Unknown;
+        assert!(matches!(
+            unknown.is_eligible_for_remediation(&policy),
+            Err(RemediationEvidenceError::DriftNotEligible)
+        ));
+
+        let mut uncorrelated = evidence.clone();
+        uncorrelated.provenance = DriftReportProvenance::uncorrelated();
+        assert!(matches!(
+            uncorrelated.is_eligible_for_remediation(&policy),
+            Err(RemediationEvidenceError::UnverifiedProvenance)
+        ));
+
+        let mut version_mismatch = evidence;
+        version_mismatch.provenance.policy_version = Some(policy.version + 1);
+        assert!(matches!(
+            version_mismatch.is_eligible_for_remediation(&policy),
+            Err(RemediationEvidenceError::PolicyMismatch)
         ));
     }
 

@@ -62,13 +62,13 @@ while read -r expected file_name; do
   extract_dir="$TMP_DIR/$verified_count"
   mkdir -p "$extract_dir"
   tar -xzf "$archive" -C "$extract_dir"
-  binary="$(find "$extract_dir" -type f -name sponzey | head -n 1)"
+  binary="$(find "$extract_dir" -type f -name fleet | head -n 1)"
   if [ -z "$binary" ]; then
-    echo "artifact does not contain a sponzey binary: $file_name" >&2
+    echo "artifact does not contain a fleet binary: $file_name" >&2
     exit 1
   fi
   if [ ! -x "$binary" ]; then
-    echo "artifact sponzey binary is not executable: $file_name" >&2
+    echo "artifact fleet binary is not executable: $file_name" >&2
     exit 1
   fi
 

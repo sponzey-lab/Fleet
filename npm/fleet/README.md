@@ -1,6 +1,6 @@
 # @sponzey/fleet
 
-This package is a distribution wrapper for the Rust `sponzey` binary.
+This package is a distribution wrapper for the Rust `fleet` binary.
 
 The repository builds the binary with Cargo:
 
@@ -9,12 +9,12 @@ cargo build -p fleet-cli
 npm test --prefix npm/fleet
 ```
 
-The `sponzey` bin shim does not start a Node.js runtime server. It only resolves and executes a Rust binary.
+The `fleet` bin shim does not start a Node.js runtime server. It only resolves and executes a Rust binary.
 
 Resolution order:
 
-1. Explicit local binary override: `SPONZEY_FLEET_BIN`
-2. Repository development binary: `target/debug/sponzey`
+1. Explicit local binary override: `FLEET_BIN`
+2. Repository development binary: `target/debug/fleet`
 3. Release binary package next to this package, using `@sponzey/fleet-<os>-<arch>`
 
 Supported release package targets:
@@ -39,7 +39,7 @@ Local platform package install smoke:
 ./scripts/npm_platform_local_install_smoke.sh
 ```
 
-This stages the current Rust binary into the current OS/architecture package, packs the wrapper and platform package, creates a temporary global npm-style symlink layout, and verifies that `sponzey --help` resolves through the platform package.
+This stages the current Rust binary into the current OS/architecture package, packs the wrapper and platform package, creates a temporary global npm-style symlink layout, and verifies that `fleet --help` resolves through the platform package.
 
 Local demo smoke:
 
@@ -47,13 +47,13 @@ Local demo smoke:
 ./scripts/npm_demo_smoke.sh
 ```
 
-The demo starts a temporary loopback-only controller, enrolls a local demo agent, runs a small confirmed command, prints the `/admin` URL, and removes the temporary data directory unless `sponzey demo --keep-temp` is used.
+The demo starts a temporary loopback-only controller, enrolls a local demo agent, runs a small confirmed command, prints the `/admin` URL, and removes the temporary data directory unless `fleet demo --keep-temp` is used.
 
 Registry publish for the current OS/architecture:
 
 ```sh
 ./scripts/npm_publish_current_platform.sh --dry-run
-SPONZEY_NPM_TOKEN_FILE=token.md ./scripts/npm_publish_current_platform.sh
+FLEET_NPM_TOKEN_FILE=token.md ./scripts/npm_publish_current_platform.sh
 ./scripts/manual_npm_registry_smoke.sh
 ```
 
@@ -61,18 +61,18 @@ This local/manual path uses a short-lived token file because npm Trusted
 Publishing is available only inside a configured cloud CI/CD workflow. The
 normal multi-platform release path uses GitHub Actions OIDC and does not use an
 `NPM_TOKEN` secret. The publish script stages the current
-`target/release/sponzey` binary into the matching platform package, publishes
+`target/release/fleet` binary into the matching platform package, publishes
 that package first, then publishes this wrapper package. The wrapper package is
 what users install:
 
 ```sh
 npm install -g @sponzey/fleet
-sponzey --help
+fleet --help
 ```
 
-The installer creates the npm global `sponzey` launcher when possible. It also
+The installer creates the npm global `fleet` launcher when possible. It also
 tries to create a PATH-visible launcher in a safe writable bin directory such as
-`/usr/local/bin`. It does not silently edit shell profile files. If `sponzey` is
+`/usr/local/bin`. It does not silently edit shell profile files. If `fleet` is
 still not found, add the npm global bin directory explicitly:
 
 ```sh
@@ -80,7 +80,7 @@ export PATH="$(npm prefix -g)/bin:$PATH"
 ```
 
 Standalone release archives are the non-npm install path. GitHub release
-artifacts are named `sponzey-<os>-<arch>.tar.gz` and are published with
+artifacts are named `fleet-<os>-<arch>.tar.gz` and are published with
 `SHA256SUMS`. Verify them before installing, and verify `SHA256SUMS.sig` with
 the pinned release public key when a signature is published:
 
@@ -92,17 +92,17 @@ the pinned release public key when a signature is published:
 For Linux services, install the resolved Rust binary rather than an npm shim:
 
 ```sh
-sponzey controller install-service --data-dir /var/lib/sponzey-fleet --dry-run
-sponzey agent install-service --data-dir /var/lib/sponzey-fleet --dry-run
-sponzey controller status-service --dry-run
-sponzey agent logs-service --dry-run
+fleet controller install-service --data-dir /var/lib/fleet --dry-run
+fleet agent install-service --data-dir /var/lib/fleet --dry-run
+fleet controller status-service --dry-run
+fleet agent logs-service --dry-run
 ```
 
 Upgrade is currently an external npm/artifact operation. Inspect the supported
 policy first:
 
 ```sh
-sponzey upgrade --dry-run
+fleet upgrade --dry-run
 ```
 
 GitHub Actions release:
@@ -127,7 +127,7 @@ Linux release binaries are built on Ubuntu 22.04 to avoid requiring glibc 2.39 f
 
 ## License
 
-Sponzey Fleet and the distributed `sponzey` binaries are licensed under
+Sponzey Fleet and the distributed `fleet` binaries are licensed under
 `AGPL-3.0-only`. See the repository
 [`LICENSE`](https://github.com/sponzey-lab/Fleet/blob/main/LICENSE) file and
 [license notes](https://github.com/sponzey-lab/Fleet/blob/main/docs/license.md).

@@ -1801,7 +1801,7 @@ fn temporary_copy_path(destination: &Path) -> PathBuf {
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("copy");
-    destination.with_file_name(format!(".{file_name}.sponzey.tmp.{}", std::process::id()))
+    destination.with_file_name(format!(".{file_name}.fleet.tmp.{}", std::process::id()))
 }
 
 fn sha256_hex(body: &[u8]) -> String {
@@ -2150,6 +2150,7 @@ where
                         return;
                     }
                 }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(error) => {
                     let _ = sender.send(Err(RunnerError::Io(error.to_string())));
                     return;
@@ -2345,7 +2346,7 @@ spec:
         state: present
     - id: nginx-config
       file.copy:
-        dest: /etc/nginx/conf.d/sponzey.conf
+        dest: /etc/nginx/conf.d/fleet.conf
         content: server { listen 8080; }
         mode: 0644
     - id: nginx-service
@@ -2370,7 +2371,7 @@ spec:
         assert!(matches!(
             &plan.steps[1].action,
             RunbookExecutionAction::FileCopy(spec)
-                if spec.destination == Path::new("/etc/nginx/conf.d/sponzey.conf")
+                if spec.destination == Path::new("/etc/nginx/conf.d/fleet.conf")
                     && spec.mode == Some(0o644)
         ));
         assert!(matches!(
@@ -2393,7 +2394,7 @@ selector: role=web
 steps:
   - id: nginx-template
     file.template:
-      dest: /etc/nginx/conf.d/sponzey.conf
+      dest: /etc/nginx/conf.d/fleet.conf
       content: server { listen {{ port }}; server_name {{ host }}; }
       mode: "0644"
       variables: port=8080,host=example.test
@@ -2408,7 +2409,7 @@ steps:
         assert!(matches!(
             &plan.steps[0].action,
             RunbookExecutionAction::FileCopy(spec)
-                if spec.destination == Path::new("/etc/nginx/conf.d/sponzey.conf")
+                if spec.destination == Path::new("/etc/nginx/conf.d/fleet.conf")
                     && spec.content == b"server { listen 8080; server_name example.test; }"
                     && spec.mode == Some(0o644)
         ));
@@ -3221,7 +3222,7 @@ spec:
             steps: vec![RunbookExecutionStep {
                 id: "copy".to_owned(),
                 action: RunbookExecutionAction::FileCopy(FileCopySpec {
-                    destination: PathBuf::from("/tmp/sponzey-dry-run"),
+                    destination: PathBuf::from("/tmp/fleet-dry-run"),
                     content: b"hello".to_vec(),
                     mode: None,
                     artifact_retention_class: None,
@@ -3905,6 +3906,46 @@ spec:
     }
 
     #[test]
+    fn output_reader_retries_interrupted_read_before_emitting_chunk() {
+        struct InterruptedThenData {
+            state: u8,
+        }
+
+        impl Read for InterruptedThenData {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                match self.state {
+                    0 => {
+                        self.state = 1;
+                        Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
+                    }
+                    1 => {
+                        self.state = 2;
+                        buffer[..2].copy_from_slice(b"ok");
+                        Ok(2)
+                    }
+                    _ => Ok(0),
+                }
+            }
+        }
+
+        let (sender, receiver) = mpsc::channel();
+        let reader = spawn_output_reader(
+            InterruptedThenData { state: 0 },
+            CommandOutputStream::Stdout,
+            sender,
+        );
+
+        let event = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("reader should emit a chunk");
+        reader.join().expect("reader thread should finish");
+
+        let event = event.expect("interrupted read should not be terminal");
+        assert_eq!(event.stream, CommandOutputStream::Stdout);
+        assert_eq!(event.bytes, b"ok");
+    }
+
+    #[test]
     fn non_zero_exit_code_is_preserved() {
         let output = run_command_with_spec(shell_spec("exit 7", Duration::from_secs(5))).unwrap();
 
@@ -3942,9 +3983,9 @@ spec:
 
     #[test]
     fn per_command_env_is_passed_without_global_mutation() {
-        let mut spec = shell_spec("printf %s \"$SPONZEY_TEST_VALUE\"", Duration::from_secs(5));
+        let mut spec = shell_spec("printf %s \"$FLEET_TEST_VALUE\"", Duration::from_secs(5));
         spec.env
-            .insert("SPONZEY_TEST_VALUE".to_owned(), "from-command".to_owned());
+            .insert("FLEET_TEST_VALUE".to_owned(), "from-command".to_owned());
 
         let output = run_command_with_spec(spec).unwrap();
 
@@ -4059,7 +4100,7 @@ spec:
 
     fn temp_test_dir(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
-            "sponzey-fleet-runner-{name}-{}-{}",
+            "fleet-runner-{name}-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)

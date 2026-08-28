@@ -3,7 +3,7 @@
   "version": "0.0.18",
   "description": "Sponzey Fleet Rust binary distribution wrapper",
   "bin": {
-    "sponzey": "bin/sponzey"
+    "fleet": "bin/fleet"
   },
   "scripts": {
     "postinstall": "node ./scripts/postinstall.js",

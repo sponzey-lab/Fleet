@@ -12,7 +12,7 @@ raw product logs.
 ## Validation
 
 ```bash
-sponzey apply examples/runbooks/nginx-basic.yml
+fleet apply examples/runbooks/nginx-basic.yml
 ```
 
 Current `apply` behavior remains validation-only:
@@ -236,7 +236,7 @@ The `file.template` primitive uses the same file write path after rendering:
   request state,
 - agent runbook execution passes the selected provider as an explicit resolver
   closure to the runner. The runner does not discover providers itself,
-- `sponzey apply` validates runbook structure and primitive planning only. It
+- `fleet apply` validates runbook structure and primitive planning only. It
   does not resolve `secretRefs`, read provider configuration, or prove that a
   secret-backed template can execute in a running agent context,
 - unsupported Mustache control expressions such as sections, partials, comments,
@@ -258,7 +258,7 @@ Example:
 steps:
   - id: nginx-template
     file.template:
-      dest: /etc/nginx/conf.d/sponzey.conf
+      dest: /etc/nginx/conf.d/fleet.conf
       content: server { listen {{ port }}; server_name {{ host }}; }
       mode: "0644"
       variables: port=8080,host=example.test
@@ -337,7 +337,7 @@ Every primitive step result follows this common shape:
   "exit_code": null,
   "stdout": "",
   "stderr": "",
-  "audit_metadata": "primitive=file.copy,destination=/etc/nginx/conf.d/sponzey.conf,changed=true,bytes=42"
+  "audit_metadata": "primitive=file.copy,destination=/etc/nginx/conf.d/fleet.conf,changed=true,bytes=42"
 }
 ```
 
