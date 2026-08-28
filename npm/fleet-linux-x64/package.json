@@ -1,6 +1,6 @@
 {
   "name": "@sponzey/fleet-linux-x64",
-  "version": "0.0.18",
+  "version": "0.0.19",
   "description": "Sponzey Fleet Rust binary for Linux x64",
   "os": [
     "linux"
