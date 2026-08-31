@@ -348,6 +348,7 @@ Agent가 연결된 뒤 Web Admin에서 다음 작업을 할 수 있습니다.
 - Agent별 assignment 상태와 job output 확인
 - approval 요청 생성, 승인, 거절
 - policy 저장·배정과 drift check 일정 설정
+- 공개 catalog source, 검증된 revision, runbook/policy 메타데이터 확인
 - remediation 진행 상태와 audit event 확인
 
 Job은 Agent로 보내기 전에 먼저 저장됩니다. Agent가 offline이면 assignment가 queued
@@ -377,6 +378,40 @@ verification evidence가 실제 상태의 기준입니다.
 
 전체 문법과 고급 예시는 [Runbook 문서](docs/runbooks.md),
 [Policy 문서](docs/policy.md), [API 계약](docs/api.md)을 참고하세요.
+
+## 공개 runbook·policy catalog 추가하기
+
+Catalog는 검증 가능한 runbook과 policy 문서를 담은 공개 HTTPS Git 저장소입니다. Source를
+등록해도 바로 내려받지 않고, sync가 끝나도 바로 활성화되지 않으며, 활성화해도 Agent에서
+실행되지는 않습니다. 검토할 시간을 확보하기 위해 세 단계를 분리했습니다.
+CI workflow처럼 catalog와 관계없는 YAML 파일은 건너뜁니다. 다만 Fleet `Runbook` 또는
+`Policy`라고 선언한 파일은 sync가 성공하려면 반드시 올바른 문서여야 합니다.
+
+Web Admin에서 **Runbooks** 또는 **Policies** 메뉴를 열고 Catalog 패널에서 다음 순서로
+진행합니다.
+
+1. 짧은 source ID, 공개 `https://` Git URL, 따라갈 branch 또는 tag를 입력한 뒤
+   **Register source**를 누릅니다.
+2. `sync-2026-08-31-01`처럼 새 operation ID를 입력하고 **Start sync**를 누릅니다.
+   요청은 먼저 저장되고 Controller worker가 나중에 처리하므로, 완료된 revision 상태는
+   Catalog 새로 고침으로 확인합니다.
+3. 준비된(ready) revision을 선택하고 전체 commit ID를 **Ready commit**에 붙여 넣은 뒤,
+   검토를 마쳤을 때만 **Activate ready revision**을 누릅니다.
+
+세 열은 source, revision, document의 메타데이터만 보여 줍니다. 문서 본문을 목록에
+노출하지 않으며, sync 성공을 활성화로 간주하지도 않습니다.
+
+`fleet login` 이후에는 같은 작업을 CLI로도 할 수 있습니다.
+
+```bash
+fleet catalog register public-operations https://example.com/operations.git main
+fleet catalog sync public-operations sync-2026-08-31-01
+fleet catalog list
+fleet catalog activate public-operations READY_REVISION의_전체_COMMIT_ID
+```
+
+Catalog 등록·sync·활성화는 owner 또는 administrator만 할 수 있습니다. 공개 HTTPS
+저장소만 사용하며 private 저장소 credential은 catalog 설정으로 지원하지 않습니다.
 
 ## 선택 사항: 운영자 CLI 로그인
 

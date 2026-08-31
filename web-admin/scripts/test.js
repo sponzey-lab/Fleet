@@ -71,6 +71,16 @@ assert(!index.includes('data-route-link="approvals"'), "approvals must not remai
 assert(index.includes('data-route-link="run"'), "index must expose the run workspace");
 assert(index.includes('data-route-link="runbooks"'), "index must expose the runbooks workspace");
 assert(index.includes('class="panel approval-panel" data-route="run runbooks"'), "approval queue must be shared by run and runbooks workspaces");
+assert(index.includes('class="panel catalog-panel" data-route="runbooks policies"'), "catalog must be shared by the runbooks and policies workspaces");
+for (const catalogSurface of [
+  "catalog-list",
+  "catalog-revisions",
+  "catalog-documents",
+  "catalog-action-form",
+  "refresh-catalog",
+]) {
+  assert(index.includes(`id=\"${catalogSurface}\"`), `index must expose ${catalogSurface}`);
+}
 assert(app.includes("applyAdminRoute"), "app must apply the selected admin route");
 assert(app.includes("ADMIN_ROUTE_PRESENTATION"), "app must define a presentation contract for each route");
 assert(app.includes('approvals: "run"'), "legacy approvals hash must resolve to the run workspace");
@@ -80,6 +90,10 @@ assert(app.includes("hashchange"), "app must respond to browser history route ch
 assert(app.includes("focus: true"), "hash navigation must request route focus restoration");
 assert(app.includes("preventScroll: true"), "route focus must preserve scroll position");
 assert(!app.includes("localStorage"), "route state must not persist credentials in browser storage");
+assert(app.includes("loadCatalogRevisions"), "catalog source selection must load durable revisions");
+assert(app.includes("loadCatalogDocuments"), "catalog revision selection must load document metadata");
+assert(app.includes("submitCatalogAction"), "catalog mutations must use explicit action submission");
+assert(app.includes("catalogActionInFlight"), "catalog actions must prevent duplicate submissions while a request is pending");
 assert(index.includes("id=\"agents-list\""), "index must expose the agents surface");
 assert(index.includes("id=\"agent-detail\""), "index must expose selected agent detail");
 assert(index.includes("id=\"revoke-agent-key\""), "index must expose agent key revocation");
@@ -192,6 +206,13 @@ for (const endpoint of [
   "getLatestDrift",
   "listDrift",
   "listPolicies",
+  "listCatalogSources",
+  "registerCatalogSource",
+  "startCatalogSync",
+  "activateCatalogRevision",
+  "listCatalogRevisions",
+  "listCatalogDocuments",
+  "getCatalogDocumentDetail",
   "savePolicy",
   "assignPolicy",
   "schedulePolicyDrift",
@@ -281,6 +302,9 @@ const {
   renderPolicies,
   renderAgentPolicies,
   renderAgentLogs,
+  renderCatalogSources,
+  renderCatalogRevisions,
+  renderCatalogDocuments,
   renderEnrollmentTokens,
   renderCreatedEnrollmentToken,
   buildEnrollmentTokenRequest,
@@ -310,6 +334,23 @@ assert(
   agentDisplayStatus({ connected: true, revoked: true, status: "online" }) === "offline",
   "a revoked agent must remain offline even when a stale session response says connected",
 );
+const catalogCommit = "a".repeat(40);
+assert(
+  renderCatalogSources([{ id: "public-operations", reference: "main", active_commit: catalogCommit }], "public-operations").includes("active"),
+  "catalog sources must show the explicit active revision state",
+);
+assert(
+  renderCatalogRevisions([{ commit: catalogCommit, state: "ready", document_count: 2, failure: "validation_failed" }], catalogCommit).includes("validation_failed"),
+  "catalog revisions must render the durable failure category without raw fetch errors",
+);
+assert(
+  renderCatalogRevisions([{ commit: catalogCommit, state: "ready", document_count: 2, failure: null }], catalogCommit).includes("2 documents"),
+  "catalog revisions must show durable validation metadata without inferring activation",
+);
+assert(
+  renderCatalogDocuments([{ kind: "runbook", path: "runbooks/restart-web.yaml", checksum: "b".repeat(64) }]).includes("runbooks/restart-web.yaml"),
+  "catalog documents must show metadata without rendering document bodies",
+);
 
 const calls = [];
 const client = createApiClient({
@@ -332,6 +373,13 @@ await client.listAgentLogs("agent/1", { limit: 5, before: "3:8" });
 await client.getLatestDrift("agent/1");
 await client.listDrift("agent/1", { before: "2:9" });
 await client.listPolicies();
+await client.listCatalogSources({ limit: 10, after: "public-catalog" });
+await client.registerCatalogSource({ source_id: "public-catalog", url: "https://example.com/catalog.git", reference: "main" });
+await client.startCatalogSync("public/catalog", { operation_id: "sync-001" });
+await client.activateCatalogRevision("public/catalog", { commit: "a".repeat(40) });
+await client.listCatalogRevisions("public/catalog", { limit: 10, after: "a".repeat(40) });
+await client.listCatalogDocuments("public/catalog", "a".repeat(40), { limit: 10, after: "runbooks/web service.yaml" });
+await client.getCatalogDocumentDetail("public/catalog", "a".repeat(40), "runbooks/web service.yaml");
 await client.savePolicy({ source: "apiVersion: fleet.sponzey.dev/v1alpha1\nkind: Policy\n" });
 await client.assignPolicy("policy/1", { agent_id: "agent/1" });
 await client.schedulePolicyDrift("policy/1", { agent_id: "agent/1", interval_seconds: 300 });
@@ -406,6 +454,31 @@ assert(
   "client must encode paged drift query",
 );
 assert(findCall("/api/policies"), "client must call policy list endpoint");
+assert(
+  findCall("/api/catalog/sources?limit=10&after=public-catalog"),
+  "client must page catalog sources with the opaque after cursor",
+);
+assert(findCall("/api/catalog/sources", "POST"), "client must register catalog sources");
+assert(
+  findCall("/api/catalog/sources/public%2Fcatalog/sync", "POST"),
+  "client must start a catalog sync through an encoded source path",
+);
+assert(
+  findCall("/api/catalog/sources/public%2Fcatalog/activate", "POST"),
+  "client must explicitly activate a ready catalog revision through an encoded source path",
+);
+assert(
+  findCall(`/api/catalog/sources/public%2Fcatalog/revisions?limit=10&after=${"a".repeat(40)}`),
+  "client must encode catalog source ids and revision cursors",
+);
+assert(
+  findCall(`/api/catalog/sources/public%2Fcatalog/revisions/${"a".repeat(40)}/documents?limit=10&after=runbooks%2Fweb+service.yaml`),
+  "client must encode catalog document cursors",
+);
+assert(
+  findCall(`/api/catalog/sources/public%2Fcatalog/revisions/${"a".repeat(40)}/document?path=runbooks%2Fweb%20service.yaml`),
+  "client must percent-encode catalog document detail paths",
+);
 assert(findCall("/api/policies", "POST"), "client must call policy save endpoint");
 assert(findCall("/api/policies", "POST").options.method === "POST", "client must POST policy saves");
 assert(

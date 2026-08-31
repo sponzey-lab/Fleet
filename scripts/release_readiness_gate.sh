@@ -95,6 +95,7 @@ else
   echo "glibc baseline check skipped: target/release/fleet not built."
 fi
 run ./scripts/hardening_audit.sh
+run node ./scripts/test_catalog_performance_gate.js
 
 if [ "$INCLUDE_REGISTRY" -eq 1 ]; then
   run ./scripts/manual_npm_registry_smoke.sh

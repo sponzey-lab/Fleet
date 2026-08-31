@@ -16,6 +16,7 @@ fleet-domain = { path = "../fleet-domain" }
 fleet-protocol = { path = "../fleet-protocol" }
 fleet-store = { path = "../fleet-store" }
 futures-util = { workspace = true }
+git2 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
@@ -23,6 +24,7 @@ rustls-pemfile = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
 tracing = { workspace = true }
+tempfile = "3"
 
 [dev-dependencies]
 rcgen = "0.12"

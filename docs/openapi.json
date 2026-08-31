@@ -45,6 +45,76 @@
         },
         "additionalProperties": false
       },
+      "CatalogSourceItem": {
+        "type": "object",
+        "required": ["id", "url", "reference", "active_commit"],
+        "properties": {
+          "id": { "type": "string", "example": "public-operations" },
+          "url": { "type": "string", "format": "uri", "example": "https://example.com/fleet-catalog.git" },
+          "reference": { "type": "string", "example": "main" },
+          "active_commit": { "type": ["string", "null"], "description": "Active immutable revision, when one has been explicitly activated.", "example": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
+        },
+        "additionalProperties": false
+      },
+      "CatalogSourcePage": {
+        "type": "object",
+        "required": ["items", "next_after"],
+        "properties": {
+          "items": { "type": "array", "items": { "$ref": "#/components/schemas/CatalogSourceItem" } },
+          "next_after": { "type": ["string", "null"], "description": "Opaque source cursor for the next ascending page." }
+        },
+        "additionalProperties": false
+      },
+      "CatalogRevisionItem": {
+        "type": "object",
+        "required": ["commit", "state", "document_count", "failure"],
+        "properties": {
+          "commit": { "type": "string", "pattern": "^[a-f0-9]{40}([a-f0-9]{24})?$", "example": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" },
+          "state": { "type": "string", "enum": ["fetching", "validating", "ready", "failed"] },
+          "document_count": { "type": ["integer", "null"], "minimum": 1 },
+          "failure": { "type": ["string", "null"], "description": "Sanitized durable failure category, never a fetch payload or raw remote error." }
+        },
+        "additionalProperties": false
+      },
+      "CatalogRevisionPage": {
+        "type": "object",
+        "required": ["items", "next_after"],
+        "properties": {
+          "items": { "type": "array", "items": { "$ref": "#/components/schemas/CatalogRevisionItem" } },
+          "next_after": { "type": ["string", "null"], "description": "Opaque immutable revision cursor for the next ascending page." }
+        },
+        "additionalProperties": false
+      },
+      "CatalogDocumentItem": {
+        "type": "object",
+        "required": ["kind", "path", "checksum"],
+        "properties": {
+          "kind": { "type": "string", "enum": ["policy", "runbook"] },
+          "path": { "type": "string", "example": "runbooks/restart-web.yaml" },
+          "checksum": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+        },
+        "additionalProperties": false
+      },
+      "CatalogDocumentPage": {
+        "type": "object",
+        "required": ["items", "next_after"],
+        "properties": {
+          "items": { "type": "array", "items": { "$ref": "#/components/schemas/CatalogDocumentItem" }, "description": "Document metadata only; it never includes document body." },
+          "next_after": { "type": ["string", "null"], "description": "Opaque document-path cursor for the next ascending page." }
+        },
+        "additionalProperties": false
+      },
+      "CatalogDocumentDetail": {
+        "type": "object",
+        "required": ["kind", "path", "checksum", "body"],
+        "properties": {
+          "kind": { "type": "string", "enum": ["policy", "runbook"] },
+          "path": { "type": "string", "example": "runbooks/restart-web.yaml" },
+          "checksum": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+          "body": { "type": "string", "description": "Validated immutable document body; available only from the detail endpoint." }
+        },
+        "additionalProperties": false
+      },
       "HealthResponse": {
         "type": "object",
         "required": ["status"],
@@ -2865,6 +2935,104 @@
           },
           "400": { "$ref": "#/components/responses/BadRequest" },
           "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/api/catalog/sources": {
+      "get": {
+        "tags": ["Catalog"],
+        "summary": "List durable catalog sources.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 100, "default": 50 } },
+          { "name": "after", "in": "query", "schema": { "type": "string" }, "description": "Opaque source cursor returned as next_after." }
+        ],
+        "responses": {
+          "200": { "description": "Bounded source page.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CatalogSourcePage" } } } },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      },
+      "post": {
+        "tags": ["Catalog"],
+        "summary": "Register a public HTTPS catalog source.",
+        "security": [{ "bearerAuth": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["source_id", "url", "reference"], "properties": { "source_id": { "type": "string" }, "url": { "type": "string", "format": "uri" }, "reference": { "type": "string" } }, "additionalProperties": false } } } },
+        "responses": { "201": { "description": "Registered source.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CatalogSourceItem" } } } }, "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" }, "409": { "description": "Source id already exists." } }
+      }
+    },
+    "/api/catalog/sources/{source_id}/sync": {
+      "post": {
+        "tags": ["Catalog"],
+        "summary": "Start a bounded asynchronous catalog sync.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "source_id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["operation_id"], "properties": { "operation_id": { "type": "string" } }, "additionalProperties": false } } } },
+        "responses": { "202": { "description": "Durable operation accepted for worker execution." }, "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" } }
+      }
+    },
+    "/api/catalog/sources/{source_id}/activate": {
+      "post": {
+        "tags": ["Catalog"], "summary": "Explicitly activate a ready immutable revision.", "security": [{ "bearerAuth": [] }],
+        "parameters": [{ "name": "source_id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["commit"], "properties": { "commit": { "type": "string", "pattern": "^[a-f0-9]{40}([a-f0-9]{24})?$" } }, "additionalProperties": false } } } },
+        "responses": { "200": { "description": "Activated source.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CatalogSourceItem" } } } }, "400": { "$ref": "#/components/responses/BadRequest" }, "401": { "$ref": "#/components/responses/Unauthorized" }, "403": { "$ref": "#/components/responses/Forbidden" }, "404": { "$ref": "#/components/responses/NotFound" }, "409": { "description": "Revision is not ready." } }
+      }
+    },
+    "/api/catalog/sources/{source_id}/revisions": {
+      "get": {
+        "tags": ["Catalog"],
+        "summary": "List durable catalog revisions.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "source_id", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 100, "default": 50 } },
+          { "name": "after", "in": "query", "schema": { "type": "string" }, "description": "Opaque revision cursor returned as next_after." }
+        ],
+        "responses": {
+          "200": { "description": "Bounded revision page.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CatalogRevisionPage" } } } },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      }
+    },
+    "/api/catalog/sources/{source_id}/revisions/{commit}/documents": {
+      "get": {
+        "tags": ["Catalog"],
+        "summary": "List catalog document metadata without bodies.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "source_id", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "commit", "in": "path", "required": true, "schema": { "type": "string", "pattern": "^[a-f0-9]{40}([a-f0-9]{24})?$" } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 100, "default": 50 } },
+          { "name": "after", "in": "query", "schema": { "type": "string" }, "description": "Opaque document-path cursor returned as next_after." }
+        ],
+        "responses": {
+          "200": { "description": "Bounded document metadata page; body is excluded.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CatalogDocumentPage" } } } },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      }
+    },
+    "/api/catalog/sources/{source_id}/revisions/{commit}/document": {
+      "get": {
+        "tags": ["Catalog"],
+        "summary": "Get one validated catalog document body.",
+        "security": [{ "bearerAuth": [] }],
+        "parameters": [
+          { "name": "source_id", "in": "path", "required": true, "schema": { "type": "string" } },
+          { "name": "commit", "in": "path", "required": true, "schema": { "type": "string", "pattern": "^[a-f0-9]{40}([a-f0-9]{24})?$" } },
+          { "name": "path", "in": "query", "required": true, "schema": { "type": "string" }, "description": "Repository-relative document path. Percent-encode it as a query value." }
+        ],
+        "responses": {
+          "200": { "description": "Document detail.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CatalogDocumentDetail" } } } },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" }
         }
       }
     },

@@ -1,0 +1,58 @@
+name: Catalog performance
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Capture a candidate baseline or verify the committed baseline.
+        required: true
+        default: capture
+        type: choice
+        options:
+          - capture
+          - verify
+  workflow_call:
+    inputs:
+      mode:
+        required: false
+        default: verify
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: catalog-performance-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  benchmark:
+    name: Seven-sample catalog benchmark
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@1.94.0
+
+      - name: Test performance gate comparison
+        run: node ./scripts/test_catalog_performance_gate.js
+
+      - name: Compile benchmark target
+        run: cargo test -p fleet-application --lib --no-run
+
+      - name: Record seven warm samples
+        run: ./scripts/catalog_performance_gate.sh record --runner-label ubuntu-22.04 --report dist/catalog-performance/report.json
+
+      - name: Verify committed baseline
+        if: ${{ inputs.mode == 'verify' }}
+        run: ./scripts/catalog_performance_gate.sh verify --baseline docs/catalog-performance-baseline.json --report dist/catalog-performance/report.json
+
+      - name: Upload timing report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: catalog-performance-${{ inputs.mode }}-${{ github.run_id }}
+          path: dist/catalog-performance/report.json
+          if-no-files-found: error

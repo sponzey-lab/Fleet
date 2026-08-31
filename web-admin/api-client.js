@@ -4,13 +4,16 @@ function encodePathValue(value) {
   return encodeURIComponent(String(value ?? ""));
 }
 
-function pageQuery({ limit, before } = {}) {
+function pageQuery({ limit, before, after } = {}) {
   const params = new URLSearchParams();
   if (limit !== undefined && limit !== null && limit !== "") {
     params.set("limit", String(limit));
   }
   if (before) {
     params.set("before", String(before));
+  }
+  if (after) {
+    params.set("after", String(after));
   }
   const query = params.toString();
   return query ? `?${query}` : "";
@@ -133,6 +136,13 @@ export function createApiClient({ fetchImpl = globalThis.fetch, tokenProvider = 
     listPolicies() {
       return request("/api/policies");
     },
+    listCatalogSources(page = {}) { return request(`/api/catalog/sources${pageQuery(page)}`); },
+    registerCatalogSource(body = {}) { return request("/api/catalog/sources", { method: "POST", body: JSON.stringify(body) }); },
+    startCatalogSync(sourceId, body = {}) { return request(`/api/catalog/sources/${encodePathValue(sourceId)}/sync`, { method: "POST", body: JSON.stringify(body) }); },
+    activateCatalogRevision(sourceId, body = {}) { return request(`/api/catalog/sources/${encodePathValue(sourceId)}/activate`, { method: "POST", body: JSON.stringify(body) }); },
+    listCatalogRevisions(sourceId, page = {}) { return request(`/api/catalog/sources/${encodePathValue(sourceId)}/revisions${pageQuery(page)}`); },
+    listCatalogDocuments(sourceId, commit, page = {}) { return request(`/api/catalog/sources/${encodePathValue(sourceId)}/revisions/${encodePathValue(commit)}/documents${pageQuery(page)}`); },
+    getCatalogDocumentDetail(sourceId, commit, path) { return request(`/api/catalog/sources/${encodePathValue(sourceId)}/revisions/${encodePathValue(commit)}/document?path=${encodeURIComponent(path)}`); },
     savePolicy(body = {}) {
       return request("/api/policies", {
         method: "POST",

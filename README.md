@@ -352,6 +352,7 @@ After an Agent connects, Web Admin can:
 - show per-Agent assignment state and job output
 - create and decide approval requests
 - save and assign policies and schedule drift checks
+- browse public catalog sources, their validated revisions, and runbook/policy metadata
 - show remediation progress and audit events
 
 Jobs are stored before they are sent. If an Agent is offline, its assignment
@@ -381,6 +382,41 @@ events and stored verification evidence are the source of truth.
 
 See [Runbooks](docs/runbooks.md), [Policies](docs/policy.md), and the
 [API contract](docs/api.md) for complete schemas and advanced examples.
+
+## Add a public runbook or policy catalog
+
+A catalog is a public HTTPS Git repository containing validated runbook and
+policy documents. Registering a source does not download it, syncing it does
+not make it active, and activation does not execute anything on an Agent.
+Those three separate steps make it easier to review what will be used.
+Other YAML files, such as a CI workflow, are ignored. A file that declares a
+Fleet `Runbook` or `Policy` must still be valid before the sync can succeed.
+
+In Web Admin, open **Runbooks** or **Policies**. In the Catalog panel:
+
+1. Enter a short source ID, its public `https://` Git URL, and the branch or
+   tag to follow; then choose **Register source**.
+2. Enter a new operation ID such as `sync-2026-08-31-01`, then choose
+   **Start sync**. The request is accepted first and finishes in the
+   Controller worker, so refresh the catalog to see its durable revision state.
+3. Select a ready revision, copy its full commit ID into **Ready commit**, and
+   choose **Activate ready revision** only after review.
+
+The three columns show source, revision, and document metadata. They do not
+show document bodies or treat a successful sync as an activation.
+
+The same workflow is available after `fleet login`:
+
+```bash
+fleet catalog register public-operations https://example.com/operations.git main
+fleet catalog sync public-operations sync-2026-08-31-01
+fleet catalog list
+fleet catalog activate public-operations FULL_READY_COMMIT_ID
+```
+
+Only an owner or administrator can register, sync, or activate a catalog.
+Use public HTTPS repositories only; private repository credentials are not a
+supported catalog setting.
 
 ## Optional operator CLI login
 

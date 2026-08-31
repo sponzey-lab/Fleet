@@ -235,6 +235,35 @@ steps:
           <pre id="runbook-result" class="snapshot output-viewer">Create a runbook job to view status here.</pre>
         </article>
 
+        <article class="panel catalog-panel" data-route="runbooks policies">
+          <div class="panel-heading">
+            <div><h2>Catalog</h2><p class="muted">Approved source metadata only. Sync and activation never run automatically.</p></div>
+            <button id="refresh-catalog" type="button">Refresh catalog</button>
+          </div>
+          <div class="catalog-browser">
+            <section class="catalog-section" aria-labelledby="catalog-sources-title">
+              <h3 id="catalog-sources-title">Sources</h3>
+              <div id="catalog-list" class="list empty" aria-live="polite">Authenticate to load catalog sources.</div>
+            </section>
+            <section class="catalog-section" aria-labelledby="catalog-revisions-title">
+              <h3 id="catalog-revisions-title">Revisions</h3>
+              <div id="catalog-revisions" class="list empty" aria-live="polite">Choose a source to load its revisions.</div>
+            </section>
+            <section class="catalog-section" aria-labelledby="catalog-documents-title">
+              <h3 id="catalog-documents-title">Documents</h3>
+              <div id="catalog-documents" class="list empty" aria-live="polite">Choose a revision to load document metadata.</div>
+            </section>
+          </div>
+          <form id="catalog-action-form" class="catalog-form">
+            <div class="form-field"><label for="catalog-source-id">Source ID</label><input id="catalog-source-id" name="source-id" required placeholder="public-operations" /></div>
+            <div class="form-field"><label for="catalog-operation-id">Sync operation ID</label><input id="catalog-operation-id" name="operation-id" placeholder="sync-001" /></div>
+            <div class="form-field form-field-full"><label for="catalog-url">Public HTTPS Git URL (registration only)</label><input id="catalog-url" name="url" placeholder="https://example.com/catalog.git" /></div>
+            <div class="form-field"><label for="catalog-reference">Reference (registration only)</label><input id="catalog-reference" name="reference" value="main" /></div>
+            <div class="form-field"><label for="catalog-commit">Ready commit (activation only)</label><input id="catalog-commit" name="commit" placeholder="40 or 64 lowercase hex" /></div>
+            <div class="button-row"><button name="catalog-action" value="register" type="submit">Register source</button><button name="catalog-action" value="sync" type="submit">Start sync</button><button name="catalog-action" value="activate" type="submit">Activate ready revision</button></div>
+          </form>
+        </article>
+
         <article class="panel" data-route="run">
           <div class="panel-heading">
             <h2>Jobs</h2>

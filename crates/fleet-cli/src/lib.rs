@@ -79,6 +79,7 @@ pub enum Command {
     Controller(ControllerCommand),
     Agent(AgentCommand),
     Agents(AgentsCommand),
+    Catalog(CatalogCommand),
     Jobs(JobsCommand),
     Approvals(ApprovalsCommand),
     Remediations(RemediationsCommand),
@@ -488,6 +489,38 @@ pub enum AgentSubcommand {
 pub struct AgentsCommand {
     #[command(subcommand)]
     pub command: AgentsSubcommand,
+}
+
+#[derive(Debug, Args)]
+pub struct CatalogCommand {
+    #[command(subcommand)]
+    pub command: CatalogSubcommand,
+}
+#[derive(Debug, Subcommand)]
+pub enum CatalogSubcommand {
+    List {
+        #[command(flatten)]
+        api: ProtectedApiArgs,
+    },
+    Register {
+        source_id: String,
+        url: String,
+        reference: String,
+        #[command(flatten)]
+        api: ProtectedApiArgs,
+    },
+    Sync {
+        source_id: String,
+        operation_id: String,
+        #[command(flatten)]
+        api: ProtectedApiArgs,
+    },
+    Activate {
+        source_id: String,
+        commit: String,
+        #[command(flatten)]
+        api: ProtectedApiArgs,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -979,6 +1012,7 @@ pub fn execute(cli: Cli) -> Result<(), CliError> {
         Command::Controller(command) => execute_controller(command),
         Command::Agent(command) => execute_agent(command),
         Command::Agents(command) => execute_agents(command),
+        Command::Catalog(command) => execute_catalog(command),
         Command::Jobs(command) => execute_jobs(command),
         Command::Approvals(command) => execute_approvals(command),
         Command::Remediations(command) => execute_remediations(command),
@@ -1118,7 +1152,7 @@ impl ProtectedApiClient {
             Some(&self.admin_token),
             body,
         )?;
-        protected_response_body(&response, &[200, 201])
+        protected_response_body(&response, &[200, 201, 202])
     }
 
     fn get(&self, path: &str) -> Result<String, CliError> {
@@ -2391,6 +2425,53 @@ fn execute_agent(command: AgentCommand) -> Result<(), CliError> {
             uninstall_systemd_service(ServiceRole::Agent, dry_run)
         }
     }
+}
+
+fn execute_catalog(command: CatalogCommand) -> Result<(), CliError> {
+    let (client, path, body) = match command.command {
+        CatalogSubcommand::List { api } => (
+            resolve_protected_api(&api)?,
+            "/api/catalog/sources".to_owned(),
+            None,
+        ),
+        CatalogSubcommand::Register {
+            source_id,
+            url,
+            reference,
+            api,
+        } => (
+            resolve_protected_api(&api)?,
+            "/api/catalog/sources".to_owned(),
+            Some(
+                serde_json::json!({"source_id": source_id, "url": url, "reference": reference})
+                    .to_string(),
+            ),
+        ),
+        CatalogSubcommand::Sync {
+            source_id,
+            operation_id,
+            api,
+        } => (
+            resolve_protected_api(&api)?,
+            format!("/api/catalog/sources/{source_id}/sync"),
+            Some(serde_json::json!({"operation_id": operation_id}).to_string()),
+        ),
+        CatalogSubcommand::Activate {
+            source_id,
+            commit,
+            api,
+        } => (
+            resolve_protected_api(&api)?,
+            format!("/api/catalog/sources/{source_id}/activate"),
+            Some(serde_json::json!({"commit": commit}).to_string()),
+        ),
+    };
+    let response = if let Some(body) = body {
+        client.post(&path, Some(&body))?
+    } else {
+        client.get(&path)?
+    };
+    print_json_response(&response)
 }
 
 fn execute_agents(command: AgentsCommand) -> Result<(), CliError> {
@@ -9879,6 +9960,45 @@ steps:
         let data_dir = initialized_controller_backup_fixture("restore-roundtrip-source");
         let output = unique_test_dir("restore-roundtrip-output").join("controller-backup.json");
         let restore_dir = unique_test_dir("restore-roundtrip-target");
+        let source = fleet_domain::CatalogSource::new(
+            fleet_domain::CatalogSourceId::new("public-catalog").unwrap(),
+            fleet_domain::PublicCatalogUrl::new("https://example.com/catalog.git").unwrap(),
+            fleet_domain::CatalogReference::new("main").unwrap(),
+        );
+        let commit = fleet_domain::CatalogCommitId::new("a".repeat(40)).unwrap();
+        let mut revision = source.begin_sync(commit.clone());
+        revision.begin_validation().unwrap();
+        revision.mark_ready(1).unwrap();
+        let document = fleet_domain::CatalogDocument::new(
+            source.id().clone(),
+            commit.clone(),
+            fleet_domain::CatalogDocumentKind::Runbook,
+            "runbooks/nginx.yaml",
+            "c".repeat(64),
+        )
+        .unwrap();
+        {
+            use fleet_application::CatalogRepository;
+
+            let mut source_store =
+                fleet_store::SqliteStore::open(controller_db_path(&data_dir)).unwrap();
+            source_store.save_catalog_source(source.clone()).unwrap();
+            source_store
+                .save_catalog_revision(revision.clone())
+                .unwrap();
+            let mut active_source = source.clone();
+            active_source.activate(&revision).unwrap();
+            source_store
+                .activate_catalog_revision(active_source, &revision)
+                .unwrap();
+            source_store
+                .save_catalog_document(
+                    document.clone(),
+                    "apiVersion: fleet.sponzey.dev/v1alpha1\nkind: Runbook\nname: nginx\n"
+                        .to_owned(),
+                )
+                .unwrap();
+        }
         execute_controller_backup(&data_dir, &output).unwrap();
 
         execute_controller_restore(&restore_dir, &output, false, false).unwrap();
@@ -9900,6 +10020,26 @@ steps:
                 .join("controller_public.key")
                 .is_file()
         );
+        {
+            use fleet_application::CatalogRepository;
+
+            assert_eq!(
+                restored_store
+                    .find_catalog_source(source.id())
+                    .unwrap()
+                    .expect("restored catalog source")
+                    .active_revision(),
+                Some(&commit)
+            );
+            assert_eq!(
+                restored_store
+                    .find_catalog_document(source.id(), &commit, document.path())
+                    .unwrap()
+                    .expect("restored catalog document")
+                    .body,
+                "apiVersion: fleet.sponzey.dev/v1alpha1\nkind: Runbook\nname: nginx\n"
+            );
+        }
 
         let _ = fs::remove_dir_all(data_dir);
         let _ = fs::remove_dir_all(restore_dir);

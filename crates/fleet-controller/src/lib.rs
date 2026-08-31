@@ -9,37 +9,31 @@ use axum::{
     response::{IntoResponse, Response as AxumResponse},
     routing::get,
 };
+pub mod catalog_fetch;
 use fleet_application::{
-    ActivateSigningKeyRotation, ActivateSigningKeyRotationInput,
-    AgentCertificateLifecycleRepository, AgentCertificateLifecycleUseCaseError,
-    ApprovalRepository as AppApprovalRepository, ApprovalRequestRecord as AppApprovalRequestRecord,
-    ApprovalUseCaseError, ApproveApprovalInput, ApproveApprovalRequest,
-    ApproveRemediationRunbookJob, ApproveRemediationRunbookJobError,
-    ApproveRemediationRunbookJobInput, ArtifactStore, ControllerSigningRotationStatus,
-    ControllerSigningRotationStatusInput, ControllerSigningStagedRolloutRecord,
-    ControllerSigningStagedRolloutRepository, FailSigningKeyRotation, FailSigningKeyRotationInput,
-    QueryControllerSigningRotationStatus, RejectApprovalInput, RejectApprovalRequest,
-};
-use fleet_application::{
-    AdminTokenRepository, AgentInventoryRepository, AgentLogRepository, AuthenticateAdminToken,
-    CommandJobRepository, CreateCommandJob, CreateCommandJobError, CreateCommandJobInput,
-    CreateDriftCheckJob, CreateDriftCheckJobError, CreateDriftCheckJobInput, CreateEnrollmentToken,
+    ActivateCatalogRevision, ActivateCatalogRevisionInput, AdminTokenRepository,
+    AgentInventoryRepository, AgentLogRepository, AuditWriter, AuthenticateAdminToken,
+    CatalogDocumentRecord, CatalogQueryRepository, CatalogRepository, CommandJobRepository,
+    CreateCommandJob, CreateCommandJobError, CreateCommandJobInput, CreateDriftCheckJob,
+    CreateDriftCheckJobError, CreateDriftCheckJobInput, CreateEnrollmentToken,
     CreateEnrollmentTokenInput, CreateRemediationVerificationJob,
     CreateRemediationVerificationJobError, CreateRemediationVerificationJobInput, CreateRunbookJob,
     CreateRunbookJobError, CreateRunbookJobInput, DispatchAssignmentRepository,
     DispatchPendingAssignments, DispatchPendingAssignmentsInput, DispatchPendingAssignmentsOutput,
     DriftRepository, EnrollmentTokenRepository, EnrollmentTokenUseCaseError, EnsureAdminToken,
     ExpireApprovalRequests, ExpireApprovalsInput, ExportAuditEvents, FactsRepository,
-    GetInventoryAgent, GetJobSummary, GetLatestDrift, GetLatestFacts, GetLatestMetrics,
-    JobDispatchGate, JobOutputChunk, JobOutputRepository, JobOutputStream, JobQueryRepository,
-    JobRepository, ListAgentLogChunks, ListApprovalRequests, ListAuditEvents, ListDriftReports,
+    GetCatalogDocumentDetail, GetInventoryAgent, GetJobSummary, GetLatestDrift, GetLatestFacts,
+    GetLatestMetrics, JobDispatchGate, JobOutputChunk, JobOutputRepository, JobOutputStream,
+    JobQueryRepository, JobRepository, ListAgentLogChunks, ListApprovalRequests, ListAuditEvents,
+    ListCatalogDocuments, ListCatalogRevisions, ListCatalogSources, ListDriftReports,
     ListDueScheduledDrift, ListEnrollmentTokens, ListFactsSnapshots, ListInventoryAgents,
     ListJobOutputForJob, ListJobSummaries, ListMetricsSnapshots,
     ListPendingRemediationVerificationRecovery, MAX_REMEDIATION_VERIFICATION_RECOVERY_BATCH,
     MetricsRepository, PendingAssignmentDispatcher, PendingTaskAssignment,
     PersistVerifiedDriftProposal, PersistVerifiedDriftProposalUseCaseInput,
     PolicyRepository as AppPolicyRepository, PrepareRemediationExecutionTransition,
-    PreviewSelector, RemediationApprovalRequestError, RemediationExecutionPersistenceInput,
+    PreviewSelector, RegisterCatalogSource, RegisterCatalogSourceInput,
+    RemediationApprovalRequestError, RemediationExecutionPersistenceInput,
     RemediationExecutionTransition, RemediationJobResultStatus, RemediationRequestRecord,
     RemediationRequestRepository, RemediationResultUseCaseError,
     RemediationVerificationJobPersistenceInput, RemediationVerificationJobRepository,
@@ -59,6 +53,17 @@ use fleet_application::{
     ValidateSigningKeyRotationInput, VerifiedDriftProposalRepository,
     select_controller_signing_fingerprint, select_dispatch_targets,
 };
+use fleet_application::{
+    ActivateSigningKeyRotation, ActivateSigningKeyRotationInput,
+    AgentCertificateLifecycleRepository, AgentCertificateLifecycleUseCaseError,
+    ApprovalRepository as AppApprovalRepository, ApprovalRequestRecord as AppApprovalRequestRecord,
+    ApprovalUseCaseError, ApproveApprovalInput, ApproveApprovalRequest,
+    ApproveRemediationRunbookJob, ApproveRemediationRunbookJobError,
+    ApproveRemediationRunbookJobInput, ArtifactStore, ControllerSigningRotationStatus,
+    ControllerSigningRotationStatusInput, ControllerSigningStagedRolloutRecord,
+    ControllerSigningStagedRolloutRepository, FailSigningKeyRotation, FailSigningKeyRotationInput,
+    QueryControllerSigningRotationStatus, RejectApprovalInput, RejectApprovalRequest,
+};
 use fleet_application::{AssignPolicyToAgent, AssignPolicyToAgentInput, RetentionPolicy};
 use fleet_application::{
     DisabledSecretProvider, DisabledSecretProviderError, ResolvedSecret, SecretProvider,
@@ -73,7 +78,9 @@ use fleet_domain::{
     Agent, AgentCapability, AgentCapabilitySnapshot, AgentFingerprint, AgentId, AgentIdentity,
     AgentLabel, AgentName, AgentPublicKey, AgentRuntimeProfile, AgentStatus, ArtifactChecksum,
     ArtifactId, ArtifactRetentionClass, AssignmentStatus, AuditActor, AuditCategory, AuditEvent,
-    AuditTarget, AuditValue, ControllerPublicKey, DriftAcknowledgement, DriftReport,
+    AuditTarget, AuditValue, CatalogCommitId, CatalogDocument, CatalogPolicyProvenance,
+    CatalogRevision, CatalogRevisionState, CatalogSource, CatalogSourceId, CatalogSyncOperation,
+    CatalogSyncOperationId, ControllerPublicKey, DriftAcknowledgement, DriftReport,
     DriftReportProvenance, DriftSeverity, DriftStatus, Job, JobId, JobStatus, PackageManager,
     PrivilegeLevel, RenderedArtifactMetadata, Selector, ServiceManager, TaskEnvelope, TaskId,
 };
@@ -92,9 +99,10 @@ use std::fs::File;
 use std::io::BufReader;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -113,6 +121,8 @@ const AGENT_OFFLINE_AFTER: Duration = Duration::from_secs(90);
 const AGENT_RECENTLY_SEEN_AFTER: Duration = Duration::from_secs(90);
 const HEARTBEAT_BOUND_IDLE_CLOSE_AFTER: Duration = Duration::from_millis(75);
 const AGENT_SESSION_OUTBOUND_QUEUE_CAPACITY: usize = 64;
+const CATALOG_SYNC_WORKER_QUEUE_CAPACITY: usize = 16;
+const CATALOG_SYNC_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 const AGENT_LOG_CHUNK_MAX_BYTES: usize = 4096;
 const SCHEDULED_DRIFT_WORKER_INTERVAL: Duration = Duration::from_secs(30);
 const SCHEDULED_DRIFT_WORKER_GRACE: Duration = Duration::from_secs(60);
@@ -146,6 +156,7 @@ struct ControllerAppState {
     identity: Arc<ControllerIdentity>,
     metadata: Arc<ControllerRuntimeMetadata>,
     sessions: Arc<Mutex<AgentSessionRegistry>>,
+    catalog_sync_submitter: Option<CatalogSyncSubmitter>,
 }
 
 enum ControllerStore {
@@ -276,6 +287,241 @@ impl ControllerStore {
     }
 }
 
+impl CatalogRepository for ControllerStore {
+    type Error = fleet_store::StoreError;
+
+    fn save_catalog_source(&mut self, source: CatalogSource) -> Result<(), Self::Error> {
+        match self {
+            Self::Sqlite(store) => CatalogRepository::save_catalog_source(store, source),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(store) => {
+                CatalogRepository::save_catalog_source(&mut *store.borrow_mut(), source)
+            }
+        }
+    }
+    fn find_catalog_source(
+        &self,
+        id: &CatalogSourceId,
+    ) -> Result<Option<CatalogSource>, Self::Error> {
+        match self {
+            Self::Sqlite(store) => CatalogRepository::find_catalog_source(store, id),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(store) => CatalogRepository::find_catalog_source(&*store.borrow(), id),
+        }
+    }
+    fn find_catalog_revision(
+        &self,
+        source: &CatalogSourceId,
+        commit: &CatalogCommitId,
+    ) -> Result<Option<CatalogRevision>, Self::Error> {
+        match self {
+            Self::Sqlite(store) => CatalogRepository::find_catalog_revision(store, source, commit),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(store) => {
+                CatalogRepository::find_catalog_revision(&*store.borrow(), source, commit)
+            }
+        }
+    }
+    fn save_catalog_revision(&mut self, revision: CatalogRevision) -> Result<(), Self::Error> {
+        match self {
+            Self::Sqlite(store) => CatalogRepository::save_catalog_revision(store, revision),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(store) => {
+                CatalogRepository::save_catalog_revision(&mut *store.borrow_mut(), revision)
+            }
+        }
+    }
+    fn begin_or_observe_catalog_sync_operation(
+        &mut self,
+        operation: CatalogSyncOperation,
+    ) -> Result<CatalogSyncOperation, Self::Error> {
+        match self {
+            Self::Sqlite(store) => {
+                CatalogRepository::begin_or_observe_catalog_sync_operation(store, operation)
+            }
+            #[cfg(feature = "postgres")]
+            Self::Postgres(store) => CatalogRepository::begin_or_observe_catalog_sync_operation(
+                &mut *store.borrow_mut(),
+                operation,
+            ),
+        }
+    }
+    fn save_catalog_sync_operation(
+        &mut self,
+        operation: CatalogSyncOperation,
+    ) -> Result<(), Self::Error> {
+        match self {
+            Self::Sqlite(store) => CatalogRepository::save_catalog_sync_operation(store, operation),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(store) => {
+                CatalogRepository::save_catalog_sync_operation(&mut *store.borrow_mut(), operation)
+            }
+        }
+    }
+    fn find_catalog_sync_operation(
+        &self,
+        id: &CatalogSyncOperationId,
+    ) -> Result<Option<CatalogSyncOperation>, Self::Error> {
+        match self {
+            Self::Sqlite(store) => CatalogRepository::find_catalog_sync_operation(store, id),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(store) => {
+                CatalogRepository::find_catalog_sync_operation(&*store.borrow(), id)
+            }
+        }
+    }
+    fn save_catalog_document(
+        &mut self,
+        document: CatalogDocument,
+        body: String,
+    ) -> Result<(), Self::Error> {
+        match self {
+            Self::Sqlite(store) => CatalogRepository::save_catalog_document(store, document, body),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(store) => {
+                CatalogRepository::save_catalog_document(&mut *store.borrow_mut(), document, body)
+            }
+        }
+    }
+
+    fn reuse_catalog_document(&mut self, document: CatalogDocument) -> Result<(), Self::Error> {
+        match self {
+            Self::Sqlite(store) => CatalogRepository::reuse_catalog_document(store, document),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(store) => {
+                CatalogRepository::reuse_catalog_document(&mut *store.borrow_mut(), document)
+            }
+        }
+    }
+
+    fn find_catalog_document(
+        &self,
+        source: &CatalogSourceId,
+        commit: &CatalogCommitId,
+        path: &str,
+    ) -> Result<Option<CatalogDocumentRecord>, Self::Error> {
+        match self {
+            Self::Sqlite(store) => {
+                CatalogRepository::find_catalog_document(store, source, commit, path)
+            }
+            #[cfg(feature = "postgres")]
+            Self::Postgres(store) => {
+                CatalogRepository::find_catalog_document(&*store.borrow(), source, commit, path)
+            }
+        }
+    }
+    fn activate_catalog_revision(
+        &mut self,
+        source: CatalogSource,
+        revision: &CatalogRevision,
+    ) -> Result<(), Self::Error> {
+        match self {
+            Self::Sqlite(store) => {
+                CatalogRepository::activate_catalog_revision(store, source, revision)
+            }
+            #[cfg(feature = "postgres")]
+            Self::Postgres(store) => CatalogRepository::activate_catalog_revision(
+                &mut *store.borrow_mut(),
+                source,
+                revision,
+            ),
+        }
+    }
+}
+
+impl CatalogQueryRepository for ControllerStore {
+    type Error = fleet_store::StoreError;
+
+    fn list_catalog_sources_after(
+        &self,
+        after: Option<&CatalogSourceId>,
+        limit: usize,
+    ) -> Result<Vec<CatalogSource>, Self::Error> {
+        match self {
+            Self::Sqlite(store) => {
+                CatalogQueryRepository::list_catalog_sources_after(store, after, limit)
+            }
+            #[cfg(feature = "postgres")]
+            Self::Postgres(store) => {
+                CatalogQueryRepository::list_catalog_sources_after(&*store.borrow(), after, limit)
+            }
+        }
+    }
+
+    fn list_catalog_revisions_after(
+        &self,
+        source: &CatalogSourceId,
+        after: Option<&CatalogCommitId>,
+        limit: usize,
+    ) -> Result<Vec<CatalogRevision>, Self::Error> {
+        match self {
+            Self::Sqlite(store) => {
+                CatalogQueryRepository::list_catalog_revisions_after(store, source, after, limit)
+            }
+            #[cfg(feature = "postgres")]
+            Self::Postgres(store) => CatalogQueryRepository::list_catalog_revisions_after(
+                &*store.borrow(),
+                source,
+                after,
+                limit,
+            ),
+        }
+    }
+
+    fn list_catalog_documents_after(
+        &self,
+        source: &CatalogSourceId,
+        commit: &CatalogCommitId,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<CatalogDocument>, Self::Error> {
+        match self {
+            Self::Sqlite(store) => CatalogQueryRepository::list_catalog_documents_after(
+                store, source, commit, after, limit,
+            ),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(store) => CatalogQueryRepository::list_catalog_documents_after(
+                &*store.borrow(),
+                source,
+                commit,
+                after,
+                limit,
+            ),
+        }
+    }
+
+    fn find_catalog_document_detail(
+        &self,
+        source: &CatalogSourceId,
+        commit: &CatalogCommitId,
+        path: &str,
+    ) -> Result<Option<CatalogDocumentRecord>, Self::Error> {
+        match self {
+            Self::Sqlite(store) => {
+                CatalogQueryRepository::find_catalog_document_detail(store, source, commit, path)
+            }
+            #[cfg(feature = "postgres")]
+            Self::Postgres(store) => CatalogQueryRepository::find_catalog_document_detail(
+                &*store.borrow(),
+                source,
+                commit,
+                path,
+            ),
+        }
+    }
+}
+
+impl AuditWriter for ControllerStore {
+    type Error = fleet_store::StoreError;
+    fn write(&mut self, event: AuditEvent) -> Result<(), Self::Error> {
+        match self {
+            Self::Sqlite(store) => AuditWriter::write(store, event),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(store) => AuditWriter::write(&mut *store.borrow_mut(), event),
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum ControllerStoreRef<'a> {
     Sqlite(&'a SqliteStore),
@@ -302,6 +548,84 @@ impl<'a> From<&'a SqliteStore> for ControllerStoreRef<'a> {
 impl<'a> From<&'a std::sync::MutexGuard<'_, ControllerStore>> for ControllerStoreRef<'a> {
     fn from(store: &'a std::sync::MutexGuard<'_, ControllerStore>) -> Self {
         (&**store).into()
+    }
+}
+
+impl CatalogQueryRepository for ControllerStoreRef<'_> {
+    type Error = fleet_store::StoreError;
+    fn list_catalog_sources_after(
+        &self,
+        after: Option<&CatalogSourceId>,
+        limit: usize,
+    ) -> Result<Vec<CatalogSource>, Self::Error> {
+        match self {
+            Self::Sqlite(store) => {
+                CatalogQueryRepository::list_catalog_sources_after(*store, after, limit)
+            }
+            #[cfg(feature = "postgres")]
+            Self::Postgres(store) => {
+                CatalogQueryRepository::list_catalog_sources_after(&*store.borrow(), after, limit)
+            }
+        }
+    }
+    fn list_catalog_revisions_after(
+        &self,
+        source: &CatalogSourceId,
+        after: Option<&CatalogCommitId>,
+        limit: usize,
+    ) -> Result<Vec<CatalogRevision>, Self::Error> {
+        match self {
+            Self::Sqlite(store) => {
+                CatalogQueryRepository::list_catalog_revisions_after(*store, source, after, limit)
+            }
+            #[cfg(feature = "postgres")]
+            Self::Postgres(store) => CatalogQueryRepository::list_catalog_revisions_after(
+                &*store.borrow(),
+                source,
+                after,
+                limit,
+            ),
+        }
+    }
+    fn list_catalog_documents_after(
+        &self,
+        source: &CatalogSourceId,
+        commit: &CatalogCommitId,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<CatalogDocument>, Self::Error> {
+        match self {
+            Self::Sqlite(store) => CatalogQueryRepository::list_catalog_documents_after(
+                *store, source, commit, after, limit,
+            ),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(store) => CatalogQueryRepository::list_catalog_documents_after(
+                &*store.borrow(),
+                source,
+                commit,
+                after,
+                limit,
+            ),
+        }
+    }
+    fn find_catalog_document_detail(
+        &self,
+        source: &CatalogSourceId,
+        commit: &CatalogCommitId,
+        path: &str,
+    ) -> Result<Option<CatalogDocumentRecord>, Self::Error> {
+        match self {
+            Self::Sqlite(store) => {
+                CatalogQueryRepository::find_catalog_document_detail(*store, source, commit, path)
+            }
+            #[cfg(feature = "postgres")]
+            Self::Postgres(store) => CatalogQueryRepository::find_catalog_document_detail(
+                &*store.borrow(),
+                source,
+                commit,
+                path,
+            ),
+        }
     }
 }
 
@@ -1190,6 +1514,22 @@ impl ControllerStoreRef<'_> {
         }
     }
 
+    fn publish_catalog_policy_source(
+        &self,
+        policy: &fleet_domain::Policy,
+        provenance: &CatalogPolicyProvenance,
+    ) -> Result<fleet_application::CatalogPolicyPublishOutcome, fleet_store::StoreError> {
+        match self {
+            Self::Sqlite(store) => store.publish_catalog_policy_source(policy, provenance),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(_) => self.with_postgres(|store| {
+                fleet_application::PolicyRepository::publish_catalog_policy_source(
+                    store, policy, provenance,
+                )
+            }),
+        }
+    }
+
     fn list_policies(
         &self,
     ) -> Result<Vec<fleet_application::PolicyRecord>, fleet_store::StoreError> {
@@ -1638,6 +1978,33 @@ impl ControllerStoreRef<'_> {
             #[cfg(feature = "postgres")]
             Self::Postgres(_) => self.with_postgres(|store| {
                 store.save_runbook_job_with_assignments(job.clone(), task, assignments)
+            }),
+        }
+    }
+
+    fn save_catalog_runbook_job_with_assignments_record(
+        &self,
+        job: &Job,
+        task: &fleet_domain::RunbookExecutionTask,
+        provenance: &fleet_domain::CatalogRunbookProvenance,
+        assignments: &[TaskEnvelope],
+    ) -> Result<(), fleet_store::StoreError> {
+        match self {
+            Self::Sqlite(store) => store.save_catalog_runbook_job_with_assignments_record(
+                job,
+                task,
+                provenance,
+                assignments,
+            ),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(_) => self.with_postgres(|store| {
+                RunbookJobRepository::save_catalog_runbook_job_with_assignments(
+                    store,
+                    job.clone(),
+                    task,
+                    provenance,
+                    assignments,
+                )
             }),
         }
     }
@@ -3492,6 +3859,56 @@ pub struct PolicyResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogSourceItemResponse {
+    pub id: String,
+    pub url: String,
+    pub reference: String,
+    pub active_commit: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogRevisionItemResponse {
+    pub commit: String,
+    pub state: String,
+    pub document_count: Option<usize>,
+    pub failure: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogDocumentItemResponse {
+    pub kind: String,
+    pub path: String,
+    pub checksum: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogPageResponse<T> {
+    pub items: Vec<T>,
+    pub next_after: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogDocumentDetailResponse {
+    pub kind: String,
+    pub path: String,
+    pub checksum: String,
+    pub body: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterCatalogSourceRequest {
+    pub source_id: String,
+    pub url: String,
+    pub reference: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StartCatalogSyncRequest {
+    pub operation_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActivateCatalogRevisionRequest {
+    pub commit: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssignPolicyRequest {
     pub agent_id: String,
 }
@@ -3659,6 +4076,7 @@ pub enum ControllerError {
     Tls(String),
     SigningKeyRotation(String),
     SecretProvider(String),
+    CatalogSync(String),
     UnsupportedDatabaseBackend(String),
 }
 
@@ -3674,6 +4092,7 @@ impl Display for ControllerError {
                 write!(formatter, "controller signing key rotation error: {error}")
             }
             Self::SecretProvider(error) => write!(formatter, "secret provider error: {error}"),
+            Self::CatalogSync(error) => write!(formatter, "catalog sync error: {error}"),
             Self::UnsupportedDatabaseBackend(backend) => write!(
                 formatter,
                 "database backend is recognized but not implemented: {backend}"
@@ -3905,7 +4324,7 @@ where
         .map(|settings| build_tls_acceptor(settings.cert_path(), settings.key_path()))
         .transpose()?;
     let insecure_http_target = insecure_http_transport_target(&config);
-    let state = ControllerAppState {
+    let mut state = ControllerAppState {
         store: Arc::new(Mutex::new(store)),
         artifact_store: Arc::new(Mutex::new(artifact_store)),
         identity: Arc::new(identity),
@@ -3932,6 +4351,7 @@ where
                 .map(|settings| settings.key_path().to_path_buf()),
         }),
         sessions: Arc::new(Mutex::new(AgentSessionRegistry::default())),
+        catalog_sync_submitter: None,
     };
     let recovery = recover_pending_remediation_verifications(
         &state,
@@ -3957,6 +4377,13 @@ where
         state.identity.as_ref(),
         insecure_http_target.as_deref(),
     );
+    let catalog_sync_worker = start_catalog_sync_worker(
+        state.store.clone(),
+        Arc::new(catalog_fetch::PublicGitCatalogFetcher::new(
+            config.data_dir.join("controller").join("catalog-staging"),
+        )),
+    );
+    state.catalog_sync_submitter = Some(catalog_sync_worker.submitter());
     start_scheduled_drift_worker(state.store.clone(), state.identity.clone());
     start_controller_signing_staged_rollout_worker(
         state.store.clone(),
@@ -3970,7 +4397,7 @@ where
         .fallback(axum_http_fallback)
         .with_state(state);
 
-    if let Some(acceptor) = tls_acceptor {
+    let serve_result = if let Some(acceptor) = tls_acceptor {
         let listener = TlsControllerListener { listener, acceptor };
         axum::serve(listener, app)
             .with_graceful_shutdown(async move {
@@ -3979,7 +4406,7 @@ where
                 }
             })
             .await
-            .map_err(ControllerError::Io)?;
+            .map_err(ControllerError::Io)
     } else {
         axum::serve(listener, app)
             .with_graceful_shutdown(async move {
@@ -3988,9 +4415,11 @@ where
                 }
             })
             .await
-            .map_err(ControllerError::Io)?;
-    }
+            .map_err(ControllerError::Io)
+    };
 
+    catalog_sync_worker.shutdown().await;
+    serve_result?;
     tracing::info!("controller_stopped");
     Ok(())
 }
@@ -4086,6 +4515,36 @@ async fn axum_http_fallback(
     body: Bytes,
 ) -> AxumResponse {
     let request = raw_http_request_from_axum(method, uri, headers, body);
+    if request.starts_with("POST /api/catalog/sources ") {
+        return match register_catalog_source_http(&request, &state) {
+            Ok(response) => axum_response_from_raw(&response),
+            Err(error) => axum_response_from_raw(&response(
+                500,
+                "application/json",
+                &format!("{{\"error\":\"{}\"}}\n", json_escape(&error.to_string())),
+            )),
+        };
+    }
+    if request.starts_with("POST /api/catalog/sources/") && request.contains("/sync HTTP/") {
+        return match start_catalog_sync_http(&request, &state) {
+            Ok(response) => axum_response_from_raw(&response),
+            Err(error) => axum_response_from_raw(&response(
+                500,
+                "application/json",
+                &format!("{{\"error\":\"{}\"}}\n", json_escape(&error.to_string())),
+            )),
+        };
+    }
+    if request.starts_with("POST /api/catalog/sources/") && request.contains("/activate HTTP/") {
+        return match activate_catalog_revision_http(&request, &state) {
+            Ok(response) => axum_response_from_raw(&response),
+            Err(error) => axum_response_from_raw(&response(
+                500,
+                "application/json",
+                &format!("{{\"error\":\"{}\"}}\n", json_escape(&error.to_string())),
+            )),
+        };
+    }
     let result = state
         .store
         .lock()
@@ -4115,6 +4574,223 @@ async fn axum_http_fallback(
                 &format!("{{\"error\":\"{}\"}}\n", json_escape(&error.to_string())),
             ))
         }
+    }
+}
+
+fn register_catalog_source_http(
+    request: &str,
+    state: &ControllerAppState,
+) -> Result<String, ControllerError> {
+    let mut store = state.store.lock().map_err(|_| {
+        ControllerError::Store(fleet_store::StoreError::Domain(
+            "store lock poisoned".to_owned(),
+        ))
+    })?;
+    let Some(context) = authenticate_admin_request(request, &*store)? else {
+        return Ok(response(
+            401,
+            "application/json",
+            "{\"error\":\"unauthorized\"}\n",
+        ));
+    };
+    if !context.allows(AdminPermission::PolicyWrite) {
+        return Ok(forbidden_response(AdminPermission::PolicyWrite));
+    }
+    let request: RegisterCatalogSourceRequest = serde_json::from_str(request_body(request))
+        .map_err(|error| ControllerError::Json(error.to_string()))?;
+    match RegisterCatalogSource::execute_with_unified_repository(
+        &mut *store,
+        RegisterCatalogSourceInput {
+            source_id: request.source_id,
+            url: request.url,
+            reference: request.reference,
+            actor: context.actor_id,
+            occurred_at: SystemTime::now(),
+        },
+    ) {
+        Ok(source) => serde_json::to_string(&CatalogSourceItemResponse {
+            id: source.id().as_str().to_owned(),
+            url: source.url().as_str().to_owned(),
+            reference: source.reference().as_str().to_owned(),
+            active_commit: None,
+        })
+        .map(|body| response(201, "application/json", &format!("{body}\n")))
+        .map_err(|error| ControllerError::Json(error.to_string())),
+        Err(fleet_application::CatalogUseCaseError::AlreadyExists) => Ok(response(
+            409,
+            "application/json",
+            "{\"error\":\"catalog_source_already_exists\"}\n",
+        )),
+        Err(fleet_application::CatalogUseCaseError::Domain(_)) => Ok(response(
+            400,
+            "application/json",
+            "{\"error\":\"invalid_catalog_source\"}\n",
+        )),
+        Err(fleet_application::CatalogUseCaseError::Repository(error)) => {
+            Err(ControllerError::Store(error))
+        }
+        Err(fleet_application::CatalogUseCaseError::Audit(error)) => {
+            Err(ControllerError::Store(error))
+        }
+        Err(_) => Ok(response(
+            400,
+            "application/json",
+            "{\"error\":\"invalid_catalog_source\"}\n",
+        )),
+    }
+}
+
+fn start_catalog_sync_http(
+    request: &str,
+    state: &ControllerAppState,
+) -> Result<String, ControllerError> {
+    let raw_path = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap_or_default();
+    let Some(source_id) = raw_path
+        .strip_prefix("/api/catalog/sources/")
+        .and_then(|path| path.strip_suffix("/sync"))
+    else {
+        return Ok(response(
+            404,
+            "application/json",
+            "{\"error\":\"not_found\"}\n",
+        ));
+    };
+    let mut store = state.store.lock().map_err(|_| {
+        ControllerError::Store(fleet_store::StoreError::Domain(
+            "store lock poisoned".to_owned(),
+        ))
+    })?;
+    let Some(context) = authenticate_admin_request(request, &*store)? else {
+        return Ok(response(
+            401,
+            "application/json",
+            "{\"error\":\"unauthorized\"}\n",
+        ));
+    };
+    if !context.allows(AdminPermission::PolicyWrite) {
+        return Ok(forbidden_response(AdminPermission::PolicyWrite));
+    }
+    let request_body: StartCatalogSyncRequest = serde_json::from_str(request_body(request))
+        .map_err(|error| ControllerError::Json(error.to_string()))?;
+    let operation_id = CatalogSyncOperationId::new(request_body.operation_id.clone())
+        .map_err(|error| ControllerError::Json(error.to_string()))?;
+    let already_exists =
+        CatalogRepository::find_catalog_sync_operation(&*store, &operation_id)?.is_some();
+    let operation = fleet_application::StartCatalogSync::execute(
+        &mut *store,
+        fleet_application::StartCatalogSyncInput {
+            source_id: source_id.to_owned(),
+            operation_id: request_body.operation_id.clone(),
+        },
+    )
+    .map_err(|_| ControllerError::Json("invalid catalog sync request".to_owned()))?;
+    let should_dispatch = !already_exists && operation.id() == &operation_id;
+    if should_dispatch {
+        let Some(submitter) = state.catalog_sync_submitter.as_ref() else {
+            return Err(ControllerError::CatalogSync(
+                "catalog sync worker is unavailable".to_owned(),
+            ));
+        };
+        submitter
+            .try_submit(CatalogSyncWorkerInput {
+                source_id: source_id.to_owned(),
+                operation_id: operation.id().as_str().to_owned(),
+                actor: context.actor_id,
+                occurred_at: SystemTime::now(),
+                dispatch_existing_operation: true,
+            })
+            .map_err(|error| ControllerError::CatalogSync(error.to_string()))?;
+    }
+    let body = serde_json::json!({
+        "id": operation.id().as_str(),
+        "source_id": operation.source_id().as_str(),
+        "state": "in_progress"
+    })
+    .to_string();
+    Ok(response(202, "application/json", &format!("{body}\n")))
+}
+
+fn activate_catalog_revision_http(
+    request: &str,
+    state: &ControllerAppState,
+) -> Result<String, ControllerError> {
+    let raw_path = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap_or_default();
+    let Some(source_id) = raw_path
+        .strip_prefix("/api/catalog/sources/")
+        .and_then(|path| path.strip_suffix("/activate"))
+    else {
+        return Ok(response(
+            404,
+            "application/json",
+            "{\"error\":\"not_found\"}\n",
+        ));
+    };
+    let mut store = state.store.lock().map_err(|_| {
+        ControllerError::Store(fleet_store::StoreError::Domain(
+            "store lock poisoned".to_owned(),
+        ))
+    })?;
+    let Some(context) = authenticate_admin_request(request, &*store)? else {
+        return Ok(response(
+            401,
+            "application/json",
+            "{\"error\":\"unauthorized\"}\n",
+        ));
+    };
+    if !context.allows(AdminPermission::PolicyWrite) {
+        return Ok(forbidden_response(AdminPermission::PolicyWrite));
+    }
+    let body: ActivateCatalogRevisionRequest = serde_json::from_str(request_body(request))
+        .map_err(|error| ControllerError::Json(error.to_string()))?;
+    match ActivateCatalogRevision::execute_with_unified_repository(
+        &mut *store,
+        ActivateCatalogRevisionInput {
+            source_id: source_id.to_owned(),
+            commit: body.commit,
+            actor: context.actor_id,
+            occurred_at: SystemTime::now(),
+        },
+    ) {
+        Ok(source) => serde_json::to_string(&CatalogSourceItemResponse {
+            id: source.id().as_str().to_owned(),
+            url: source.url().as_str().to_owned(),
+            reference: source.reference().as_str().to_owned(),
+            active_commit: source
+                .active_revision()
+                .map(|commit| commit.as_str().to_owned()),
+        })
+        .map(|body| response(200, "application/json", &format!("{body}\n")))
+        .map_err(|error| ControllerError::Json(error.to_string())),
+        Err(
+            fleet_application::CatalogUseCaseError::SourceNotFound
+            | fleet_application::CatalogUseCaseError::RevisionNotFound,
+        ) => Ok(response(
+            404,
+            "application/json",
+            "{\"error\":\"not_found\"}\n",
+        )),
+        Err(fleet_application::CatalogUseCaseError::Domain(_)) => Ok(response(
+            409,
+            "application/json",
+            "{\"error\":\"catalog_revision_not_ready\"}\n",
+        )),
+        Err(
+            fleet_application::CatalogUseCaseError::Repository(error)
+            | fleet_application::CatalogUseCaseError::Audit(error),
+        ) => Err(ControllerError::Store(error)),
+        Err(_) => Ok(response(
+            400,
+            "application/json",
+            "{\"error\":\"invalid_catalog_activation\"}\n",
+        )),
     }
 }
 
@@ -4649,6 +5325,7 @@ fn close_reason_from_session_read_result(
         | Err(ControllerError::Tls(_))
         | Err(ControllerError::SigningKeyRotation(_))
         | Err(ControllerError::SecretProvider(_))
+        | Err(ControllerError::CatalogSync(_))
         | Err(ControllerError::UnsupportedDatabaseBackend(_)) => {
             AgentSessionCloseReason::WriteFailure
         }
@@ -6520,6 +7197,409 @@ fn audit_drift<'a>(
     Ok(())
 }
 
+/// A controller-owned catalog sync request. It identifies durable state only; repository URLs and
+/// document bodies stay behind the fetch and repository boundaries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CatalogSyncWorkerInput {
+    source_id: String,
+    operation_id: String,
+    actor: String,
+    occurred_at: SystemTime,
+    /// The HTTP boundary has already created the operation atomically and only asks this worker
+    /// to perform its fetch. Retried worker submissions without this marker remain idempotent.
+    dispatch_existing_operation: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Catalog API/CLI submission is intentionally the following task.
+enum CatalogSyncWorkerError {
+    QueueClosed,
+    InvalidRequest,
+    SourceUnavailable,
+    FetchFailed,
+    FetchTimedOut,
+    Cancelled,
+    ValidationFailed,
+    PersistenceFailed,
+}
+
+impl Display for CatalogSyncWorkerError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::QueueClosed => "catalog sync worker is unavailable",
+            Self::InvalidRequest => "catalog sync request is invalid",
+            Self::SourceUnavailable => "catalog source is unavailable",
+            Self::FetchFailed => "catalog source fetch failed",
+            Self::FetchTimedOut => "catalog source fetch timed out",
+            Self::Cancelled => "catalog source fetch was cancelled",
+            Self::ValidationFailed => "catalog source validation failed",
+            Self::PersistenceFailed => "catalog sync persistence failed",
+        })
+    }
+}
+
+type CatalogSyncWorkerResult = Result<CatalogSyncOperation, CatalogSyncWorkerError>;
+
+#[derive(Clone, Default)]
+struct ControllerCatalogFetchCancellation(Arc<AtomicBool>);
+
+impl fleet_application::CatalogFetchCancellation for ControllerCatalogFetchCancellation {
+    fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    fn shared_signal(&self) -> Option<Arc<AtomicBool>> {
+        Some(Arc::clone(&self.0))
+    }
+}
+
+impl ControllerCatalogFetchCancellation {
+    fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+struct CatalogSyncWorker<F> {
+    sender: mpsc::Sender<CatalogSyncWorkerRequest>,
+    shutdown: oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<()>,
+    current_cancellation: Arc<Mutex<Option<ControllerCatalogFetchCancellation>>>,
+    fetcher: std::marker::PhantomData<F>,
+}
+
+struct CatalogSyncWorkerRequest {
+    input: CatalogSyncWorkerInput,
+    completion: oneshot::Sender<CatalogSyncWorkerResult>,
+}
+
+#[derive(Clone)]
+struct CatalogSyncSubmitter {
+    sender: mpsc::Sender<CatalogSyncWorkerRequest>,
+}
+
+impl CatalogSyncSubmitter {
+    fn try_submit(&self, input: CatalogSyncWorkerInput) -> Result<(), CatalogSyncWorkerError> {
+        let (completion, _receiver) = oneshot::channel();
+        self.sender
+            .try_send(CatalogSyncWorkerRequest { input, completion })
+            .map_err(|error| match error {
+                tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                    CatalogSyncWorkerError::QueueClosed
+                }
+                tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                    CatalogSyncWorkerError::QueueClosed
+                }
+            })
+    }
+}
+
+impl<F> CatalogSyncWorker<F>
+where
+    F: fleet_application::CatalogFetcher + Send + Sync + 'static,
+    F::Error: Send + 'static,
+{
+    fn submitter(&self) -> CatalogSyncSubmitter {
+        CatalogSyncSubmitter {
+            sender: self.sender.clone(),
+        }
+    }
+    #[allow(dead_code)] // Catalog API/CLI submission is intentionally the following task.
+    async fn submit(
+        &self,
+        input: CatalogSyncWorkerInput,
+    ) -> Result<oneshot::Receiver<CatalogSyncWorkerResult>, CatalogSyncWorkerError> {
+        let (completion_sender, completion_receiver) = oneshot::channel();
+        self.sender
+            .send(CatalogSyncWorkerRequest {
+                input,
+                completion: completion_sender,
+            })
+            .await
+            .map_err(|_| CatalogSyncWorkerError::QueueClosed)?;
+        Ok(completion_receiver)
+    }
+
+    async fn shutdown(self) {
+        let Self {
+            sender,
+            shutdown,
+            task,
+            current_cancellation,
+            fetcher: _,
+        } = self;
+        drop(sender);
+        if let Ok(cancellation) = current_cancellation.lock()
+            && let Some(cancellation) = cancellation.as_ref()
+        {
+            cancellation.cancel();
+        }
+        let _ = shutdown.send(());
+        let _ = task.await;
+    }
+}
+
+fn start_catalog_sync_worker<F>(
+    store: Arc<Mutex<ControllerStore>>,
+    fetcher: Arc<F>,
+) -> CatalogSyncWorker<F>
+where
+    F: fleet_application::CatalogFetcher + Send + Sync + 'static,
+    F::Error: Send + 'static,
+{
+    start_catalog_sync_worker_with_timeout(store, fetcher, CATALOG_SYNC_FETCH_TIMEOUT)
+}
+
+fn start_catalog_sync_worker_with_timeout<F>(
+    store: Arc<Mutex<ControllerStore>>,
+    fetcher: Arc<F>,
+    fetch_timeout: Duration,
+) -> CatalogSyncWorker<F>
+where
+    F: fleet_application::CatalogFetcher + Send + Sync + 'static,
+    F::Error: Send + 'static,
+{
+    let (sender, mut receiver) =
+        mpsc::channel::<CatalogSyncWorkerRequest>(CATALOG_SYNC_WORKER_QUEUE_CAPACITY);
+    let (shutdown, mut shutdown_receiver) = oneshot::channel();
+    let current_cancellation = Arc::new(Mutex::new(None));
+    let worker_cancellation = current_cancellation.clone();
+    let task = tokio::spawn(async move {
+        tracing::info!(
+            queue_capacity = CATALOG_SYNC_WORKER_QUEUE_CAPACITY,
+            "catalog_sync_worker_started"
+        );
+        loop {
+            let request = tokio::select! {
+                _ = &mut shutdown_receiver => break,
+                request = receiver.recv() => request,
+            };
+            let Some(request) = request else {
+                break;
+            };
+            let operation_id = request.input.operation_id.clone();
+            let cancellation = ControllerCatalogFetchCancellation::default();
+            if let Ok(mut current) = worker_cancellation.lock() {
+                *current = Some(cancellation.clone());
+            }
+            let result = execute_catalog_sync_worker_request(
+                store.clone(),
+                fetcher.clone(),
+                request.input,
+                cancellation,
+                fetch_timeout,
+            )
+            .await;
+            if let Ok(mut current) = worker_cancellation.lock() {
+                *current = None;
+            }
+            if result.is_err() {
+                tracing::warn!(operation_id = %operation_id, "catalog_sync_worker_request_failed");
+            }
+            let _ = request.completion.send(result);
+        }
+        tracing::info!("catalog_sync_worker_stopped");
+    });
+    CatalogSyncWorker {
+        sender,
+        shutdown,
+        task,
+        current_cancellation,
+        fetcher: std::marker::PhantomData,
+    }
+}
+
+async fn execute_catalog_sync_worker_request<F>(
+    store: Arc<Mutex<ControllerStore>>,
+    fetcher: Arc<F>,
+    input: CatalogSyncWorkerInput,
+    cancellation: ControllerCatalogFetchCancellation,
+    fetch_timeout: Duration,
+) -> CatalogSyncWorkerResult
+where
+    F: fleet_application::CatalogFetcher + Send + Sync + 'static,
+    F::Error: Send + 'static,
+{
+    let requested_operation_id = CatalogSyncOperationId::new(input.operation_id.clone())
+        .map_err(|_| CatalogSyncWorkerError::InvalidRequest)?;
+    let (source, operation) = {
+        let mut store_guard = store
+            .lock()
+            .map_err(|_| CatalogSyncWorkerError::PersistenceFailed)?;
+        let store: &mut ControllerStore = &mut store_guard;
+        if let Some(operation) =
+            CatalogRepository::find_catalog_sync_operation(&*store, &requested_operation_id)
+                .map_err(|_| CatalogSyncWorkerError::PersistenceFailed)?
+        {
+            if input.dispatch_existing_operation && operation.is_active() {
+                let source_id = CatalogSourceId::new(input.source_id.clone())
+                    .map_err(|_| CatalogSyncWorkerError::InvalidRequest)?;
+                let source = CatalogRepository::find_catalog_source(&*store, &source_id)
+                    .map_err(|_| CatalogSyncWorkerError::PersistenceFailed)?
+                    .ok_or(CatalogSyncWorkerError::SourceUnavailable)?;
+                if operation.source_id() == &source_id {
+                    (source, operation)
+                } else {
+                    return Err(CatalogSyncWorkerError::InvalidRequest);
+                }
+            } else {
+                return Ok(operation);
+            }
+        } else {
+            let source_id = CatalogSourceId::new(input.source_id.clone())
+                .map_err(|_| CatalogSyncWorkerError::InvalidRequest)?;
+            let source = CatalogRepository::find_catalog_source(&*store, &source_id)
+                .map_err(|_| CatalogSyncWorkerError::PersistenceFailed)?
+                .ok_or(CatalogSyncWorkerError::SourceUnavailable)?;
+            let operation = fleet_application::StartCatalogSync::execute(
+                store,
+                fleet_application::StartCatalogSyncInput {
+                    source_id: input.source_id.clone(),
+                    operation_id: input.operation_id.clone(),
+                },
+            )
+            .map_err(|_| CatalogSyncWorkerError::PersistenceFailed)?;
+            if operation.id() != &requested_operation_id {
+                return Ok(operation);
+            }
+            (source, operation)
+        }
+    };
+
+    let cancellation_for_fetch = cancellation.clone();
+    let mut fetch_task = tokio::task::spawn_blocking(move || {
+        fetcher.fetch_public_catalog(&source, &cancellation_for_fetch)
+    });
+    let fetch_result = match tokio::time::timeout(fetch_timeout, &mut fetch_task).await {
+        Ok(result) => result,
+        Err(_) => {
+            cancellation.cancel();
+            let _ = fetch_task.await;
+            return persist_catalog_sync_failure(
+                &store,
+                &operation,
+                &input,
+                CatalogSyncWorkerError::FetchTimedOut,
+                "reason=timeout",
+            );
+        }
+    };
+    let fetched = match fetch_result {
+        Ok(Ok(fetched)) => fetched,
+        Ok(Err(_)) | Err(_) => {
+            if fleet_application::CatalogFetchCancellation::is_cancelled(&cancellation) {
+                return persist_catalog_sync_cancellation(&store, &operation, &input);
+            }
+            return persist_catalog_sync_failure(
+                &store,
+                &operation,
+                &input,
+                CatalogSyncWorkerError::FetchFailed,
+                "reason=fetch_failed",
+            );
+        }
+    };
+    let commit = fetched.commit.clone();
+    let mut store_guard = store
+        .lock()
+        .map_err(|_| CatalogSyncWorkerError::PersistenceFailed)?;
+    let store: &mut ControllerStore = &mut store_guard;
+    match fleet_application::CompleteCatalogSync::execute(
+        store,
+        fleet_application::CompleteCatalogSyncInput {
+            operation_id: operation.id().as_str().to_owned(),
+            result: fetched,
+        },
+    ) {
+        Ok(operation) => {
+            persist_catalog_sync_audit(
+                store,
+                "catalog_sync_completed",
+                &input,
+                format!("commit={commit}"),
+            )?;
+            Ok(operation)
+        }
+        Err(fleet_application::CatalogUseCaseError::ValidationFailed) => {
+            persist_catalog_sync_audit(
+                store,
+                "catalog_sync_failed",
+                &input,
+                "reason=validation_failed".to_owned(),
+            )?;
+            Err(CatalogSyncWorkerError::ValidationFailed)
+        }
+        Err(_) => Err(CatalogSyncWorkerError::PersistenceFailed),
+    }
+}
+
+fn persist_catalog_sync_cancellation(
+    store: &Arc<Mutex<ControllerStore>>,
+    operation: &CatalogSyncOperation,
+    input: &CatalogSyncWorkerInput,
+) -> CatalogSyncWorkerResult {
+    let mut store_guard = store
+        .lock()
+        .map_err(|_| CatalogSyncWorkerError::PersistenceFailed)?;
+    let store: &mut ControllerStore = &mut store_guard;
+    fleet_application::CancelCatalogSync::execute(
+        store,
+        fleet_application::CancelCatalogSyncInput {
+            operation_id: operation.id().as_str().to_owned(),
+        },
+    )
+    .map_err(|_| CatalogSyncWorkerError::PersistenceFailed)?;
+    persist_catalog_sync_audit(
+        store,
+        "catalog_sync_failed",
+        input,
+        "reason=cancelled".to_owned(),
+    )?;
+    Err(CatalogSyncWorkerError::Cancelled)
+}
+
+fn persist_catalog_sync_failure(
+    store: &Arc<Mutex<ControllerStore>>,
+    operation: &CatalogSyncOperation,
+    input: &CatalogSyncWorkerInput,
+    result: CatalogSyncWorkerError,
+    reason: &str,
+) -> CatalogSyncWorkerResult {
+    let mut store_guard = store
+        .lock()
+        .map_err(|_| CatalogSyncWorkerError::PersistenceFailed)?;
+    let store: &mut ControllerStore = &mut store_guard;
+    fleet_application::FailCatalogSync::execute(
+        store,
+        fleet_application::FailCatalogSyncInput {
+            operation_id: operation.id().as_str().to_owned(),
+            failure: fleet_domain::CatalogSyncFailure::FetchFailed,
+        },
+    )
+    .map_err(|_| CatalogSyncWorkerError::PersistenceFailed)?;
+    persist_catalog_sync_audit(store, "catalog_sync_failed", input, reason.to_owned())?;
+    Err(result)
+}
+
+fn persist_catalog_sync_audit(
+    store: &mut ControllerStore,
+    action: &str,
+    input: &CatalogSyncWorkerInput,
+    value: String,
+) -> Result<(), CatalogSyncWorkerError> {
+    AuditWriter::write(
+        store,
+        AuditEvent {
+            category: AuditCategory::Policy,
+            action: action.to_owned(),
+            actor: AuditActor::new(input.actor.clone()),
+            target: AuditTarget::new(input.source_id.clone()),
+            value: AuditValue::Plain(value),
+            occurred_at: input.occurred_at,
+        },
+    )
+    .map_err(|_| CatalogSyncWorkerError::PersistenceFailed)
+}
+
 fn start_scheduled_drift_worker(
     store: Arc<Mutex<ControllerStore>>,
     identity: Arc<ControllerIdentity>,
@@ -7222,6 +8302,44 @@ fn route_request_with_identity_and_sessions<'a>(
         ("GET", "/api/agents") => {
             let body = list_agents(store, sessions)?;
             Ok(response(200, "application/json", &format!("{body}\n")))
+        }
+        ("GET", "/api/catalog/sources") => {
+            catalog_http_response(list_catalog_sources(raw_path, store))
+        }
+        ("GET", path)
+            if path.starts_with("/api/catalog/sources/") && path.ends_with("/revisions") =>
+        {
+            let source_id = path
+                .trim_start_matches("/api/catalog/sources/")
+                .trim_end_matches("/revisions")
+                .trim_end_matches('/');
+            catalog_http_response(list_catalog_revisions(source_id, raw_path, store))
+        }
+        ("GET", path)
+            if path.starts_with("/api/catalog/sources/") && path.ends_with("/documents") =>
+        {
+            let Some((source_id, commit)) = parse_catalog_revision_route(path, "/documents") else {
+                return Ok(response(
+                    404,
+                    "application/json",
+                    "{\"error\":\"not_found\"}\n",
+                ));
+            };
+            catalog_http_response(list_catalog_documents(source_id, commit, raw_path, store))
+        }
+        ("GET", path)
+            if path.starts_with("/api/catalog/sources/") && path.ends_with("/document") =>
+        {
+            let Some((source_id, commit)) = parse_catalog_revision_route(path, "/document") else {
+                return Ok(response(
+                    404,
+                    "application/json",
+                    "{\"error\":\"not_found\"}\n",
+                ));
+            };
+            catalog_document_detail_http_response(get_catalog_document_detail(
+                source_id, commit, raw_path, store,
+            ))
         }
         ("POST", path)
             if path.starts_with("/api/agents/")
@@ -9899,6 +11017,266 @@ fn list_policies<'a>(
     serde_json::to_string(&policies).map_err(|error| ControllerError::Json(error.to_string()))
 }
 
+fn catalog_http_response(
+    result: Result<String, ControllerError>,
+) -> Result<String, ControllerError> {
+    match result {
+        Ok(body) => Ok(response(200, "application/json", &format!("{body}\n"))),
+        Err(ControllerError::Json(message)) => Ok(response(
+            400,
+            "application/json",
+            &format!("{{\"error\":\"{}\"}}\n", json_escape(&message)),
+        )),
+        Err(error) => Err(error),
+    }
+}
+
+fn catalog_document_detail_http_response(
+    result: Result<Option<String>, ControllerError>,
+) -> Result<String, ControllerError> {
+    match result {
+        Ok(Some(body)) => Ok(response(200, "application/json", &format!("{body}\n"))),
+        Ok(None) => Ok(response(
+            404,
+            "application/json",
+            "{\"error\":\"not_found\"}\n",
+        )),
+        Err(ControllerError::Json(message)) => Ok(response(
+            400,
+            "application/json",
+            &format!("{{\"error\":\"{}\"}}\n", json_escape(&message)),
+        )),
+        Err(error) => Err(error),
+    }
+}
+
+fn catalog_page_request(raw_path: &str) -> Result<(usize, Option<String>), ControllerError> {
+    let limit = query_param(raw_path, "limit")
+        .unwrap_or("50")
+        .parse::<usize>()
+        .map_err(|_| ControllerError::Json("limit must be a positive integer".to_owned()))?;
+    if !(1..=100).contains(&limit) {
+        return Err(ControllerError::Json(
+            "limit must be between 1 and 100".to_owned(),
+        ));
+    }
+    Ok((
+        limit,
+        query_param(raw_path, "after")
+            .map(decode_catalog_query_value)
+            .transpose()?,
+    ))
+}
+
+/// Decodes a catalog query component emitted by the browser API client without accepting a
+/// malformed percent escape as a different durable cursor or document path.
+fn decode_catalog_query_value(value: &str) -> Result<String, ControllerError> {
+    fn hex_value(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                decoded.push(b' ');
+                index += 1;
+            }
+            b'%' => {
+                let Some(high) = bytes.get(index + 1).copied().and_then(hex_value) else {
+                    return Err(ControllerError::Json(
+                        "catalog query contains an invalid percent escape".to_owned(),
+                    ));
+                };
+                let Some(low) = bytes.get(index + 2).copied().and_then(hex_value) else {
+                    return Err(ControllerError::Json(
+                        "catalog query contains an invalid percent escape".to_owned(),
+                    ));
+                };
+                decoded.push((high << 4) | low);
+                index += 3;
+            }
+            byte => {
+                decoded.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8(decoded).map_err(|_| {
+        ControllerError::Json("catalog query must be valid UTF-8 after decoding".to_owned())
+    })
+}
+
+fn list_catalog_sources<'a>(
+    raw_path: &str,
+    store: impl Into<ControllerStoreRef<'a>> + Copy,
+) -> Result<String, ControllerError> {
+    let (limit, after) = catalog_page_request(raw_path)?;
+    let page = ListCatalogSources::execute(
+        &store.into(),
+        after
+            .map(CatalogSourceId::new)
+            .transpose()
+            .map_err(|e| ControllerError::Json(e.to_string()))?,
+        limit,
+    )
+    .map_err(map_catalog_page_error)?;
+    serde_json::to_string(&CatalogPageResponse {
+        items: page
+            .records
+            .into_iter()
+            .map(|source| CatalogSourceItemResponse {
+                id: source.id().as_str().to_owned(),
+                url: source.url().as_str().to_owned(),
+                reference: source.reference().as_str().to_owned(),
+                active_commit: source.active_revision().map(|v| v.as_str().to_owned()),
+            })
+            .collect(),
+        next_after: page.next_after.map(|id| id.as_str().to_owned()),
+    })
+    .map_err(|e| ControllerError::Json(e.to_string()))
+}
+
+fn list_catalog_revisions<'a>(
+    source_id: &str,
+    raw_path: &str,
+    store: impl Into<ControllerStoreRef<'a>> + Copy,
+) -> Result<String, ControllerError> {
+    let (limit, after) = catalog_page_request(raw_path)?;
+    let source_id =
+        CatalogSourceId::new(source_id).map_err(|e| ControllerError::Json(e.to_string()))?;
+    let page = ListCatalogRevisions::execute(
+        &store.into(),
+        &source_id,
+        after
+            .map(CatalogCommitId::new)
+            .transpose()
+            .map_err(|e| ControllerError::Json(e.to_string()))?,
+        limit,
+    )
+    .map_err(map_catalog_page_error)?;
+    serde_json::to_string(&CatalogPageResponse {
+        items: page
+            .records
+            .into_iter()
+            .map(|revision| {
+                let (state, document_count, failure) = match revision.state() {
+                    CatalogRevisionState::Fetching => ("fetching".to_owned(), None, None),
+                    CatalogRevisionState::Validating => ("validating".to_owned(), None, None),
+                    CatalogRevisionState::Ready { document_count } => {
+                        ("ready".to_owned(), Some(document_count), None)
+                    }
+                    CatalogRevisionState::Failed(failure) => (
+                        "failed".to_owned(),
+                        None,
+                        Some(format!("{failure:?}").to_lowercase()),
+                    ),
+                };
+                CatalogRevisionItemResponse {
+                    commit: revision.commit().as_str().to_owned(),
+                    state,
+                    document_count,
+                    failure,
+                }
+            })
+            .collect(),
+        next_after: page.next_after.map(|id| id.as_str().to_owned()),
+    })
+    .map_err(|e| ControllerError::Json(e.to_string()))
+}
+
+fn list_catalog_documents<'a>(
+    source_id: &str,
+    commit: &str,
+    raw_path: &str,
+    store: impl Into<ControllerStoreRef<'a>> + Copy,
+) -> Result<String, ControllerError> {
+    let (limit, after) = catalog_page_request(raw_path)?;
+    let source_id =
+        CatalogSourceId::new(source_id).map_err(|e| ControllerError::Json(e.to_string()))?;
+    let commit = CatalogCommitId::new(commit).map_err(|e| ControllerError::Json(e.to_string()))?;
+    let page = ListCatalogDocuments::execute(&store.into(), &source_id, &commit, after, limit)
+        .map_err(map_catalog_page_error)?;
+    serde_json::to_string(&CatalogPageResponse {
+        items: page
+            .records
+            .into_iter()
+            .map(|document| CatalogDocumentItemResponse {
+                kind: match document.kind() {
+                    fleet_domain::CatalogDocumentKind::Policy => "policy",
+                    fleet_domain::CatalogDocumentKind::Runbook => "runbook",
+                }
+                .to_owned(),
+                path: document.path().to_owned(),
+                checksum: document.checksum().to_owned(),
+            })
+            .collect(),
+        next_after: page.next_after,
+    })
+    .map_err(|e| ControllerError::Json(e.to_string()))
+}
+
+fn get_catalog_document_detail<'a>(
+    source_id: &str,
+    commit: &str,
+    raw_path: &str,
+    store: impl Into<ControllerStoreRef<'a>> + Copy,
+) -> Result<Option<String>, ControllerError> {
+    let path = query_param(raw_path, "path")
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| ControllerError::Json("path is required".to_owned()))?;
+    let path = decode_catalog_query_value(path)?;
+    let source_id =
+        CatalogSourceId::new(source_id).map_err(|e| ControllerError::Json(e.to_string()))?;
+    let commit = CatalogCommitId::new(commit).map_err(|e| ControllerError::Json(e.to_string()))?;
+    let Some(record) = GetCatalogDocumentDetail::execute(&store.into(), &source_id, &commit, &path)
+        .map_err(ControllerError::from)?
+    else {
+        return Ok(None);
+    };
+    serde_json::to_string(&CatalogDocumentDetailResponse {
+        kind: match record.document.kind() {
+            fleet_domain::CatalogDocumentKind::Policy => "policy",
+            fleet_domain::CatalogDocumentKind::Runbook => "runbook",
+        }
+        .to_owned(),
+        path: record.document.path().to_owned(),
+        checksum: record.document.checksum().to_owned(),
+        body: record.body,
+    })
+    .map(Some)
+    .map_err(|e| ControllerError::Json(e.to_string()))
+}
+
+fn parse_catalog_revision_route<'a>(path: &'a str, suffix: &str) -> Option<(&'a str, &'a str)> {
+    let value = path
+        .strip_prefix("/api/catalog/sources/")?
+        .strip_suffix(suffix)?
+        .trim_end_matches('/');
+    let (source_id, commit) = value.split_once("/revisions/")?;
+    (!source_id.is_empty() && !commit.is_empty()).then_some((source_id, commit))
+}
+
+fn map_catalog_page_error(
+    error: fleet_application::CatalogPageQueryError<fleet_store::StoreError>,
+) -> ControllerError {
+    match error {
+        fleet_application::CatalogPageQueryError::InvalidLimit { requested } => {
+            ControllerError::Json(format!("limit must be between 1 and 100, got {requested}"))
+        }
+        fleet_application::CatalogPageQueryError::Repository(error) => {
+            ControllerError::Store(error)
+        }
+    }
+}
+
 fn save_policy<'a>(
     body: &str,
     store: impl Into<ControllerStoreRef<'a>> + Copy,
@@ -12112,6 +13490,14 @@ impl AppPolicyRepository for ControllerPolicyRepository<'_> {
             .save_policy_source(policy_id, name, version, source)
     }
 
+    fn publish_catalog_policy_source(
+        &mut self,
+        policy: &fleet_domain::Policy,
+        provenance: &CatalogPolicyProvenance,
+    ) -> Result<fleet_application::CatalogPolicyPublishOutcome, Self::Error> {
+        self.store.publish_catalog_policy_source(policy, provenance)
+    }
+
     fn list_policies(&self) -> Result<Vec<fleet_application::PolicyRecord>, Self::Error> {
         Ok(self
             .store
@@ -12480,6 +13866,14 @@ impl AppPolicyRepository for ControllerJobRepository<'_> {
             .save_policy_source(policy_id, name, version, source)
     }
 
+    fn publish_catalog_policy_source(
+        &mut self,
+        policy: &fleet_domain::Policy,
+        provenance: &CatalogPolicyProvenance,
+    ) -> Result<fleet_application::CatalogPolicyPublishOutcome, Self::Error> {
+        self.store.publish_catalog_policy_source(policy, provenance)
+    }
+
     fn list_policies(&self) -> Result<Vec<fleet_application::PolicyRecord>, Self::Error> {
         Ok(self
             .store
@@ -12828,6 +14222,21 @@ impl RunbookJobRepository for ControllerJobRepository<'_> {
         self.store
             .save_runbook_job_with_assignments_record(&job, task, assignments)
     }
+
+    fn save_catalog_runbook_job_with_assignments(
+        &mut self,
+        job: Job,
+        task: &fleet_domain::RunbookExecutionTask,
+        provenance: &fleet_domain::CatalogRunbookProvenance,
+        assignments: &[TaskEnvelope],
+    ) -> Result<(), <Self as TaskAssignmentRepository>::Error> {
+        self.store.save_catalog_runbook_job_with_assignments_record(
+            &job,
+            task,
+            provenance,
+            assignments,
+        )
+    }
 }
 
 impl DispatchAssignmentRepository for ControllerJobRepository<'_> {
@@ -13161,6 +14570,10 @@ fn required_permission_for_route(method: &str, route_path: &str) -> Option<Admin
         }
         ("GET", "/api/audit") | ("GET", "/api/audit/export") => Some(AdminPermission::AuditRead),
         ("GET", "/api/policies") => Some(AdminPermission::PolicyRead),
+        ("GET", "/api/catalog/sources") => Some(AdminPermission::PolicyRead),
+        ("GET", path) if path.starts_with("/api/catalog/sources/") => {
+            Some(AdminPermission::PolicyRead)
+        }
         ("GET", path) if path.starts_with("/api/agents/") && path.ends_with("/policies") => {
             Some(AdminPermission::PolicyRead)
         }
@@ -13454,6 +14867,69 @@ mod tests {
     use super::*;
     use fleet_store::SqliteStore;
     use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone)]
+    struct TestCatalogFetcher {
+        calls: Arc<AtomicUsize>,
+        store: Arc<Mutex<ControllerStore>>,
+        store_lock_available: Arc<std::sync::atomic::AtomicBool>,
+        result: fleet_application::CatalogFetchResult,
+    }
+
+    impl fleet_application::CatalogFetcher for TestCatalogFetcher {
+        type Error = std::convert::Infallible;
+
+        fn fetch_public_catalog(
+            &self,
+            _source: &CatalogSource,
+            _cancellation: &dyn fleet_application::CatalogFetchCancellation,
+        ) -> Result<fleet_application::CatalogFetchResult, Self::Error> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.store_lock_available
+                .store(self.store.try_lock().is_ok(), Ordering::SeqCst);
+            Ok(self.result.clone())
+        }
+    }
+
+    #[derive(Clone)]
+    struct FailingCatalogFetcher {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl fleet_application::CatalogFetcher for FailingCatalogFetcher {
+        type Error = ();
+
+        fn fetch_public_catalog(
+            &self,
+            _source: &CatalogSource,
+            _cancellation: &dyn fleet_application::CatalogFetchCancellation,
+        ) -> Result<fleet_application::CatalogFetchResult, Self::Error> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct BlockingUntilCancelledCatalogFetcher {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl fleet_application::CatalogFetcher for BlockingUntilCancelledCatalogFetcher {
+        type Error = ();
+
+        fn fetch_public_catalog(
+            &self,
+            _source: &CatalogSource,
+            cancellation: &dyn fleet_application::CatalogFetchCancellation,
+        ) -> Result<fleet_application::CatalogFetchResult, Self::Error> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            while !cancellation.is_cancelled() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(())
+        }
+    }
 
     #[test]
     fn session_registry_registers_gets_and_unregisters_session() {
@@ -13488,6 +14964,645 @@ mod tests {
             })
         );
         assert!(!registry.has_active_session("agent-1"));
+    }
+
+    #[tokio::test]
+    async fn catalog_sync_worker_fetches_once_without_holding_store_lock_and_audits_completion() {
+        let store = Arc::new(Mutex::new(ControllerStore::sqlite(
+            SqliteStore::in_memory().unwrap(),
+        )));
+        let source = CatalogSource::new(
+            CatalogSourceId::new("public-catalog").unwrap(),
+            fleet_domain::PublicCatalogUrl::new("https://example.com/fleet/catalog.git").unwrap(),
+            fleet_domain::CatalogReference::new("main").unwrap(),
+        );
+        {
+            let mut guard = store.lock().unwrap();
+            CatalogRepository::save_catalog_source(&mut *guard, source).unwrap();
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let store_lock_available = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fetcher = Arc::new(TestCatalogFetcher {
+            calls: calls.clone(),
+            store: store.clone(),
+            store_lock_available: store_lock_available.clone(),
+            result: fleet_application::CatalogFetchResult {
+                commit: "a".repeat(40),
+                documents: vec![fleet_application::CatalogFetchedDocument {
+                    kind: fleet_domain::CatalogDocumentKind::Runbook,
+                    path: "runbooks/nginx.yaml".to_owned(),
+                    checksum: "c".repeat(64),
+                    body: "apiVersion: fleet.sponzey.dev/v1alpha1\nkind: Runbook\nname: nginx\nselector: role=web\nsteps:\n  - id: nginx\n    service:\n      name: nginx\n      state: started\n".to_owned(),
+                }],
+            },
+        });
+        let worker = start_catalog_sync_worker(store.clone(), fetcher);
+
+        let completion = worker
+            .submit(CatalogSyncWorkerInput {
+                source_id: "public-catalog".to_owned(),
+                operation_id: "sync-001".to_owned(),
+                actor: "admin".to_owned(),
+                occurred_at: UNIX_EPOCH,
+                dispatch_existing_operation: false,
+            })
+            .await
+            .unwrap();
+        let operation = tokio::time::timeout(Duration::from_secs(1), completion)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        assert!(matches!(
+            operation.state(),
+            fleet_domain::CatalogSyncOperationState::Completed
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(store_lock_available.load(Ordering::SeqCst));
+        let duplicate = worker
+            .submit(CatalogSyncWorkerInput {
+                source_id: "public-catalog".to_owned(),
+                operation_id: "sync-001".to_owned(),
+                actor: "admin".to_owned(),
+                occurred_at: UNIX_EPOCH,
+                dispatch_existing_operation: false,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            duplicate.await.unwrap().unwrap().state(),
+            fleet_domain::CatalogSyncOperationState::Completed
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        {
+            let guard = store.lock().unwrap();
+            let events = guard.store_ref().list_audit_events(10).unwrap();
+            assert!(events.iter().any(|event| {
+                event.action == "catalog_sync_completed"
+                    && event.target.as_str() == "public-catalog"
+                    && !format!("{event:?}").contains("nginx.yaml")
+            }));
+        }
+        worker.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn catalog_sync_worker_fetches_a_durable_http_started_operation_once() {
+        let store = Arc::new(Mutex::new(ControllerStore::sqlite(
+            SqliteStore::in_memory().unwrap(),
+        )));
+        let source = CatalogSource::new(
+            CatalogSourceId::new("public-catalog").unwrap(),
+            fleet_domain::PublicCatalogUrl::new("https://example.com/fleet/catalog.git").unwrap(),
+            fleet_domain::CatalogReference::new("main").unwrap(),
+        );
+        {
+            let mut guard = store.lock().unwrap();
+            CatalogRepository::save_catalog_source(&mut *guard, source).unwrap();
+            fleet_application::StartCatalogSync::execute(
+                &mut *guard,
+                fleet_application::StartCatalogSyncInput {
+                    source_id: "public-catalog".to_owned(),
+                    operation_id: "http-sync-001".to_owned(),
+                },
+            )
+            .unwrap();
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let worker = start_catalog_sync_worker(
+            store,
+            Arc::new(TestCatalogFetcher {
+                calls: calls.clone(),
+                store: Arc::new(Mutex::new(ControllerStore::sqlite(
+                    SqliteStore::in_memory().unwrap(),
+                ))),
+                store_lock_available: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                result: fleet_application::CatalogFetchResult {
+                    commit: "a".repeat(40),
+                    documents: vec![fleet_application::CatalogFetchedDocument {
+                        kind: fleet_domain::CatalogDocumentKind::Runbook,
+                        path: "runbooks/nginx.yaml".to_owned(),
+                        checksum: "c".repeat(64),
+                        body: "apiVersion: fleet.sponzey.dev/v1alpha1\nkind: Runbook\nname: nginx\nselector: role=web\nsteps:\n  - id: nginx\n    service:\n      name: nginx\n      state: started\n".to_owned(),
+                    }],
+                },
+            }),
+        );
+
+        let completion = worker
+            .submit(CatalogSyncWorkerInput {
+                source_id: "public-catalog".to_owned(),
+                operation_id: "http-sync-001".to_owned(),
+                actor: "admin".to_owned(),
+                occurred_at: UNIX_EPOCH,
+                dispatch_existing_operation: true,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            completion.await.unwrap().unwrap().state(),
+            fleet_domain::CatalogSyncOperationState::Completed
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        worker.shutdown().await;
+    }
+
+    #[test]
+    fn catalog_source_register_http_is_owner_only_and_does_not_start_sync() {
+        let root = artifact_test_root("catalog-source-register-http");
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .insert_admin_token_hash(&hash_token("owner-token"))
+            .unwrap();
+        let state = ControllerAppState {
+            store: Arc::new(Mutex::new(ControllerStore::sqlite(store))),
+            artifact_store: Arc::new(Mutex::new(LocalArtifactStore::new(&root).unwrap())),
+            identity: Arc::new(ControllerIdentity::dev_insecure()),
+            metadata: Arc::new(ControllerRuntimeMetadata::default()),
+            sessions: Arc::new(Mutex::new(AgentSessionRegistry::default())),
+            catalog_sync_submitter: None,
+        };
+        let request = "POST /api/catalog/sources HTTP/1.1\r\nAuthorization: Bearer owner-token\r\n\r\n{\"source_id\":\"public-catalog\",\"url\":\"https://example.com/fleet/catalog.git\",\"reference\":\"main\"}";
+
+        let created = register_catalog_source_http(request, &state).unwrap();
+        let duplicate = register_catalog_source_http(request, &state).unwrap();
+        let invalid = register_catalog_source_http(
+            "POST /api/catalog/sources HTTP/1.1\r\nAuthorization: Bearer owner-token\r\n\r\n{\"source_id\":\"bad-catalog\",\"url\":\"http://127.0.0.1/catalog.git\",\"reference\":\"main\"}",
+            &state,
+        )
+        .unwrap();
+        let guard = state.store.lock().unwrap();
+        let source = CatalogRepository::find_catalog_source(
+            &*guard,
+            &CatalogSourceId::new("public-catalog").unwrap(),
+        )
+        .unwrap();
+        let operation = CatalogRepository::find_catalog_sync_operation(
+            &*guard,
+            &CatalogSyncOperationId::new("sync-001").unwrap(),
+        )
+        .unwrap();
+
+        assert!(created.starts_with("HTTP/1.1 201"));
+        assert!(created.contains("\"id\":\"public-catalog\""));
+        assert!(duplicate.starts_with("HTTP/1.1 409"));
+        assert!(invalid.starts_with("HTTP/1.1 400"));
+        assert!(source.is_some());
+        assert!(operation.is_none());
+
+        let viewer_store = SqliteStore::in_memory().unwrap();
+        viewer_store
+            .insert_admin_token_hash_with_identity(
+                &hash_token("viewer-token"),
+                "viewer-1",
+                "viewer",
+            )
+            .unwrap();
+        let viewer_state = ControllerAppState {
+            store: Arc::new(Mutex::new(ControllerStore::sqlite(viewer_store))),
+            artifact_store: Arc::new(Mutex::new(LocalArtifactStore::new(&root).unwrap())),
+            identity: Arc::new(ControllerIdentity::dev_insecure()),
+            metadata: Arc::new(ControllerRuntimeMetadata::default()),
+            sessions: Arc::new(Mutex::new(AgentSessionRegistry::default())),
+            catalog_sync_submitter: None,
+        };
+        let forbidden = register_catalog_source_http(
+            request.replace("owner-token", "viewer-token").as_str(),
+            &viewer_state,
+        )
+        .unwrap();
+        assert!(forbidden.starts_with("HTTP/1.1 403"));
+        assert!(forbidden.contains("\"required_permission\":\"policy_write\""));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn catalog_sync_http_starts_durable_operation_then_returns_before_worker_completion() {
+        let root = artifact_test_root("catalog-sync-http");
+        let store = Arc::new(Mutex::new(ControllerStore::sqlite(
+            SqliteStore::in_memory().unwrap(),
+        )));
+        {
+            let guard = store.lock().unwrap();
+            let sqlite = sqlite_test_store(&guard);
+            sqlite
+                .insert_admin_token_hash(&hash_token("owner-token"))
+                .unwrap();
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let worker = start_catalog_sync_worker(
+            store.clone(),
+            Arc::new(TestCatalogFetcher {
+                calls: calls.clone(),
+                store: store.clone(),
+                store_lock_available: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                result: fleet_application::CatalogFetchResult {
+                    commit: "a".repeat(40),
+                    documents: vec![fleet_application::CatalogFetchedDocument {
+                        kind: fleet_domain::CatalogDocumentKind::Runbook,
+                        path: "runbooks/nginx.yaml".to_owned(),
+                        checksum: "c".repeat(64),
+                        body: "apiVersion: fleet.sponzey.dev/v1alpha1\nkind: Runbook\nname: nginx\nselector: role=web\nsteps:\n  - id: nginx\n    service:\n      name: nginx\n      state: started\n".to_owned(),
+                    }],
+                },
+            }),
+        );
+        let state = ControllerAppState {
+            store: store.clone(),
+            artifact_store: Arc::new(Mutex::new(LocalArtifactStore::new(&root).unwrap())),
+            identity: Arc::new(ControllerIdentity::dev_insecure()),
+            metadata: Arc::new(ControllerRuntimeMetadata::default()),
+            sessions: Arc::new(Mutex::new(AgentSessionRegistry::default())),
+            catalog_sync_submitter: Some(worker.submitter()),
+        };
+        register_catalog_source_http(
+            "POST /api/catalog/sources HTTP/1.1\r\nAuthorization: Bearer owner-token\r\n\r\n{\"source_id\":\"public-catalog\",\"url\":\"https://example.com/fleet/catalog.git\",\"reference\":\"main\"}",
+            &state,
+        )
+        .unwrap();
+
+        let response = start_catalog_sync_http(
+            "POST /api/catalog/sources/public-catalog/sync HTTP/1.1\r\nAuthorization: Bearer owner-token\r\n\r\n{\"operation_id\":\"http-sync-001\"}",
+            &state,
+        )
+        .unwrap();
+        assert!(response.starts_with("HTTP/1.1 202"));
+        assert!(response.contains("\"state\":\"in_progress\""));
+        for _ in 0..100 {
+            if calls.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        worker.shutdown().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn catalog_activation_http_requires_ready_revision_and_policy_write() {
+        let root = artifact_test_root("catalog-activation-http");
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .insert_admin_token_hash(&hash_token("owner-token"))
+            .unwrap();
+        let source = CatalogSource::new(
+            CatalogSourceId::new("public-catalog").unwrap(),
+            fleet_domain::PublicCatalogUrl::new("https://example.com/catalog.git").unwrap(),
+            fleet_domain::CatalogReference::new("main").unwrap(),
+        );
+        let ready_commit = CatalogCommitId::new("a".repeat(40)).unwrap();
+        let mut ready = source.begin_sync(ready_commit.clone());
+        ready.begin_validation().unwrap();
+        ready.mark_ready(1).unwrap();
+        let unready_commit = CatalogCommitId::new("b".repeat(40)).unwrap();
+        let unready = source.begin_sync(unready_commit.clone());
+        let state = ControllerAppState {
+            store: Arc::new(Mutex::new(ControllerStore::sqlite(store))),
+            artifact_store: Arc::new(Mutex::new(LocalArtifactStore::new(&root).unwrap())),
+            identity: Arc::new(ControllerIdentity::dev_insecure()),
+            metadata: Arc::new(ControllerRuntimeMetadata::default()),
+            sessions: Arc::new(Mutex::new(AgentSessionRegistry::default())),
+            catalog_sync_submitter: None,
+        };
+        {
+            let mut guard = state.store.lock().unwrap();
+            CatalogRepository::save_catalog_source(&mut *guard, source).unwrap();
+            CatalogRepository::save_catalog_revision(&mut *guard, ready).unwrap();
+            CatalogRepository::save_catalog_revision(&mut *guard, unready).unwrap();
+        }
+        let activate = activate_catalog_revision_http(&format!("POST /api/catalog/sources/public-catalog/activate HTTP/1.1\r\nAuthorization: Bearer owner-token\r\n\r\n{{\"commit\":\"{}\"}}", ready_commit.as_str()), &state).unwrap();
+        let unready = activate_catalog_revision_http(&format!("POST /api/catalog/sources/public-catalog/activate HTTP/1.1\r\nAuthorization: Bearer owner-token\r\n\r\n{{\"commit\":\"{}\"}}", unready_commit.as_str()), &state).unwrap();
+        assert!(activate.starts_with("HTTP/1.1 200"));
+        assert!(activate.contains(ready_commit.as_str()));
+        assert!(unready.starts_with("HTTP/1.1 409"));
+        let guard = state.store.lock().unwrap();
+        assert_eq!(
+            CatalogRepository::find_catalog_source(
+                &*guard,
+                &CatalogSourceId::new("public-catalog").unwrap()
+            )
+            .unwrap()
+            .unwrap()
+            .active_revision(),
+            Some(&ready_commit)
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn catalog_read_routes_page_metadata_without_body_and_decode_document_paths() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        store
+            .insert_admin_token_hash_with_identity(
+                &hash_token("viewer-token"),
+                "viewer-1",
+                "viewer",
+            )
+            .unwrap();
+        let source = CatalogSource::new(
+            CatalogSourceId::new("public-catalog").unwrap(),
+            fleet_domain::PublicCatalogUrl::new("https://example.com/catalog.git").unwrap(),
+            fleet_domain::CatalogReference::new("main").unwrap(),
+        );
+        let commit = CatalogCommitId::new("a".repeat(40)).unwrap();
+        let mut revision = source.begin_sync(commit.clone());
+        revision.begin_validation().unwrap();
+        revision.mark_ready(2).unwrap();
+        let document = CatalogDocument::new(
+            source.id().clone(),
+            commit.clone(),
+            fleet_domain::CatalogDocumentKind::Runbook,
+            "runbooks/web service.yaml",
+            "c".repeat(64),
+        )
+        .unwrap();
+        CatalogRepository::save_catalog_source(&mut store, source.clone()).unwrap();
+        CatalogRepository::save_catalog_revision(&mut store, revision.clone()).unwrap();
+        CatalogRepository::save_catalog_document(
+            &mut store,
+            document,
+            "body-must-only-appear-in-detail".to_owned(),
+        )
+        .unwrap();
+        CatalogRepository::save_catalog_document(
+            &mut store,
+            CatalogDocument::new(
+                source.id().clone(),
+                commit.clone(),
+                fleet_domain::CatalogDocumentKind::Policy,
+                "runbooks/z-last.yaml",
+                "d".repeat(64),
+            )
+            .unwrap(),
+            "second-body-must-only-appear-in-detail".to_owned(),
+        )
+        .unwrap();
+
+        let unauthorized =
+            route_request("GET /api/catalog/sources HTTP/1.1\r\n\r\n", &store).unwrap();
+        let sources = route_request(
+            "GET /api/catalog/sources?limit=1 HTTP/1.1\r\nAuthorization: Bearer viewer-token\r\n\r\n",
+            &store,
+        )
+        .unwrap();
+        let documents = route_request(
+            &format!(
+                "GET /api/catalog/sources/public-catalog/revisions/{}/documents?limit=1&after=runbooks%2Fweb+service.yaml HTTP/1.1\r\nAuthorization: Bearer viewer-token\r\n\r\n",
+                commit.as_str()
+            ),
+            &store,
+        )
+        .unwrap();
+        let detail = route_request(
+            &format!(
+                "GET /api/catalog/sources/public-catalog/revisions/{}/document?path=runbooks%2Fweb+service.yaml HTTP/1.1\r\nAuthorization: Bearer viewer-token\r\n\r\n",
+                commit.as_str()
+            ),
+            &store,
+        )
+        .unwrap();
+        let missing = route_request(
+            &format!(
+                "GET /api/catalog/sources/public-catalog/revisions/{}/document?path=runbooks%2Fmissing.yaml HTTP/1.1\r\nAuthorization: Bearer viewer-token\r\n\r\n",
+                commit.as_str()
+            ),
+            &store,
+        )
+        .unwrap();
+        let bad_limit = route_request(
+            "GET /api/catalog/sources?limit=0 HTTP/1.1\r\nAuthorization: Bearer viewer-token\r\n\r\n",
+            &store,
+        )
+        .unwrap();
+        let bad_escape = route_request(
+            &format!(
+                "GET /api/catalog/sources/public-catalog/revisions/{}/document?path=runbooks%ZZ HTTP/1.1\r\nAuthorization: Bearer viewer-token\r\n\r\n",
+                commit.as_str()
+            ),
+            &store,
+        )
+        .unwrap();
+
+        assert!(unauthorized.starts_with("HTTP/1.1 401"));
+        assert!(sources.starts_with("HTTP/1.1 200"));
+        assert!(sources.contains("\"id\":\"public-catalog\""));
+        assert!(documents.starts_with("HTTP/1.1 200"));
+        assert!(documents.contains("\"path\":\"runbooks/z-last.yaml\""));
+        assert!(!sources.contains("body-must-only-appear-in-detail"));
+        assert!(!documents.contains("body-must-only-appear-in-detail"));
+        assert!(detail.starts_with("HTTP/1.1 200"));
+        assert!(detail.contains("body-must-only-appear-in-detail"));
+        assert!(missing.starts_with("HTTP/1.1 404"));
+        assert!(bad_limit.starts_with("HTTP/1.1 400"));
+        assert!(bad_escape.starts_with("HTTP/1.1 400"));
+    }
+
+    #[tokio::test]
+    async fn catalog_sync_worker_persists_fetch_failure_without_an_active_revision() {
+        let store = Arc::new(Mutex::new(ControllerStore::sqlite(
+            SqliteStore::in_memory().unwrap(),
+        )));
+        let source = CatalogSource::new(
+            CatalogSourceId::new("public-catalog").unwrap(),
+            fleet_domain::PublicCatalogUrl::new("https://example.com/fleet/catalog.git").unwrap(),
+            fleet_domain::CatalogReference::new("main").unwrap(),
+        );
+        {
+            let mut guard = store.lock().unwrap();
+            CatalogRepository::save_catalog_source(&mut *guard, source).unwrap();
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let worker = start_catalog_sync_worker(
+            store.clone(),
+            Arc::new(FailingCatalogFetcher {
+                calls: calls.clone(),
+            }),
+        );
+
+        let completion = worker
+            .submit(CatalogSyncWorkerInput {
+                source_id: "public-catalog".to_owned(),
+                operation_id: "sync-failed".to_owned(),
+                actor: "admin".to_owned(),
+                occurred_at: UNIX_EPOCH,
+                dispatch_existing_operation: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), completion)
+                .await
+                .unwrap()
+                .unwrap(),
+            Err(CatalogSyncWorkerError::FetchFailed)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        {
+            let guard = store.lock().unwrap();
+            let operation_id = CatalogSyncOperationId::new("sync-failed").unwrap();
+            let operation = CatalogRepository::find_catalog_sync_operation(&*guard, &operation_id)
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                operation.state(),
+                fleet_domain::CatalogSyncOperationState::Failed(
+                    fleet_domain::CatalogSyncFailure::FetchFailed
+                )
+            ));
+            assert_eq!(
+                CatalogRepository::find_catalog_source(
+                    &*guard,
+                    &CatalogSourceId::new("public-catalog").unwrap(),
+                )
+                .unwrap()
+                .unwrap()
+                .active_revision(),
+                None
+            );
+            assert!(
+                guard
+                    .store_ref()
+                    .list_audit_events(10)
+                    .unwrap()
+                    .iter()
+                    .any(|event| event.action == "catalog_sync_failed")
+            );
+        }
+        worker.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn catalog_sync_worker_shutdown_cancels_an_in_flight_fetch_durably() {
+        let store = Arc::new(Mutex::new(ControllerStore::sqlite(
+            SqliteStore::in_memory().unwrap(),
+        )));
+        let source = CatalogSource::new(
+            CatalogSourceId::new("public-catalog").unwrap(),
+            fleet_domain::PublicCatalogUrl::new("https://example.com/fleet/catalog.git").unwrap(),
+            fleet_domain::CatalogReference::new("main").unwrap(),
+        );
+        {
+            let mut guard = store.lock().unwrap();
+            CatalogRepository::save_catalog_source(&mut *guard, source).unwrap();
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let worker = start_catalog_sync_worker(
+            store.clone(),
+            Arc::new(BlockingUntilCancelledCatalogFetcher {
+                calls: calls.clone(),
+            }),
+        );
+        let completion = worker
+            .submit(CatalogSyncWorkerInput {
+                source_id: "public-catalog".to_owned(),
+                operation_id: "sync-cancelled".to_owned(),
+                actor: "admin".to_owned(),
+                occurred_at: UNIX_EPOCH,
+                dispatch_existing_operation: false,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        worker.shutdown().await;
+        assert_eq!(
+            completion.await.unwrap(),
+            Err(CatalogSyncWorkerError::Cancelled)
+        );
+        let guard = store.lock().unwrap();
+        let operation = CatalogRepository::find_catalog_sync_operation(
+            &*guard,
+            &CatalogSyncOperationId::new("sync-cancelled").unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            operation.state(),
+            fleet_domain::CatalogSyncOperationState::Cancelled
+        ));
+        assert!(guard
+            .store_ref()
+            .list_audit_events(10)
+            .unwrap()
+            .iter()
+            .any(|event| {
+                event.action == "catalog_sync_failed"
+                    && matches!(event.value, AuditValue::Plain(ref value) if value == "reason=cancelled")
+            }));
+    }
+
+    #[tokio::test]
+    async fn catalog_sync_worker_timeout_fails_the_operation_after_cancelling_the_fetcher() {
+        let store = Arc::new(Mutex::new(ControllerStore::sqlite(
+            SqliteStore::in_memory().unwrap(),
+        )));
+        let source = CatalogSource::new(
+            CatalogSourceId::new("public-catalog").unwrap(),
+            fleet_domain::PublicCatalogUrl::new("https://example.com/fleet/catalog.git").unwrap(),
+            fleet_domain::CatalogReference::new("main").unwrap(),
+        );
+        {
+            let mut guard = store.lock().unwrap();
+            CatalogRepository::save_catalog_source(&mut *guard, source).unwrap();
+        }
+        let worker = start_catalog_sync_worker_with_timeout(
+            store.clone(),
+            Arc::new(BlockingUntilCancelledCatalogFetcher {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            Duration::from_millis(1),
+        );
+        let completion = worker
+            .submit(CatalogSyncWorkerInput {
+                source_id: "public-catalog".to_owned(),
+                operation_id: "sync-timeout".to_owned(),
+                actor: "admin".to_owned(),
+                occurred_at: UNIX_EPOCH,
+                dispatch_existing_operation: false,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), completion)
+                .await
+                .unwrap()
+                .unwrap(),
+            Err(CatalogSyncWorkerError::FetchTimedOut)
+        );
+        {
+            let guard = store.lock().unwrap();
+            let operation = CatalogRepository::find_catalog_sync_operation(
+                &*guard,
+                &CatalogSyncOperationId::new("sync-timeout").unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+            assert!(matches!(
+                operation.state(),
+                fleet_domain::CatalogSyncOperationState::Failed(
+                    fleet_domain::CatalogSyncFailure::FetchFailed
+                )
+            ));
+            assert!(guard
+                .store_ref()
+                .list_audit_events(10)
+                .unwrap()
+                .iter()
+                .any(|event| {
+                    event.action == "catalog_sync_failed"
+                        && matches!(event.value, AuditValue::Plain(ref value) if value == "reason=timeout")
+                }));
+        }
+        worker.shutdown().await;
     }
 
     #[test]
@@ -16447,6 +18562,36 @@ mod tests {
         RestApiRouteContract {
             method: "GET",
             path: "/api/agents",
+            surface: ApiSurface::Admin,
+        },
+        RestApiRouteContract {
+            method: "GET",
+            path: "/api/catalog/sources",
+            surface: ApiSurface::Admin,
+        },
+        RestApiRouteContract {
+            method: "POST",
+            path: "/api/catalog/sources",
+            surface: ApiSurface::Admin,
+        },
+        RestApiRouteContract {
+            method: "POST",
+            path: "/api/catalog/sources/{source_id}/sync",
+            surface: ApiSurface::Admin,
+        },
+        RestApiRouteContract {
+            method: "GET",
+            path: "/api/catalog/sources/{source_id}/revisions",
+            surface: ApiSurface::Admin,
+        },
+        RestApiRouteContract {
+            method: "GET",
+            path: "/api/catalog/sources/{source_id}/revisions/{commit}/documents",
+            surface: ApiSurface::Admin,
+        },
+        RestApiRouteContract {
+            method: "GET",
+            path: "/api/catalog/sources/{source_id}/revisions/{commit}/document",
             surface: ApiSurface::Admin,
         },
         RestApiRouteContract {
@@ -20413,6 +22558,7 @@ spec:
             identity: Arc::new(ControllerIdentity::dev_insecure()),
             metadata: Arc::new(ControllerRuntimeMetadata::default()),
             sessions: Arc::new(Mutex::new(AgentSessionRegistry::default())),
+            catalog_sync_submitter: None,
         };
 
         handle_agent_task_data_message_from_state(
@@ -20563,6 +22709,7 @@ spec:
                 identity: Arc::new(ControllerIdentity::dev_insecure()),
                 metadata: Arc::new(ControllerRuntimeMetadata::default()),
                 sessions: Arc::new(Mutex::new(AgentSessionRegistry::default())),
+                catalog_sync_submitter: None,
             };
             let execution_job_id = format!("job-remediation-{suffix}");
             let execution_task_id = format!("task-remediation-{suffix}");
@@ -20723,6 +22870,7 @@ spec:
             identity: Arc::new(ControllerIdentity::dev_insecure()),
             metadata: Arc::new(ControllerRuntimeMetadata::default()),
             sessions: Arc::new(Mutex::new(AgentSessionRegistry::default())),
+            catalog_sync_submitter: None,
         };
 
         let first = recover_pending_remediation_verifications(&state, 1).unwrap();

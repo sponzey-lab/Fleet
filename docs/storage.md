@@ -34,7 +34,7 @@ ad hoc으로 추가하지 않도록 하는 것이다.
   rotation은 Phase 5 작업이다.
 - Postgres store는 feature-gated implementation slice다. `fleet-store --features
   postgres`는 explicit URL을 받는 `PostgresStore::connect`, schema migration entrypoint,
-  ignored integration migration test, Agent/AdminToken/ControllerIdentity/AgentIdentity
+  ignored integration migration test, CatalogRepository와 Agent/AdminToken/ControllerIdentity/AgentIdentity
   repository trait implementation, EnrollmentToken repository trait implementation, Audit
   writer/query/export repository trait implementation, ApprovalRequest repository trait
   implementation, basic Job/TaskAssignment persistence repository implementation, Command/Runbook/Drift
@@ -166,7 +166,7 @@ schema_migrations
   version = CURRENT_SCHEMA_VERSION
 ```
 
-현재 `CURRENT_SCHEMA_VERSION`은 19이다.
+현재 `CURRENT_SCHEMA_VERSION`은 20이다.
 
 반복 실행 규칙:
 
@@ -350,6 +350,8 @@ Restore 안전장치:
 
 - data directory 삭제는 reset이다. controller identity, jobs, audit, telemetry, enrollment records가 사라진다.
 - backup/restore는 보존 복구다. 같은 controller identity와 저장 데이터를 다시 사용할 수 있다.
+- catalog source/revision/operation/document은 SQLite durable state이므로 Controller backup archive의
+  `controller/fleet.db`에 포함된다. 재구성 가능한 Git checkout cache를 별도 backup file로 넣지 않는다.
 
 ## 현재 주요 Table
 
@@ -385,6 +387,41 @@ Policy:
 - `policy_drift_schedules`
 - `remediation_requests`
 
+Catalog:
+
+- `catalog_sources` — 공개 source URL/reference와 active revision pointer
+- `catalog_revisions` — source/commit별 validation state와 document count 또는 failure code
+- `catalog_sync_operations` — source별 하나의 진행 중 sync와 immutable terminal result
+- `catalog_documents` — source/commit/path/checksum provenance와 validated 원문
+- `job_catalog_runbook_provenance` — catalog Runbook Job의 immutable source/commit/path/checksum; referenced catalog document deletion을 제한한다.
+- `policy_catalog_provenance` — catalog Policy의 immutable source/commit/path/checksum 및 source ownership; referenced catalog document deletion을 제한한다.
+
+`CatalogRepository`는 SQLite와 feature-gated Postgres에서 같은 source/revision/operation/document
+read/write 및 ready revision activation contract를 구현한다. 새 revision에서 같은 source의 unchanged
+checksum document는 controller가 body를 다시 전달하지 않고 durable validated body를 복사해 provenance
+row만 추가한다. `CatalogQueryRepository`는 이 durable state만 source id, source별 commit id,
+source+commit별 path 오름차순의 exclusive cursor로 읽는다. application page 결과는 1~100 records로
+제한하고 list에는 document body를 넣지 않으며, body는 이후 권한 검사를 거친 단건 detail 경로에서만
+읽는다. 이 query는 Git fetch/refresh를 수행하지 않는다. 세 정렬 키는 각 table의 primary key 또는
+`catalog_documents_source_commit_path_idx`로 index-backed이다. Postgres의 실제 서버 roundtrip은
+disposable DB를 요구하는 ignored test로 분리한다.
+
+Catalog Runbook Job은 active이면서 `Ready`인 revision의 checksum 일치 document만 이 table과
+같은 transaction에서 Job·Assignment로 저장한다. Job에는 source id, commit, path, checksum만
+남기며 실행 본문은 그 provenance가 가리키는 validated `catalog_documents` body를 immutable
+snapshot으로 사용한다. catalog document를 지우려 하면 그것을 참조하는 provenance가 있는 동안
+foreign-key constraint로 거부된다.
+
+Catalog Policy publish도 active·`Ready` revision의 checksum 일치 Policy만 transaction 안에서
+저장한다. 처음 publish는 policy id의 catalog source ownership을 만들고, 같은 source의 새 commit은
+그 provenance를 갱신할 수 있다. 기존 manual policy 또는 다른 catalog source가 소유한 같은 id는
+overwrite하지 않고 conflict로 끝난다. publish 자체는 Policy assignment, drift schedule, remediation을
+생성하지 않는다.
+
+Catalog의 1,000-document deterministic fixture와 local warm-run observation 방법은
+[`catalog-performance.md`](catalog-performance.md)에 기록한다. 이 문서는 local 수치를 release
+threshold로 취급하지 않으며, pinned runner에서 재현한 baseline만 release gate에 사용할 수 있다.
+
 Audit:
 
 - `audit_events`
@@ -419,6 +456,8 @@ Application layer는 store 구현체가 아니라 repository trait을 통해 접
 - `JobQueryRepository`
 - `JobOutputRepository`
 - `PolicyRepository`
+- `CatalogRepository`
+- `CatalogQueryRepository`
 - `FactsRepository`
 - `MetricsRepository`
 - `DriftRepository`
@@ -558,6 +597,12 @@ Storage 변경 시 최소 확인:
 
 ```bash
 cargo test -p fleet-store migration_from_versioned_previous_fixture_adds_columns_without_losing_rows
+cargo test -p fleet-store sqlite_catalog_repository_preserves_active_ready_revision_and_failed_attempt_after_reopen
+cargo test -p fleet-store sqlite_catalog_sync_operation
+cargo test -p fleet-store sqlite_catalog_document_repository_roundtrips_validated_body_after_reopen
+cargo test -p fleet-store sqlite_catalog_query_repository_pages_durable_provenance_without_listing_bodies
+cargo test -p fleet-store sqlite_catalog_document_cursor_reads_one_thousand_rows_in_ten_indexed_pages
+cargo test -p fleet-store --features postgres postgres_store_implements_catalog_repository_trait
 cargo test -p fleet-store sqlite_store_implements_application_repository_contracts
 cargo test -p fleet-store sqlite_store_passes_shared_repository_contract_harness
 cargo test -p fleet-store migration_state_transitions_follow_phase3_gate
@@ -581,11 +626,15 @@ cargo test -p fleet-store --features postgres postgres_store_implements_remediat
 cargo test -p fleet-core database_settings
 cargo test -p fleet-controller postgres_backend
 cargo test -p fleet-cli controller_restore_refuses_incompatible_schema_version
+cargo test -p fleet-cli controller_backup_restore_roundtrip_restores_database_and_keys
 ```
 
 Postgres가 있는 개발 환경에서만 실행하는 ignored gate:
 
 ```bash
+FLEET_TEST_POSTGRES_URL=postgresql://... \
+  cargo test -p fleet-store --features postgres \
+  postgres_catalog_repository_roundtrips_source_operation_document_and_activation -- --ignored
 FLEET_TEST_POSTGRES_URL=postgresql://... \
   cargo test -p fleet-store --features postgres postgres_migration_records_current_schema_version -- --ignored
 FLEET_TEST_POSTGRES_URL=postgresql://... \
@@ -614,6 +663,16 @@ FLEET_TEST_POSTGRES_URL=postgresql://... \
 
 이 URL은 test-only 입력이다. production code는 process env를 읽지 않고 explicit
 argument 또는 bootstrap `DatabaseSettings`로만 DB 설정을 받는다.
+
+각 ignored integration test는 **비어 있는 disposable database를 따로** 사용한다. 여러
+repository contract fixture는 같은 test database 안의 다른 durable row를 의도적으로
+관찰할 수 있으므로, `-- --ignored`로 전체 suite를 한 database에 병렬 실행해 parity 결과로
+해석하지 않는다.
+
+2026-08-31에는 loopback-only temporary PostgreSQL 18.3 cluster에서 위 13개 ignored test를
+각각 새 database에 연결해 모두 통과했다. cluster와 data directory는 test 직후 제거했다.
+이 결과는 feature-gated adapter의 local runtime parity 근거이며, production PostgreSQL,
+custom CA/mTLS, HA lease/leader election 검증을 의미하지 않는다.
 
 Fixture 갱신 절차:
 

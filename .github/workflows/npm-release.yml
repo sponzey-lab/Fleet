@@ -98,6 +98,13 @@ jobs:
       - name: Verify npm wrapper metadata
         run: npm test --workspace @sponzey/fleet
 
+  catalog-performance:
+    name: Verify catalog performance baseline
+    needs: validate
+    uses: ./.github/workflows/catalog-performance.yml
+    with:
+      mode: verify
+
   build-platform:
     name: Build ${{ matrix.package }}
     needs: validate
@@ -143,6 +150,7 @@ jobs:
     name: Publish npm packages
     needs:
       - validate
+      - catalog-performance
       - build-platform
     runs-on: ubuntu-24.04
     permissions:

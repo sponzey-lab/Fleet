@@ -17,7 +17,7 @@ if rg -n 'std::env::set_var|std::env::remove_var' crates >/tmp/fleet-hardening-e
 fi
 
 if rg -n 'std::env::var|std::env::vars|std::env::var_os|std::env::vars_os' crates \
-  | grep -v 'FLEET_TEST_POSTGRES_URL' >/tmp/fleet-hardening-env-read.txt; then
+  | grep -vE 'FLEET_TEST_(POSTGRES_URL|PUBLIC_CATALOG_URL)' >/tmp/fleet-hardening-env-read.txt; then
   cat /tmp/fleet-hardening-env-read.txt >&2
   fail "production code must not read environment outside bootstrap settings"
 fi

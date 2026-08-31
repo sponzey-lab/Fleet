@@ -6,6 +6,7 @@
 | `artifact.rs` | Domain model | Defines artifact identity, retention classification, and metadata validation. | Pure data validation; no storage access. |
 | `audit.rs` | Domain model | Defines auditable actors, targets, values, and events. | Pure event construction; no log or database writes. |
 | `capability.rs` | Domain model | Defines agent capability snapshots and compatibility decisions. | Pure policy evaluation; no system probes. |
+| `catalog.rs` | Domain model | Defines public catalog identity with validated HTTPS authority, immutable revision, Runbook Job and Policy provenance, sync-operation and activation guards, and document metadata. | Pure validation and transitions; no Git, database, or network access. |
 | `certificate.rs` | Domain model | Defines certificate lifecycle and revocation state. | Pure state transitions; no TLS or filesystem access. |
 | `job.rs` | Domain model | Defines jobs, assignments, task envelopes, and execution state transitions. | Pure execution policy; no dispatch or process I/O. |
 | `policy.rs` | Domain model | Defines policies, drift reports, verified remediation-origin candidate validation, and remediation rules. | Pure parsing and policy decisions; no persistence or transport access. |

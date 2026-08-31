@@ -551,6 +551,23 @@ Audit/log policy:
 - Permission checks cover the current REST route boundary. Every new public
   API must add an explicit permission and table-driven authorization test before
   becoming public.
+- Public Git catalog infrastructure uses a fixed `git2` HTTPS-only dependency with an ephemeral
+  bare staging directory, shallow depth, no tag download, no redirect following, a transfer-size
+  ceiling, a credential callback that always fails, and a fail-closed DNS preflight that rejects
+  empty, private, reserved, link-local, loopback, multicast, or mixed address answers. Each fetch
+  then starts a controller-local loopback CONNECT proxy that accepts only the source's exact
+  authority and opens every upstream socket directly to one of those checked addresses. Libgit2
+  keeps the original hostname for HTTPS SNI and certificate validation; it cannot redirect the
+  proxy to another authority. The proxy polls both its 30-second hard deadline and the
+  controller-owned cancellation signal, closing both tunnel ends so stalled native I/O returns to
+  the joined worker. The controller performs queued sync in the blocking pool only after releasing
+  the durable-store lock, then records a source/operation-only audit event. Timeout is persisted
+  as a fetch failure and shutdown as cancellation.
+  A YAML blob is treated as catalog input only when its `kind` declares `Runbook` or `Policy`;
+  unrelated YAML such as CI workflows is ignored. A declared catalog document still has to pass
+  its strict parser and size limits, or the sync fails without changing the active revision.
+  Private Git authentication remains unsupported; no URL, request, or runtime model accepts a Git
+  token.
 
 ## Post-MVP Security Phase Map
 
@@ -560,7 +577,7 @@ Audit/log policy:
 | Controller signing key rotation | Phase 5 | Domain state machine, dual-trust decision policy, SQLite/Postgres-shaped persistence contract, application operation/audit boundary, signing material validation boundary, filesystem staging/swap boundary, bootstrap runtime guard, explicit signer selection context, agent-side trust bundle verification, trust-bundle update/ack protocol and session foundation, agent trust sidecar restart survival, read-only status API/CLI, mutation API/CLI, restart-plan API/CLI, audited external restart-action API/CLI, admin-triggered trust-bundle rollout API/CLI, bounded retry coordinator API/CLI, already-current ack skip, staged rollout domain state machine/persistence/worker, and Web Admin staged rollout surface exist. In-process hot reload/self-restart is not a current product path; audited external restart-action is the supported path. |
 | Secret provider boundary | Phase 5 | Typed `SecretRef`, application `SecretProvider` trait, static fake provider, disabled provider, explicit runner resolver injection, typed startup `SecretProviderSettings`, controller bootstrap provider factory, agent runbook resolver handoff, and redaction tests exist; Vault/OpenBao adapter only after provider integration tests. |
 | OIDC/admin identity/project RBAC | Phase 6 | Authenticated context, project scope, permission matrix, audit actor contract. |
-| Git sync credentials | Phase 7 | SecretRef only; validation/activation audit; no raw Git token in logs. |
+| Public Git catalog / private credentials | Current plan / follow-up | Public HTTPS catalog transport is credential-free and bounded; private Git requires a separately approved SecretRef adapter, validation/activation audit, and no raw token in logs. |
 | Notification webhooks | Phase 8 | SecretRef webhook credentials and redacted summary payloads. |
 | Agent update policy | Phase 9 | Signed artifact verification before install, rollback state machine. |
 | HA coordination | Phase 10 | Lease/claim tests; no WebSocket handle persisted. |

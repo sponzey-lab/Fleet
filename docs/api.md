@@ -78,6 +78,13 @@ OpenAPI 문서 범위:
 - `/api/agents/{agent_id}/logs`
 - `/api/agents/{agent_id}/drift`
 - `/api/agents/{agent_id}/drift/latest`
+- `/api/catalog/sources`
+- `POST /api/catalog/sources`
+- `POST /api/catalog/sources/{source_id}/sync`
+- `POST /api/catalog/sources/{source_id}/activate`
+- `/api/catalog/sources/{source_id}/revisions`
+- `/api/catalog/sources/{source_id}/revisions/{commit}/documents`
+- `/api/catalog/sources/{source_id}/revisions/{commit}/document`
 - `/api/policies`
 - `/api/policies/{policy_id}/assignments`
 - `/api/policies/{policy_id}/schedules`
@@ -125,7 +132,7 @@ OpenAPI 문서 범위:
 | --- | --- | --- | --- |
 | Public readiness/docs | `/healthz`, `/api/controller/identity`, `/openapi.json`, `/swagger-ui` | 없음 | 운영 도구가 의존할 수 있는 public surface |
 | Agent protocol REST | `POST /api/agents/enroll` | enrollment token body | agent bootstrap 계약. WebSocket protocol은 별도 문서화 |
-| Admin API | `/api/agents`, `/api/jobs`, `/api/approvals`, `/api/enrollment-tokens`, `/api/controller/signing-rotation/*`, `/api/audit`, `/api/audit/export`, telemetry page API | admin bearer token | 외부 자동화 후보. OpenAPI와 contract test 대상 |
+| Admin API | `/api/agents`, `/api/jobs`, `/api/approvals`, `/api/enrollment-tokens`, `/api/catalog/*`, `/api/controller/signing-rotation/*`, `/api/audit`, `/api/audit/export`, telemetry page API | admin bearer token | 외부 자동화 후보. OpenAPI와 contract test 대상 |
 | Admin beta API | `/api/policies`, `/api/drift/scheduled`, `/api/selectors/preview`, label 변경, key revoke | admin bearer token | 구현되어 있지만 selector rollout과 UX가 더 바뀔 수 있음 |
 | Internal static | `/admin`, `/admin/*`, `/favicon.ico` | 없음 | Web Admin asset serving. REST API 계약이 아님 |
 | Agent WebSocket protocol | `/api/agents/ws` | agent identity proof | `docs/protocol.md` 범위. REST OpenAPI에 포함하지 않음 |
@@ -199,8 +206,57 @@ Response shape:
 - `GET /api/agents/{agent_id}/drift`
 - `GET /api/audit/export`
 
+Catalog 목록은 같은 cursor 원칙을 쓰지만 오래된 immutable record를 ID/commit/path 오름차순으로
+읽기 때문에 query와 응답 필드 이름이 `after`/`next_after`이고, `limit` 범위는 `1..=100`이다.
+다음 endpoint에 적용한다.
+
+- `GET /api/catalog/sources`
+- `GET /api/catalog/sources/{source_id}/revisions`
+- `GET /api/catalog/sources/{source_id}/revisions/{commit}/documents`
+
 정렬은 최신순이다. `next_cursor`가 `null`이면 다음 page가 없다. cursor는 내부 저장소 key
 형식을 숨기기 위한 opaque string으로 취급하며, client가 분해하거나 생성하지 않는다.
+
+### Catalog Read API
+
+Catalog read API는 이미 Controller에 저장된 source, immutable revision, 검증된 document를
+읽기만 한다. 조회 요청은 Git fetch, source sync, revision activation 또는 Policy/Runbook
+실행을 시작하지 않는다. 네 endpoint 모두 `Authorization: Bearer <admin-token>`을 요구하며,
+현재 `policy_read` 권한을 사용한다.
+
+```http
+GET /api/catalog/sources?limit=50&after=<cursor>
+GET /api/catalog/sources/{source_id}/revisions?limit=50&after=<cursor>
+GET /api/catalog/sources/{source_id}/revisions/{commit}/documents?limit=50&after=<cursor>
+GET /api/catalog/sources/{source_id}/revisions/{commit}/document?path=runbooks%2Frestart-web.yaml
+```
+
+세 목록 응답은 다음 모양이다.
+
+```json
+{
+  "items": [],
+  "next_after": null
+}
+```
+
+- source item은 `id`, public `url`, `reference`, `active_commit`만 반환한다.
+- revision item은 `commit`, durable `state`, `document_count`, sanitized `failure`만 반환한다.
+- document 목록 item은 `kind`, repository-relative `path`, `checksum`만 반환한다. **`body`는
+  목록에 절대 포함되지 않는다.**
+- 하나의 document body가 필요할 때만 `document?path=...` detail endpoint를 사용한다. detail은
+  `kind`, `path`, `checksum`, `body`를 반환한다. query `path`는 URL query 값으로 percent-encode해야
+  하며, 해당 document가 없으면 `404 {"error":"not_found"}`를 반환한다.
+- `limit`이 `1..=100` 밖이거나 `after`/`path`의 percent encoding이 잘못되면 `400`이다. 목록의
+  존재하지 않는 source/revision은 빈 page이고, 그 source/revision 아래의 명시적 document detail이
+  없으면 `404`이다.
+
+Catalog source mutation은 owner/admin의 `policy_write` 권한만 허용한다. `POST /api/catalog/sources`는
+`source_id`, public HTTPS `url`, `reference`를 받고 source와 redacted audit event를 만든다.
+`POST /api/catalog/sources/{source_id}/sync`는 `{ "operation_id": "..." }`로 durable operation을
+만든 뒤 bounded worker에 전달하고 `202`를 즉시 반환한다. 등록 및 sync 요청은 credential을 받거나
+HTTP handler에서 Git fetch를 실행하지 않는다.
+Activation은 `POST /api/catalog/sources/{source_id}/activate` body의 immutable `commit`을 받아 ready revision만 active pointer로 전환한다. sync 완료는 activation을 자동으로 수행하지 않는다.
 
 ### Job and Assignment
 

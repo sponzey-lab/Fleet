@@ -6,8 +6,9 @@ use fleet_application::{
     ApprovalRepository, ApprovalRequestRecord as AppApprovalRequestRecord, ArtifactDeleteOutcome,
     ArtifactMetadataRepository, ArtifactStore, ArtifactStorePut,
     ArtifactStoreRecord as AppArtifactStoreRecord, ArtifactVerification, AuditEventPageRecord,
-    AuditRepository, AuditWriter, CommandJobRepository, ControllerIdentityMetadata,
-    ControllerIdentityRepository, ControllerSigningStagedRolloutRecord,
+    AuditRepository, AuditWriter, CatalogDocumentRecord as AppCatalogDocumentRecord,
+    CatalogPolicyPublishOutcome, CatalogQueryRepository, CatalogRepository, CommandJobRepository,
+    ControllerIdentityMetadata, ControllerIdentityRepository, ControllerSigningStagedRolloutRecord,
     ControllerSigningStagedRolloutRepository, DispatchAssignmentRepository,
     DriftCheckJobRepository, DriftReportPageRecord as AppDriftReportPageRecord,
     DriftReportRecord as AppDriftReportRecord, DriftRepository,
@@ -42,13 +43,17 @@ use fleet_domain::{
     AgentCertificateRevocationReason, AgentCertificateSerial, AgentCertificateValidity, AgentError,
     AgentFingerprint, AgentId, AgentIdentity, AgentLabel, AgentName, AgentPublicKey,
     AgentRuntimeProfile, AgentStatus, ArtifactChecksum, ArtifactId, ArtifactRetentionClass,
-    AssignmentStatus, AuditActor, AuditCategory, AuditEvent, AuditTarget, AuditValue, CommandTask,
-    ControllerPublicKey, ControllerSigningKeyRotation, ControllerSigningKeyRotationSnapshot,
-    DriftAcknowledgement, DriftCheckPurpose, DriftCheckTask, DriftJobProvenance, DriftReport,
-    DriftReportId, DriftReportProvenance, DriftSeverity, DriftStatus, Job, JobId, JobStatus,
-    PackageManager, PrivilegeLevel, RenderedArtifactMetadata, RunbookExecutionTask, ServiceManager,
-    SigningKeyFingerprint, SigningKeyRotationState, TaskEnvelope, TaskExpiry, TaskId, TaskKind,
-    TaskNonce, TaskSignature, aggregate_job_status,
+    AssignmentStatus, AuditActor, AuditCategory, AuditEvent, AuditTarget, AuditValue,
+    CatalogCommitId, CatalogDocument, CatalogDocumentKind, CatalogError, CatalogPolicyProvenance,
+    CatalogReference, CatalogRevision, CatalogRevisionState, CatalogSource, CatalogSourceId,
+    CatalogSyncFailure, CatalogSyncOperation, CatalogSyncOperationId, CatalogSyncOperationState,
+    CommandTask, ControllerPublicKey, ControllerSigningKeyRotation,
+    ControllerSigningKeyRotationSnapshot, DriftAcknowledgement, DriftCheckPurpose, DriftCheckTask,
+    DriftJobProvenance, DriftReport, DriftReportId, DriftReportProvenance, DriftSeverity,
+    DriftStatus, Job, JobId, JobStatus, PackageManager, PrivilegeLevel, PublicCatalogUrl,
+    RenderedArtifactMetadata, RunbookExecutionTask, ServiceManager, SigningKeyFingerprint,
+    SigningKeyRotationState, TaskEnvelope, TaskExpiry, TaskId, TaskKind, TaskNonce, TaskSignature,
+    aggregate_job_status,
 };
 use rusqlite::{Connection, ErrorCode, OptionalExtension, params};
 use sha2::{Digest, Sha256};
@@ -56,7 +61,7 @@ use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 19;
+pub const CURRENT_SCHEMA_VERSION: i64 = 22;
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -815,6 +820,72 @@ impl PostgresStore {
                     updated_at BIGINT NOT NULL DEFAULT (EXTRACT(EPOCH FROM now())::BIGINT)
                 );
 
+                CREATE TABLE IF NOT EXISTS catalog_sources (
+                    id TEXT PRIMARY KEY,
+                    url TEXT NOT NULL,
+                    reference TEXT NOT NULL,
+                    active_revision TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS catalog_revisions (
+                    source_id TEXT NOT NULL REFERENCES catalog_sources(id) ON DELETE CASCADE,
+                    commit_id TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    document_count BIGINT,
+                    failure_code TEXT,
+                    PRIMARY KEY (source_id, commit_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS catalog_revisions_source_state_idx
+                    ON catalog_revisions (source_id, state, commit_id);
+
+                CREATE TABLE IF NOT EXISTS catalog_sync_operations (
+                    id TEXT PRIMARY KEY,
+                    source_id TEXT NOT NULL REFERENCES catalog_sources(id) ON DELETE CASCADE,
+                    commit_id TEXT,
+                    state TEXT NOT NULL,
+                    failure_code TEXT
+                );
+
+                CREATE UNIQUE INDEX IF NOT EXISTS catalog_sync_operations_one_active_source_idx
+                    ON catalog_sync_operations (source_id)
+                    WHERE state = 'in_progress';
+
+                CREATE TABLE IF NOT EXISTS catalog_documents (
+                    source_id TEXT NOT NULL,
+                    commit_id TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    checksum TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    PRIMARY KEY (source_id, commit_id, path),
+                    FOREIGN KEY (source_id, commit_id)
+                        REFERENCES catalog_revisions(source_id, commit_id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS catalog_documents_source_commit_path_idx
+                    ON catalog_documents (source_id, commit_id, path);
+
+                CREATE TABLE IF NOT EXISTS job_catalog_runbook_provenance (
+                    job_id TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+                    source_id TEXT NOT NULL,
+                    commit_id TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    checksum TEXT NOT NULL,
+                    FOREIGN KEY (source_id, commit_id, path)
+                        REFERENCES catalog_documents(source_id, commit_id, path) ON DELETE RESTRICT
+                );
+
+                CREATE TABLE IF NOT EXISTS policy_catalog_provenance (
+                    policy_id TEXT PRIMARY KEY REFERENCES policies(id) ON DELETE CASCADE,
+                    source_id TEXT NOT NULL,
+                    commit_id TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    checksum TEXT NOT NULL,
+                    FOREIGN KEY (source_id, commit_id, path)
+                        REFERENCES catalog_documents(source_id, commit_id, path) ON DELETE RESTRICT
+                );
+
                 CREATE TABLE IF NOT EXISTS policy_assignments (
                     policy_id TEXT NOT NULL REFERENCES policies(id) ON DELETE CASCADE,
                     agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
@@ -1402,6 +1473,72 @@ impl SqliteStore {
         self.connection
             .query_row("PRAGMA integrity_check", [], |row| row.get(0))
             .map_err(StoreError::from)
+    }
+
+    fn load_catalog_revision(
+        &self,
+        source_id: &CatalogSourceId,
+        commit: &CatalogCommitId,
+    ) -> Result<Option<CatalogRevision>, StoreError> {
+        let row = self
+            .connection
+            .query_row(
+                "SELECT state, document_count, failure_code
+                 FROM catalog_revisions
+                 WHERE source_id = ?1 AND commit_id = ?2",
+                params![source_id.as_str(), commit.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        row.map(|(state, document_count, failure_code)| {
+            catalog_revision_from_persisted(
+                source_id.clone(),
+                commit.clone(),
+                &state,
+                document_count,
+                failure_code.as_deref(),
+            )
+        })
+        .transpose()
+    }
+
+    fn load_catalog_sync_operation(
+        &self,
+        operation_id: &CatalogSyncOperationId,
+    ) -> Result<Option<CatalogSyncOperation>, StoreError> {
+        let row = self
+            .connection
+            .query_row(
+                "SELECT source_id, commit_id, state, failure_code
+                 FROM catalog_sync_operations
+                 WHERE id = ?1",
+                params![operation_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        row.map(|(source_id, commit_id, state, failure_code)| {
+            catalog_sync_operation_from_persisted(
+                operation_id.clone(),
+                source_id,
+                commit_id,
+                &state,
+                failure_code.as_deref(),
+            )
+        })
+        .transpose()
     }
 
     fn ensure_column(&self, table: &str, column: &str, statement: &str) -> Result<(), StoreError> {
@@ -2069,6 +2206,65 @@ impl SqliteStore {
             params![policy_id, name, version as i64, source],
         )?;
         Ok(())
+    }
+
+    pub fn publish_catalog_policy_source(
+        &self,
+        policy: &fleet_domain::Policy,
+        provenance: &CatalogPolicyProvenance,
+    ) -> Result<CatalogPolicyPublishOutcome, StoreError> {
+        self.run_sqlite_transaction(|| {
+            let existing_source = self
+                .connection
+                .query_row(
+                    "SELECT source_id FROM policy_catalog_provenance WHERE policy_id = ?1",
+                    [policy.id.as_str()],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if let Some(existing_source) = existing_source {
+                if existing_source != provenance.source_id().as_str() {
+                    return Ok(CatalogPolicyPublishOutcome::OtherCatalogSourceConflict);
+                }
+            } else {
+                let policy_exists = self.connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM policies WHERE id = ?1)",
+                    [policy.id.as_str()],
+                    |row| row.get::<_, bool>(0),
+                )?;
+                if policy_exists {
+                    return Ok(CatalogPolicyPublishOutcome::ManualPolicyConflict);
+                }
+            }
+            self.connection.execute(
+                "INSERT INTO policies (id, name, version, source, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, unixepoch(), unixepoch())
+                 ON CONFLICT(id) DO UPDATE SET
+                    name = excluded.name,
+                    version = excluded.version,
+                    source = excluded.source,
+                    updated_at = excluded.updated_at",
+                params![policy.id, policy.name, policy.version as i64, policy.source],
+            )?;
+            self.connection.execute(
+                "INSERT INTO policy_catalog_provenance
+                    (policy_id, source_id, commit_id, path, checksum)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(policy_id) DO UPDATE SET
+                    source_id = excluded.source_id,
+                    commit_id = excluded.commit_id,
+                    path = excluded.path,
+                    checksum = excluded.checksum",
+                params![
+                    policy.id,
+                    provenance.source_id().as_str(),
+                    provenance.commit().as_str(),
+                    provenance.path(),
+                    provenance.checksum(),
+                ],
+            )?;
+            Ok(CatalogPolicyPublishOutcome::Published)
+        })
     }
 
     pub fn list_policies(&self) -> Result<Vec<PolicyRecord>, StoreError> {
@@ -2794,6 +2990,45 @@ impl SqliteStore {
                     approval_requirement_to_str(job.approval_requirement()),
                     job.timeout().as_millis() as i64,
                     task.runbook_document(),
+                ],
+            )?;
+            for assignment in assignments {
+                sqlite_insert_task_assignment_in_connection(&self.connection, assignment)?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn save_catalog_runbook_job_with_assignments_record(
+        &self,
+        job: &Job,
+        task: &RunbookExecutionTask,
+        provenance: &fleet_domain::CatalogRunbookProvenance,
+        assignments: &[TaskEnvelope],
+    ) -> Result<(), StoreError> {
+        self.run_sqlite_transaction(|| {
+            self.connection.execute(
+                "INSERT INTO jobs (id, status, risk, approval_requirement, timeout_ms, runbook_document)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    job.id().as_str(),
+                    job_status_to_str(job.status()),
+                    task_risk_to_str(job.risk()),
+                    approval_requirement_to_str(job.approval_requirement()),
+                    job.timeout().as_millis() as i64,
+                    task.runbook_document(),
+                ],
+            )?;
+            self.connection.execute(
+                "INSERT INTO job_catalog_runbook_provenance
+                    (job_id, source_id, commit_id, path, checksum)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    job.id().as_str(),
+                    provenance.source_id().as_str(),
+                    provenance.commit().as_str(),
+                    provenance.path(),
+                    provenance.checksum(),
                 ],
             )?;
             for assignment in assignments {
@@ -4468,6 +4703,449 @@ impl SqliteStore {
     }
 }
 
+impl CatalogRepository for SqliteStore {
+    type Error = StoreError;
+
+    fn save_catalog_source(&mut self, source: CatalogSource) -> Result<(), Self::Error> {
+        self.connection.execute(
+            "INSERT INTO catalog_sources (id, url, reference, active_revision)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                source.id().as_str(),
+                source.url().as_str(),
+                source.reference().as_str(),
+                source.active_revision().map(CatalogCommitId::as_str),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn find_catalog_source(
+        &self,
+        source_id: &CatalogSourceId,
+    ) -> Result<Option<CatalogSource>, Self::Error> {
+        let row = self
+            .connection
+            .query_row(
+                "SELECT url, reference, active_revision FROM catalog_sources WHERE id = ?1",
+                params![source_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((url, reference, active_revision)) = row else {
+            return Ok(None);
+        };
+        let mut source = CatalogSource::new(
+            source_id.clone(),
+            PublicCatalogUrl::new(url).map_err(|error| StoreError::Domain(error.to_string()))?,
+            CatalogReference::new(reference)
+                .map_err(|error| StoreError::Domain(error.to_string()))?,
+        );
+        if let Some(active_revision) = active_revision {
+            let active_revision = CatalogCommitId::new(active_revision)
+                .map_err(|error| StoreError::Domain(error.to_string()))?;
+            let revision = self
+                .load_catalog_revision(source_id, &active_revision)?
+                .ok_or_else(|| {
+                    StoreError::Domain("catalog active revision is missing".to_owned())
+                })?;
+            source
+                .activate(&revision)
+                .map_err(|error| StoreError::Domain(error.to_string()))?;
+        }
+        Ok(Some(source))
+    }
+
+    fn find_catalog_revision(
+        &self,
+        source_id: &CatalogSourceId,
+        commit: &CatalogCommitId,
+    ) -> Result<Option<CatalogRevision>, Self::Error> {
+        self.load_catalog_revision(source_id, commit)
+    }
+
+    fn save_catalog_revision(&mut self, revision: CatalogRevision) -> Result<(), Self::Error> {
+        let (state, document_count, failure_code) = catalog_revision_to_persisted(&revision);
+        self.connection.execute(
+            "INSERT INTO catalog_revisions (source_id, commit_id, state, document_count, failure_code)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(source_id, commit_id) DO UPDATE SET
+                state = excluded.state,
+                document_count = excluded.document_count,
+                failure_code = excluded.failure_code",
+            params![
+                revision.source_id().as_str(),
+                revision.commit().as_str(),
+                state,
+                document_count,
+                failure_code,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn begin_or_observe_catalog_sync_operation(
+        &mut self,
+        operation: CatalogSyncOperation,
+    ) -> Result<CatalogSyncOperation, Self::Error> {
+        let transaction = self.connection.transaction()?;
+        let existing = transaction
+            .query_row(
+                "SELECT id, source_id, commit_id, state, failure_code
+                 FROM catalog_sync_operations
+                 WHERE source_id = ?1 AND state = 'in_progress'",
+                params![operation.source_id().as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((id, source_id, commit_id, state, failure_code)) = existing {
+            let existing = catalog_sync_operation_from_persisted(
+                CatalogSyncOperationId::new(id)
+                    .map_err(|error| StoreError::Domain(error.to_string()))?,
+                source_id,
+                commit_id,
+                &state,
+                failure_code.as_deref(),
+            )?;
+            transaction.commit()?;
+            return Ok(existing);
+        }
+        let (state, commit_id, failure_code) = catalog_sync_operation_to_persisted(&operation);
+        transaction.execute(
+            "INSERT INTO catalog_sync_operations (id, source_id, commit_id, state, failure_code)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                operation.id().as_str(),
+                operation.source_id().as_str(),
+                commit_id,
+                state,
+                failure_code,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(operation)
+    }
+
+    fn save_catalog_sync_operation(
+        &mut self,
+        operation: CatalogSyncOperation,
+    ) -> Result<(), Self::Error> {
+        let (state, commit_id, failure_code) = catalog_sync_operation_to_persisted(&operation);
+        let changed = self.connection.execute(
+            "UPDATE catalog_sync_operations
+             SET commit_id = ?1, state = ?2, failure_code = ?3
+             WHERE id = ?4 AND source_id = ?5",
+            params![
+                commit_id,
+                state,
+                failure_code,
+                operation.id().as_str(),
+                operation.source_id().as_str(),
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
+    }
+
+    fn find_catalog_sync_operation(
+        &self,
+        operation_id: &CatalogSyncOperationId,
+    ) -> Result<Option<CatalogSyncOperation>, Self::Error> {
+        self.load_catalog_sync_operation(operation_id)
+    }
+
+    fn save_catalog_document(
+        &mut self,
+        document: CatalogDocument,
+        body: String,
+    ) -> Result<(), Self::Error> {
+        self.connection.execute(
+            "INSERT INTO catalog_documents (source_id, commit_id, path, kind, checksum, body)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                document.source_id().as_str(),
+                document.commit().as_str(),
+                document.path(),
+                catalog_document_kind_to_code(document.kind()),
+                document.checksum(),
+                body,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn reuse_catalog_document(&mut self, document: CatalogDocument) -> Result<(), Self::Error> {
+        let copied = self.connection.execute(
+            "INSERT INTO catalog_documents (source_id, commit_id, path, kind, checksum, body)
+             SELECT ?1, ?2, ?3, ?4, ?5, body
+             FROM catalog_documents
+             WHERE source_id = ?1 AND checksum = ?5
+             LIMIT 1",
+            params![
+                document.source_id().as_str(),
+                document.commit().as_str(),
+                document.path(),
+                catalog_document_kind_to_code(document.kind()),
+                document.checksum(),
+            ],
+        )?;
+        if copied != 1 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
+    }
+
+    fn find_catalog_document(
+        &self,
+        source_id: &CatalogSourceId,
+        commit: &CatalogCommitId,
+        path: &str,
+    ) -> Result<Option<AppCatalogDocumentRecord>, Self::Error> {
+        self.connection
+            .query_row(
+                "SELECT kind, checksum, body
+                 FROM catalog_documents
+                 WHERE source_id = ?1 AND commit_id = ?2 AND path = ?3",
+                params![source_id.as_str(), commit.as_str(), path],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .map(|(kind, checksum, body)| {
+                Ok(AppCatalogDocumentRecord {
+                    document: CatalogDocument::new(
+                        source_id.clone(),
+                        commit.clone(),
+                        catalog_document_kind_from_code(&kind)?,
+                        path,
+                        checksum,
+                    )?,
+                    body,
+                })
+            })
+            .transpose()
+            .map_err(|error: CatalogError| StoreError::Domain(error.to_string()))
+    }
+
+    fn activate_catalog_revision(
+        &mut self,
+        source: CatalogSource,
+        revision: &CatalogRevision,
+    ) -> Result<(), Self::Error> {
+        if source.id() != revision.source_id()
+            || source.active_revision() != Some(revision.commit())
+            || !matches!(revision.state(), CatalogRevisionState::Ready { .. })
+        {
+            return Err(StoreError::Domain(
+                "catalog activation must target the source's ready revision".to_owned(),
+            ));
+        }
+        let transaction = self.connection.transaction()?;
+        let changed = transaction.execute(
+            "UPDATE catalog_sources
+             SET active_revision = ?1
+             WHERE id = ?2
+               AND EXISTS (
+                   SELECT 1 FROM catalog_revisions
+                   WHERE source_id = ?2 AND commit_id = ?1 AND state = 'ready'
+               )",
+            params![revision.commit().as_str(), source.id().as_str()],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::NotFound);
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+}
+
+impl CatalogQueryRepository for SqliteStore {
+    type Error = StoreError;
+
+    fn list_catalog_sources_after(
+        &self,
+        after: Option<&CatalogSourceId>,
+        limit: usize,
+    ) -> Result<Vec<CatalogSource>, Self::Error> {
+        let mut statement = self.connection.prepare(
+            "SELECT sources.id, sources.url, sources.reference, sources.active_revision,
+                    revisions.state, revisions.document_count, revisions.failure_code
+             FROM catalog_sources AS sources
+             LEFT JOIN catalog_revisions AS revisions
+               ON revisions.source_id = sources.id
+              AND revisions.commit_id = sources.active_revision
+             WHERE (?1 IS NULL OR sources.id > ?1)
+             ORDER BY sources.id ASC
+             LIMIT ?2",
+        )?;
+        statement
+            .query_map(
+                params![
+                    after.map(CatalogSourceId::as_str),
+                    catalog_query_limit(limit)?
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                    ))
+                },
+            )?
+            .map(|row| {
+                let (id, url, reference, active_commit, state, document_count, failure_code) = row?;
+                let source_id = CatalogSourceId::new(id)
+                    .map_err(|error| StoreError::Domain(error.to_string()))?;
+                let mut source = CatalogSource::new(
+                    source_id.clone(),
+                    PublicCatalogUrl::new(url)
+                        .map_err(|error| StoreError::Domain(error.to_string()))?,
+                    CatalogReference::new(reference)
+                        .map_err(|error| StoreError::Domain(error.to_string()))?,
+                );
+                if let Some(commit) = active_commit {
+                    let revision = catalog_revision_from_persisted(
+                        source_id,
+                        CatalogCommitId::new(commit)
+                            .map_err(|error| StoreError::Domain(error.to_string()))?,
+                        state.as_deref().ok_or_else(|| {
+                            StoreError::Domain("catalog active revision is missing".to_owned())
+                        })?,
+                        document_count,
+                        failure_code.as_deref(),
+                    )?;
+                    source
+                        .activate(&revision)
+                        .map_err(|error| StoreError::Domain(error.to_string()))?;
+                }
+                Ok(source)
+            })
+            .collect::<Result<Vec<_>, _>>()
+    }
+
+    fn list_catalog_revisions_after(
+        &self,
+        source_id: &CatalogSourceId,
+        after: Option<&CatalogCommitId>,
+        limit: usize,
+    ) -> Result<Vec<CatalogRevision>, Self::Error> {
+        let mut statement = self.connection.prepare(
+            "SELECT commit_id, state, document_count, failure_code
+             FROM catalog_revisions
+             WHERE source_id = ?1 AND (?2 IS NULL OR commit_id > ?2)
+             ORDER BY commit_id ASC
+             LIMIT ?3",
+        )?;
+        statement
+            .query_map(
+                params![
+                    source_id.as_str(),
+                    after.map(CatalogCommitId::as_str),
+                    catalog_query_limit(limit)?
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )?
+            .map(|row| {
+                let (commit, state, document_count, failure_code) = row?;
+                catalog_revision_from_persisted(
+                    source_id.clone(),
+                    CatalogCommitId::new(commit)
+                        .map_err(|error| StoreError::Domain(error.to_string()))?,
+                    &state,
+                    document_count,
+                    failure_code.as_deref(),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()
+    }
+
+    fn list_catalog_documents_after(
+        &self,
+        source_id: &CatalogSourceId,
+        commit: &CatalogCommitId,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<CatalogDocument>, Self::Error> {
+        let mut statement = self.connection.prepare(
+            "SELECT path, kind, checksum
+             FROM catalog_documents
+             WHERE source_id = ?1 AND commit_id = ?2 AND (?3 IS NULL OR path > ?3)
+             ORDER BY path ASC
+             LIMIT ?4",
+        )?;
+        statement
+            .query_map(
+                params![
+                    source_id.as_str(),
+                    commit.as_str(),
+                    after,
+                    catalog_query_limit(limit)?
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )?
+            .map(|row| {
+                let (path, kind, checksum) = row?;
+                CatalogDocument::new(
+                    source_id.clone(),
+                    commit.clone(),
+                    catalog_document_kind_from_code(&kind)
+                        .map_err(|error| StoreError::Domain(error.to_string()))?,
+                    path,
+                    checksum,
+                )
+                .map_err(|error| StoreError::Domain(error.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()
+    }
+
+    fn find_catalog_document_detail(
+        &self,
+        source_id: &CatalogSourceId,
+        commit: &CatalogCommitId,
+        path: &str,
+    ) -> Result<Option<AppCatalogDocumentRecord>, Self::Error> {
+        CatalogRepository::find_catalog_document(self, source_id, commit, path)
+    }
+}
+
 impl AgentRepository for SqliteStore {
     type Error = StoreError;
 
@@ -4600,6 +5278,153 @@ fn postgres_connection_error() -> StoreError {
     StoreError::Postgres("postgres connection failed".to_owned())
 }
 
+fn catalog_revision_to_persisted(
+    revision: &CatalogRevision,
+) -> (&'static str, Option<i64>, Option<&'static str>) {
+    match revision.state() {
+        CatalogRevisionState::Fetching => ("fetching", None, None),
+        CatalogRevisionState::Validating => ("validating", None, None),
+        CatalogRevisionState::Ready { document_count } => {
+            ("ready", Some(document_count as i64), None)
+        }
+        CatalogRevisionState::Failed(failure) => {
+            ("failed", None, Some(catalog_sync_failure_to_code(failure)))
+        }
+    }
+}
+
+fn catalog_revision_from_persisted(
+    source_id: CatalogSourceId,
+    commit: CatalogCommitId,
+    state: &str,
+    document_count: Option<i64>,
+    failure_code: Option<&str>,
+) -> Result<CatalogRevision, StoreError> {
+    let state = match state {
+        "fetching" => CatalogRevisionState::Fetching,
+        "validating" => CatalogRevisionState::Validating,
+        "ready" => CatalogRevisionState::Ready {
+            document_count: document_count.filter(|count| *count > 0).ok_or_else(|| {
+                StoreError::Domain("catalog ready revision has no documents".to_owned())
+            })? as usize,
+        },
+        "failed" => {
+            CatalogRevisionState::Failed(catalog_sync_failure_from_code(failure_code.ok_or_else(
+                || StoreError::Domain("catalog failed revision has no failure code".to_owned()),
+            )?)?)
+        }
+        _ => {
+            return Err(StoreError::Domain(
+                "catalog revision state is invalid".to_owned(),
+            ));
+        }
+    };
+    CatalogRevision::restore(source_id, commit, state)
+        .map_err(|error| StoreError::Domain(error.to_string()))
+}
+
+fn catalog_sync_failure_to_code(failure: CatalogSyncFailure) -> &'static str {
+    match failure {
+        CatalogSyncFailure::FetchRejected => "fetch_rejected",
+        CatalogSyncFailure::FetchFailed => "fetch_failed",
+        CatalogSyncFailure::ValidationFailed => "validation_failed",
+        CatalogSyncFailure::LimitExceeded => "limit_exceeded",
+        CatalogSyncFailure::Cancelled => "cancelled",
+    }
+}
+
+fn catalog_sync_failure_from_code(value: &str) -> Result<CatalogSyncFailure, StoreError> {
+    match value {
+        "fetch_rejected" => Ok(CatalogSyncFailure::FetchRejected),
+        "fetch_failed" => Ok(CatalogSyncFailure::FetchFailed),
+        "validation_failed" => Ok(CatalogSyncFailure::ValidationFailed),
+        "limit_exceeded" => Ok(CatalogSyncFailure::LimitExceeded),
+        "cancelled" => Ok(CatalogSyncFailure::Cancelled),
+        _ => Err(StoreError::Domain(
+            "catalog sync failure code is invalid".to_owned(),
+        )),
+    }
+}
+
+fn catalog_sync_operation_to_persisted(
+    operation: &CatalogSyncOperation,
+) -> (&'static str, Option<&str>, Option<&'static str>) {
+    match operation.state() {
+        CatalogSyncOperationState::InProgress => (
+            "in_progress",
+            operation.commit().map(CatalogCommitId::as_str),
+            None,
+        ),
+        CatalogSyncOperationState::Completed => (
+            "completed",
+            operation.commit().map(CatalogCommitId::as_str),
+            None,
+        ),
+        CatalogSyncOperationState::Failed(failure) => (
+            "failed",
+            operation.commit().map(CatalogCommitId::as_str),
+            Some(catalog_sync_failure_to_code(failure)),
+        ),
+        CatalogSyncOperationState::Cancelled => (
+            "cancelled",
+            operation.commit().map(CatalogCommitId::as_str),
+            None,
+        ),
+    }
+}
+
+fn catalog_sync_operation_from_persisted(
+    id: CatalogSyncOperationId,
+    source_id: String,
+    commit_id: Option<String>,
+    state: &str,
+    failure_code: Option<&str>,
+) -> Result<CatalogSyncOperation, StoreError> {
+    let source_id =
+        CatalogSourceId::new(source_id).map_err(|error| StoreError::Domain(error.to_string()))?;
+    let commit = commit_id
+        .map(CatalogCommitId::new)
+        .transpose()
+        .map_err(|error| StoreError::Domain(error.to_string()))?;
+    let state = match state {
+        "in_progress" => CatalogSyncOperationState::InProgress,
+        "completed" => CatalogSyncOperationState::Completed,
+        "failed" => CatalogSyncOperationState::Failed(catalog_sync_failure_from_code(
+            failure_code.ok_or_else(|| {
+                StoreError::Domain("catalog failed sync operation has no failure code".to_owned())
+            })?,
+        )?),
+        "cancelled" => CatalogSyncOperationState::Cancelled,
+        _ => {
+            return Err(StoreError::Domain(
+                "catalog sync operation state is invalid".to_owned(),
+            ));
+        }
+    };
+    CatalogSyncOperation::restore(id, source_id, commit, state)
+        .map_err(|error| StoreError::Domain(error.to_string()))
+}
+
+fn catalog_document_kind_to_code(kind: CatalogDocumentKind) -> &'static str {
+    match kind {
+        CatalogDocumentKind::Policy => "policy",
+        CatalogDocumentKind::Runbook => "runbook",
+    }
+}
+
+fn catalog_document_kind_from_code(value: &str) -> Result<CatalogDocumentKind, CatalogError> {
+    match value {
+        "policy" => Ok(CatalogDocumentKind::Policy),
+        "runbook" => Ok(CatalogDocumentKind::Runbook),
+        _ => Err(CatalogError::InvalidDocumentPath),
+    }
+}
+
+fn catalog_query_limit(limit: usize) -> Result<i64, StoreError> {
+    i64::try_from(limit)
+        .map_err(|_| StoreError::Domain("catalog query limit exceeds database range".to_owned()))
+}
+
 #[cfg(feature = "postgres")]
 fn postgres_tls_adapter_error() -> StoreError {
     StoreError::Postgres("postgres TLS adapter initialization failed".to_owned())
@@ -4685,6 +5510,489 @@ fn postgres_insert_task_assignment_in_transaction(
         )
         .map_err(|_| postgres_error("postgres job target snapshot insert failed"))?;
     Ok(())
+}
+
+#[cfg(feature = "postgres")]
+impl CatalogRepository for PostgresStore {
+    type Error = StoreError;
+
+    fn save_catalog_source(&mut self, source: CatalogSource) -> Result<(), Self::Error> {
+        self.checkout_client()?
+            .execute(
+                "INSERT INTO catalog_sources (id, url, reference, active_revision)
+                 VALUES ($1, $2, $3, $4)",
+                &[
+                    &source.id().as_str(),
+                    &source.url().as_str(),
+                    &source.reference().as_str(),
+                    &source.active_revision().map(CatalogCommitId::as_str),
+                ],
+            )
+            .map(|_| ())
+            .map_err(|error| {
+                postgres_constraint_or_context(error, "postgres catalog source insert failed")
+            })
+    }
+
+    fn find_catalog_source(
+        &self,
+        source_id: &CatalogSourceId,
+    ) -> Result<Option<CatalogSource>, Self::Error> {
+        let row = self
+            .checkout_client()?
+            .query_opt(
+                "SELECT url, reference, active_revision FROM catalog_sources WHERE id = $1",
+                &[&source_id.as_str()],
+            )
+            .map_err(|_| postgres_error("postgres catalog source query failed"))?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let url: String = row.get(0);
+        let reference: String = row.get(1);
+        let active_revision: Option<String> = row.get(2);
+        let mut source = CatalogSource::new(
+            source_id.clone(),
+            PublicCatalogUrl::new(url).map_err(|error| StoreError::Domain(error.to_string()))?,
+            CatalogReference::new(reference)
+                .map_err(|error| StoreError::Domain(error.to_string()))?,
+        );
+        if let Some(active_revision) = active_revision {
+            let active_revision = CatalogCommitId::new(active_revision)
+                .map_err(|error| StoreError::Domain(error.to_string()))?;
+            let revision = self
+                .find_catalog_revision(source_id, &active_revision)?
+                .ok_or_else(|| {
+                    StoreError::Domain("catalog active revision is missing".to_owned())
+                })?;
+            source
+                .activate(&revision)
+                .map_err(|error| StoreError::Domain(error.to_string()))?;
+        }
+        Ok(Some(source))
+    }
+
+    fn find_catalog_revision(
+        &self,
+        source_id: &CatalogSourceId,
+        commit: &CatalogCommitId,
+    ) -> Result<Option<CatalogRevision>, Self::Error> {
+        let row = self
+            .checkout_client()?
+            .query_opt(
+                "SELECT state, document_count, failure_code
+                 FROM catalog_revisions WHERE source_id = $1 AND commit_id = $2",
+                &[&source_id.as_str(), &commit.as_str()],
+            )
+            .map_err(|_| postgres_error("postgres catalog revision query failed"))?;
+        row.map(|row| {
+            catalog_revision_from_persisted(
+                source_id.clone(),
+                commit.clone(),
+                &row.get::<_, String>(0),
+                row.get(1),
+                row.get::<_, Option<String>>(2).as_deref(),
+            )
+        })
+        .transpose()
+    }
+
+    fn save_catalog_revision(&mut self, revision: CatalogRevision) -> Result<(), Self::Error> {
+        let (state, document_count, failure_code) = catalog_revision_to_persisted(&revision);
+        let changed = self
+            .checkout_client()?
+            .execute(
+                "INSERT INTO catalog_revisions (source_id, commit_id, state, document_count, failure_code)
+                 VALUES ($1, $2, $3, $4, $5)
+                 ON CONFLICT (source_id, commit_id) DO UPDATE SET
+                    state = EXCLUDED.state,
+                    document_count = EXCLUDED.document_count,
+                    failure_code = EXCLUDED.failure_code
+                 WHERE catalog_revisions.state IN ('fetching', 'validating')",
+                &[
+                    &revision.source_id().as_str(),
+                    &revision.commit().as_str(),
+                    &state,
+                    &document_count,
+                    &failure_code,
+                ],
+            )
+            .map_err(|error| postgres_constraint_or_context(error, "postgres catalog revision save failed"))?;
+        if changed == 0 {
+            return Err(StoreError::ConstraintViolation(
+                "catalog terminal revision is immutable".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn begin_or_observe_catalog_sync_operation(
+        &mut self,
+        operation: CatalogSyncOperation,
+    ) -> Result<CatalogSyncOperation, Self::Error> {
+        let mut client = self.checkout_client()?;
+        let mut transaction = client
+            .transaction()
+            .map_err(|_| postgres_error("postgres catalog sync transaction failed"))?;
+        let inserted = transaction
+            .query_opt(
+                "INSERT INTO catalog_sync_operations (id, source_id, commit_id, state, failure_code)
+                 VALUES ($1, $2, NULL, 'in_progress', NULL)
+                 ON CONFLICT DO NOTHING
+                 RETURNING id",
+                &[&operation.id().as_str(), &operation.source_id().as_str()],
+            )
+            .map_err(|error| postgres_constraint_or_context(error, "postgres catalog sync insert failed"))?;
+        if inserted.is_some() {
+            transaction
+                .commit()
+                .map_err(|_| postgres_error("postgres catalog sync transaction commit failed"))?;
+            return Ok(operation);
+        }
+        let existing = transaction
+            .query_opt(
+                "SELECT id, source_id, commit_id, state, failure_code
+                 FROM catalog_sync_operations
+                 WHERE source_id = $1 AND state = 'in_progress'
+                 FOR UPDATE",
+                &[&operation.source_id().as_str()],
+            )
+            .map_err(|_| postgres_error("postgres active catalog sync query failed"))?
+            .map(|row| {
+                catalog_sync_operation_from_persisted(
+                    CatalogSyncOperationId::new(row.get::<_, String>(0))
+                        .map_err(|error| StoreError::Domain(error.to_string()))?,
+                    row.get::<_, String>(1),
+                    row.get(2),
+                    &row.get::<_, String>(3),
+                    row.get::<_, Option<String>>(4).as_deref(),
+                )
+            })
+            .transpose()?;
+        transaction
+            .commit()
+            .map_err(|_| postgres_error("postgres catalog sync transaction commit failed"))?;
+        existing.ok_or_else(|| {
+            StoreError::ConstraintViolation("catalog sync operation id already exists".to_owned())
+        })
+    }
+
+    fn save_catalog_sync_operation(
+        &mut self,
+        operation: CatalogSyncOperation,
+    ) -> Result<(), Self::Error> {
+        let (state, commit, failure_code) = catalog_sync_operation_to_persisted(&operation);
+        let changed = self
+            .checkout_client()?
+            .execute(
+                "UPDATE catalog_sync_operations
+                 SET commit_id = $3, state = $4, failure_code = $5
+                 WHERE id = $1 AND source_id = $2 AND state = 'in_progress'",
+                &[
+                    &operation.id().as_str(),
+                    &operation.source_id().as_str(),
+                    &commit,
+                    &state,
+                    &failure_code,
+                ],
+            )
+            .map_err(|error| {
+                postgres_constraint_or_context(error, "postgres catalog sync update failed")
+            })?;
+        if changed == 0 {
+            return Err(StoreError::ConstraintViolation(
+                "catalog terminal sync operation is immutable".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn find_catalog_sync_operation(
+        &self,
+        operation_id: &CatalogSyncOperationId,
+    ) -> Result<Option<CatalogSyncOperation>, Self::Error> {
+        let row = self
+            .checkout_client()?
+            .query_opt(
+                "SELECT source_id, commit_id, state, failure_code
+                 FROM catalog_sync_operations WHERE id = $1",
+                &[&operation_id.as_str()],
+            )
+            .map_err(|_| postgres_error("postgres catalog sync query failed"))?;
+        row.map(|row| {
+            catalog_sync_operation_from_persisted(
+                operation_id.clone(),
+                row.get(0),
+                row.get(1),
+                &row.get::<_, String>(2),
+                row.get::<_, Option<String>>(3).as_deref(),
+            )
+        })
+        .transpose()
+    }
+
+    fn save_catalog_document(
+        &mut self,
+        document: CatalogDocument,
+        body: String,
+    ) -> Result<(), Self::Error> {
+        self.checkout_client()?
+            .execute(
+                "INSERT INTO catalog_documents (source_id, commit_id, path, kind, checksum, body)
+                 VALUES ($1, $2, $3, $4, $5, $6)",
+                &[
+                    &document.source_id().as_str(),
+                    &document.commit().as_str(),
+                    &document.path(),
+                    &catalog_document_kind_to_code(document.kind()),
+                    &document.checksum(),
+                    &body,
+                ],
+            )
+            .map(|_| ())
+            .map_err(|error| {
+                postgres_constraint_or_context(error, "postgres catalog document insert failed")
+            })
+    }
+
+    fn reuse_catalog_document(&mut self, document: CatalogDocument) -> Result<(), Self::Error> {
+        let copied = self
+            .checkout_client()?
+            .execute(
+                "INSERT INTO catalog_documents (source_id, commit_id, path, kind, checksum, body)
+                 SELECT $1, $2, $3, $4, $5, body
+                 FROM catalog_documents
+                 WHERE source_id = $1 AND checksum = $5
+                 LIMIT 1",
+                &[
+                    &document.source_id().as_str(),
+                    &document.commit().as_str(),
+                    &document.path(),
+                    &catalog_document_kind_to_code(document.kind()),
+                    &document.checksum(),
+                ],
+            )
+            .map_err(|error| {
+                postgres_constraint_or_context(error, "postgres catalog document reuse failed")
+            })?;
+        if copied != 1 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
+    }
+
+    fn find_catalog_document(
+        &self,
+        source_id: &CatalogSourceId,
+        commit: &CatalogCommitId,
+        path: &str,
+    ) -> Result<Option<AppCatalogDocumentRecord>, Self::Error> {
+        let row = self
+            .checkout_client()?
+            .query_opt(
+                "SELECT kind, checksum, body FROM catalog_documents
+                 WHERE source_id = $1 AND commit_id = $2 AND path = $3",
+                &[&source_id.as_str(), &commit.as_str(), &path],
+            )
+            .map_err(|_| postgres_error("postgres catalog document query failed"))?;
+        row.map(|row| {
+            Ok(AppCatalogDocumentRecord {
+                document: CatalogDocument::new(
+                    source_id.clone(),
+                    commit.clone(),
+                    catalog_document_kind_from_code(&row.get::<_, String>(0))
+                        .map_err(|error| StoreError::Domain(error.to_string()))?,
+                    path,
+                    row.get::<_, String>(1),
+                )
+                .map_err(|error| StoreError::Domain(error.to_string()))?,
+                body: row.get(2),
+            })
+        })
+        .transpose()
+    }
+
+    fn activate_catalog_revision(
+        &mut self,
+        source: CatalogSource,
+        revision: &CatalogRevision,
+    ) -> Result<(), Self::Error> {
+        let active_revision = source.active_revision().ok_or_else(|| {
+            StoreError::Domain("catalog source has no active revision to persist".to_owned())
+        })?;
+        if active_revision != revision.commit() || revision.source_id() != source.id() {
+            return Err(StoreError::Domain(
+                "catalog source activation does not match revision".to_owned(),
+            ));
+        }
+        let mut client = self.checkout_client()?;
+        let mut transaction = client
+            .transaction()
+            .map_err(|_| postgres_error("postgres catalog activation transaction failed"))?;
+        let changed = transaction
+            .execute(
+                "UPDATE catalog_sources SET active_revision = $2
+                 WHERE id = $1
+                   AND EXISTS (
+                     SELECT 1 FROM catalog_revisions
+                     WHERE source_id = $1 AND commit_id = $2 AND state = 'ready'
+                   )",
+                &[&source.id().as_str(), &active_revision.as_str()],
+            )
+            .map_err(|error| {
+                postgres_constraint_or_context(error, "postgres catalog activation failed")
+            })?;
+        if changed != 1 {
+            return Err(StoreError::ConstraintViolation(
+                "catalog activation requires a ready revision".to_owned(),
+            ));
+        }
+        transaction
+            .commit()
+            .map_err(|_| postgres_error("postgres catalog activation transaction commit failed"))?;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl CatalogQueryRepository for PostgresStore {
+    type Error = StoreError;
+
+    fn list_catalog_sources_after(
+        &self,
+        after: Option<&CatalogSourceId>,
+        limit: usize,
+    ) -> Result<Vec<CatalogSource>, Self::Error> {
+        self.checkout_client()?
+            .query(
+                "SELECT sources.id, sources.url, sources.reference, sources.active_revision,
+                        revisions.state, revisions.document_count, revisions.failure_code
+                 FROM catalog_sources AS sources
+                 LEFT JOIN catalog_revisions AS revisions
+                   ON revisions.source_id = sources.id
+                  AND revisions.commit_id = sources.active_revision
+                 WHERE ($1::TEXT IS NULL OR sources.id > $1)
+                 ORDER BY sources.id ASC
+                 LIMIT $2",
+                &[
+                    &after.map(CatalogSourceId::as_str),
+                    &catalog_query_limit(limit)?,
+                ],
+            )
+            .map_err(|_| postgres_error("postgres catalog source page query failed"))?
+            .into_iter()
+            .map(|row| {
+                let source_id = CatalogSourceId::new(row.get::<_, String>(0))
+                    .map_err(|error| StoreError::Domain(error.to_string()))?;
+                let mut source = CatalogSource::new(
+                    source_id.clone(),
+                    PublicCatalogUrl::new(row.get::<_, String>(1))
+                        .map_err(|error| StoreError::Domain(error.to_string()))?,
+                    CatalogReference::new(row.get::<_, String>(2))
+                        .map_err(|error| StoreError::Domain(error.to_string()))?,
+                );
+                let active_commit: Option<String> = row.get(3);
+                if let Some(commit) = active_commit {
+                    let state: Option<String> = row.get(4);
+                    let revision = catalog_revision_from_persisted(
+                        source_id,
+                        CatalogCommitId::new(commit)
+                            .map_err(|error| StoreError::Domain(error.to_string()))?,
+                        state.as_deref().ok_or_else(|| {
+                            StoreError::Domain("catalog active revision is missing".to_owned())
+                        })?,
+                        row.get(5),
+                        row.get::<_, Option<String>>(6).as_deref(),
+                    )?;
+                    source
+                        .activate(&revision)
+                        .map_err(|error| StoreError::Domain(error.to_string()))?;
+                }
+                Ok(source)
+            })
+            .collect()
+    }
+
+    fn list_catalog_revisions_after(
+        &self,
+        source_id: &CatalogSourceId,
+        after: Option<&CatalogCommitId>,
+        limit: usize,
+    ) -> Result<Vec<CatalogRevision>, Self::Error> {
+        self.checkout_client()?
+            .query(
+                "SELECT commit_id, state, document_count, failure_code
+                 FROM catalog_revisions
+                 WHERE source_id = $1 AND ($2::TEXT IS NULL OR commit_id > $2)
+                 ORDER BY commit_id ASC
+                 LIMIT $3",
+                &[
+                    &source_id.as_str(),
+                    &after.map(CatalogCommitId::as_str),
+                    &catalog_query_limit(limit)?,
+                ],
+            )
+            .map_err(|_| postgres_error("postgres catalog revision page query failed"))?
+            .into_iter()
+            .map(|row| {
+                catalog_revision_from_persisted(
+                    source_id.clone(),
+                    CatalogCommitId::new(row.get::<_, String>(0))
+                        .map_err(|error| StoreError::Domain(error.to_string()))?,
+                    &row.get::<_, String>(1),
+                    row.get(2),
+                    row.get::<_, Option<String>>(3).as_deref(),
+                )
+            })
+            .collect()
+    }
+
+    fn list_catalog_documents_after(
+        &self,
+        source_id: &CatalogSourceId,
+        commit: &CatalogCommitId,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<CatalogDocument>, Self::Error> {
+        self.checkout_client()?
+            .query(
+                "SELECT path, kind, checksum
+                 FROM catalog_documents
+                 WHERE source_id = $1 AND commit_id = $2
+                   AND ($3::TEXT IS NULL OR path > $3)
+                 ORDER BY path ASC
+                 LIMIT $4",
+                &[
+                    &source_id.as_str(),
+                    &commit.as_str(),
+                    &after,
+                    &catalog_query_limit(limit)?,
+                ],
+            )
+            .map_err(|_| postgres_error("postgres catalog document page query failed"))?
+            .into_iter()
+            .map(|row| {
+                CatalogDocument::new(
+                    source_id.clone(),
+                    commit.clone(),
+                    catalog_document_kind_from_code(&row.get::<_, String>(1))
+                        .map_err(|error| StoreError::Domain(error.to_string()))?,
+                    row.get::<_, String>(0),
+                    row.get::<_, String>(2),
+                )
+                .map_err(|error| StoreError::Domain(error.to_string()))
+            })
+            .collect()
+    }
+
+    fn find_catalog_document_detail(
+        &self,
+        source_id: &CatalogSourceId,
+        commit: &CatalogCommitId,
+        path: &str,
+    ) -> Result<Option<AppCatalogDocumentRecord>, Self::Error> {
+        CatalogRepository::find_catalog_document(self, source_id, commit, path)
+    }
 }
 
 #[cfg(feature = "postgres")]
@@ -6266,6 +7574,59 @@ impl RunbookJobRepository for PostgresStore {
             .map_err(|_| postgres_error("postgres transaction commit failed"))?;
         Ok(())
     }
+
+    fn save_catalog_runbook_job_with_assignments(
+        &mut self,
+        job: Job,
+        task: &RunbookExecutionTask,
+        provenance: &fleet_domain::CatalogRunbookProvenance,
+        assignments: &[TaskEnvelope],
+    ) -> Result<(), <Self as TaskAssignmentRepository>::Error> {
+        let mut client = self.checkout_client()?;
+        let mut transaction = client
+            .transaction()
+            .map_err(|_| postgres_error("postgres catalog runbook transaction failed"))?;
+        transaction
+            .execute(
+                "INSERT INTO jobs (id, status, risk, approval_requirement, timeout_ms, runbook_document)
+                 VALUES ($1, $2, $3, $4, $5, $6)",
+                &[
+                    &job.id().as_str(),
+                    &job_status_to_str(job.status()),
+                    &task_risk_to_str(job.risk()),
+                    &approval_requirement_to_str(job.approval_requirement()),
+                    &(job.timeout().as_millis() as i64),
+                    &task.runbook_document(),
+                ],
+            )
+            .map_err(|error| postgres_constraint_or_context(error, "postgres catalog runbook insert failed"))?;
+        transaction
+            .execute(
+                "INSERT INTO job_catalog_runbook_provenance
+                    (job_id, source_id, commit_id, path, checksum)
+                 VALUES ($1, $2, $3, $4, $5)",
+                &[
+                    &job.id().as_str(),
+                    &provenance.source_id().as_str(),
+                    &provenance.commit().as_str(),
+                    &provenance.path(),
+                    &provenance.checksum(),
+                ],
+            )
+            .map_err(|error| {
+                postgres_constraint_or_context(
+                    error,
+                    "postgres catalog runbook provenance insert failed",
+                )
+            })?;
+        for assignment in assignments {
+            postgres_insert_task_assignment_in_transaction(&mut transaction, assignment)?;
+        }
+        transaction
+            .commit()
+            .map_err(|_| postgres_error("postgres catalog runbook transaction commit failed"))?;
+        Ok(())
+    }
 }
 
 #[cfg(feature = "postgres")]
@@ -6539,6 +7900,14 @@ impl PolicyRepository for PostgresStore {
         source: &str,
     ) -> Result<(), Self::Error> {
         postgres_save_policy_source(self, policy_id, name, version, source)
+    }
+
+    fn publish_catalog_policy_source(
+        &mut self,
+        policy: &fleet_domain::Policy,
+        provenance: &CatalogPolicyProvenance,
+    ) -> Result<CatalogPolicyPublishOutcome, Self::Error> {
+        postgres_publish_catalog_policy_source(self, policy, provenance)
     }
 
     fn list_policies(&self) -> Result<Vec<AppPolicyRecord>, Self::Error> {
@@ -7698,6 +9067,16 @@ impl RunbookJobRepository for SqliteStore {
     ) -> Result<(), <Self as TaskAssignmentRepository>::Error> {
         self.save_runbook_job_with_assignments_record(&job, task, assignments)
     }
+
+    fn save_catalog_runbook_job_with_assignments(
+        &mut self,
+        job: Job,
+        task: &RunbookExecutionTask,
+        provenance: &fleet_domain::CatalogRunbookProvenance,
+        assignments: &[TaskEnvelope],
+    ) -> Result<(), <Self as TaskAssignmentRepository>::Error> {
+        self.save_catalog_runbook_job_with_assignments_record(&job, task, provenance, assignments)
+    }
 }
 
 impl JobOutputRepository for SqliteStore {
@@ -8159,6 +9538,14 @@ impl PolicyRepository for SqliteStore {
         source: &str,
     ) -> Result<(), Self::Error> {
         SqliteStore::save_policy_source(self, policy_id, name, version, source)
+    }
+
+    fn publish_catalog_policy_source(
+        &mut self,
+        policy: &fleet_domain::Policy,
+        provenance: &CatalogPolicyProvenance,
+    ) -> Result<CatalogPolicyPublishOutcome, Self::Error> {
+        SqliteStore::publish_catalog_policy_source(self, policy, provenance)
     }
 
     fn list_policies(&self) -> Result<Vec<AppPolicyRecord>, Self::Error> {
@@ -9174,6 +10561,89 @@ fn postgres_save_policy_source(
         )
         .map(|_| ())
         .map_err(|_| postgres_error("postgres policy source upsert failed"))
+}
+
+#[cfg(feature = "postgres")]
+fn postgres_publish_catalog_policy_source(
+    store: &PostgresStore,
+    policy: &fleet_domain::Policy,
+    provenance: &CatalogPolicyProvenance,
+) -> Result<CatalogPolicyPublishOutcome, StoreError> {
+    let mut client = store.checkout_client()?;
+    let mut transaction = client
+        .transaction()
+        .map_err(|_| postgres_error("postgres policy publication transaction failed"))?;
+    let existing_source = transaction
+        .query_opt(
+            "SELECT source_id FROM policy_catalog_provenance WHERE policy_id = $1",
+            &[&policy.id],
+        )
+        .map_err(|_| postgres_error("postgres catalog policy provenance query failed"))?
+        .map(|row| row.get::<_, String>(0));
+    if let Some(existing_source) = existing_source {
+        if existing_source != provenance.source_id().as_str() {
+            transaction
+                .commit()
+                .map_err(|_| postgres_error("postgres transaction commit failed"))?;
+            return Ok(CatalogPolicyPublishOutcome::OtherCatalogSourceConflict);
+        }
+    } else {
+        let policy_exists = transaction
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM policies WHERE id = $1)",
+                &[&policy.id],
+            )
+            .map_err(|_| postgres_error("postgres policy ownership query failed"))?
+            .get::<_, bool>(0);
+        if policy_exists {
+            transaction
+                .commit()
+                .map_err(|_| postgres_error("postgres transaction commit failed"))?;
+            return Ok(CatalogPolicyPublishOutcome::ManualPolicyConflict);
+        }
+    }
+    transaction
+        .execute(
+            "INSERT INTO policies (id, name, version, source, created_at, updated_at)
+             VALUES ($1, $2, $3, $4,
+                     EXTRACT(EPOCH FROM now())::BIGINT,
+                     EXTRACT(EPOCH FROM now())::BIGINT)
+             ON CONFLICT(id) DO UPDATE SET
+                name = excluded.name,
+                version = excluded.version,
+                source = excluded.source,
+                updated_at = excluded.updated_at",
+            &[
+                &policy.id,
+                &policy.name,
+                &i64::from(policy.version),
+                &policy.source,
+            ],
+        )
+        .map_err(|_| postgres_error("postgres catalog policy upsert failed"))?;
+    transaction
+        .execute(
+            "INSERT INTO policy_catalog_provenance
+                (policy_id, source_id, commit_id, path, checksum)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT(policy_id) DO UPDATE SET
+                source_id = excluded.source_id,
+                commit_id = excluded.commit_id,
+                path = excluded.path,
+                checksum = excluded.checksum",
+            &[
+                &policy.id,
+                &provenance.source_id().as_str(),
+                &provenance.commit().as_str(),
+                &provenance.path(),
+                &provenance.checksum(),
+            ],
+        )
+        .map_err(|_| postgres_error("postgres catalog policy provenance upsert failed"))?;
+    transaction
+        .commit()
+        .map_err(|_| postgres_error("postgres transaction commit failed"))?;
+    Ok(CatalogPolicyPublishOutcome::Published)
 }
 
 #[cfg(feature = "postgres")]
@@ -11820,6 +13290,92 @@ CREATE TABLE IF NOT EXISTS policies (
     updated_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS catalog_sources (
+    id TEXT PRIMARY KEY,
+    url TEXT NOT NULL,
+    reference TEXT NOT NULL,
+    active_revision TEXT
+);
+
+CREATE TABLE IF NOT EXISTS catalog_revisions (
+    source_id TEXT NOT NULL REFERENCES catalog_sources(id) ON DELETE CASCADE,
+    commit_id TEXT NOT NULL,
+    state TEXT NOT NULL,
+    document_count INTEGER,
+    failure_code TEXT,
+    PRIMARY KEY (source_id, commit_id)
+);
+
+CREATE INDEX IF NOT EXISTS catalog_revisions_source_state_idx
+    ON catalog_revisions (source_id, state, commit_id);
+
+CREATE TRIGGER IF NOT EXISTS catalog_revisions_terminal_state_immutable
+BEFORE UPDATE OF state, document_count, failure_code ON catalog_revisions
+WHEN OLD.state IN ('ready', 'failed')
+ AND (NEW.state IS NOT OLD.state
+      OR NEW.document_count IS NOT OLD.document_count
+      OR NEW.failure_code IS NOT OLD.failure_code)
+BEGIN
+    SELECT RAISE(ABORT, 'catalog terminal revision is immutable');
+END;
+
+CREATE TABLE IF NOT EXISTS catalog_sync_operations (
+    id TEXT PRIMARY KEY,
+    source_id TEXT NOT NULL REFERENCES catalog_sources(id) ON DELETE CASCADE,
+    commit_id TEXT,
+    state TEXT NOT NULL,
+    failure_code TEXT
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS catalog_sync_operations_one_active_source_idx
+    ON catalog_sync_operations (source_id)
+    WHERE state = 'in_progress';
+
+CREATE TRIGGER IF NOT EXISTS catalog_sync_operations_terminal_state_immutable
+BEFORE UPDATE OF commit_id, state, failure_code ON catalog_sync_operations
+WHEN OLD.state <> 'in_progress'
+ AND (NEW.commit_id IS NOT OLD.commit_id
+      OR NEW.state IS NOT OLD.state
+      OR NEW.failure_code IS NOT OLD.failure_code)
+BEGIN
+    SELECT RAISE(ABORT, 'catalog terminal sync operation is immutable');
+END;
+
+CREATE TABLE IF NOT EXISTS catalog_documents (
+    source_id TEXT NOT NULL,
+    commit_id TEXT NOT NULL,
+    path TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    checksum TEXT NOT NULL,
+    body TEXT NOT NULL,
+    PRIMARY KEY (source_id, commit_id, path),
+    FOREIGN KEY (source_id, commit_id)
+        REFERENCES catalog_revisions(source_id, commit_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS catalog_documents_source_commit_path_idx
+    ON catalog_documents (source_id, commit_id, path);
+
+CREATE TABLE IF NOT EXISTS job_catalog_runbook_provenance (
+    job_id TEXT PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+    source_id TEXT NOT NULL,
+    commit_id TEXT NOT NULL,
+    path TEXT NOT NULL,
+    checksum TEXT NOT NULL,
+    FOREIGN KEY (source_id, commit_id, path)
+        REFERENCES catalog_documents(source_id, commit_id, path) ON DELETE RESTRICT
+);
+
+CREATE TABLE IF NOT EXISTS policy_catalog_provenance (
+    policy_id TEXT PRIMARY KEY REFERENCES policies(id) ON DELETE CASCADE,
+    source_id TEXT NOT NULL,
+    commit_id TEXT NOT NULL,
+    path TEXT NOT NULL,
+    checksum TEXT NOT NULL,
+    FOREIGN KEY (source_id, commit_id, path)
+        REFERENCES catalog_documents(source_id, commit_id, path) ON DELETE RESTRICT
+);
+
 CREATE TABLE IF NOT EXISTS policy_assignments (
     policy_id TEXT NOT NULL REFERENCES policies(id) ON DELETE CASCADE,
     agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
@@ -11847,6 +13403,7 @@ CREATE TABLE IF NOT EXISTS agent_log_chunks (
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fleet_application::{CatalogQueryRepository, CatalogRepository};
 
     fn agent() -> Agent {
         agent_with_id("a1", "web-01", "0123456789abcdef")
@@ -11885,6 +13442,715 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_catalog_repository_preserves_active_ready_revision_and_failed_attempt_after_reopen() {
+        let root = artifact_test_root("catalog-repository");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("catalog.db");
+        let source = fleet_domain::CatalogSource::new(
+            fleet_domain::CatalogSourceId::new("public-catalog").unwrap(),
+            fleet_domain::PublicCatalogUrl::new("https://example.com/catalog.git").unwrap(),
+            fleet_domain::CatalogReference::new("main").unwrap(),
+        );
+        let ready_commit = fleet_domain::CatalogCommitId::new("a".repeat(40)).unwrap();
+        let failed_commit = fleet_domain::CatalogCommitId::new("b".repeat(40)).unwrap();
+        let mut ready = source.begin_sync(ready_commit.clone());
+        ready.begin_validation().unwrap();
+        ready.mark_ready(2).unwrap();
+        let mut failed = source.begin_sync(failed_commit.clone());
+        failed
+            .fail(fleet_domain::CatalogSyncFailure::ValidationFailed)
+            .unwrap();
+
+        {
+            let mut store = SqliteStore::open(&path).unwrap();
+            store.save_catalog_source(source.clone()).unwrap();
+            store.save_catalog_revision(ready.clone()).unwrap();
+            let mut active_source = source.clone();
+            active_source.activate(&ready).unwrap();
+            store
+                .activate_catalog_revision(active_source, &ready)
+                .unwrap();
+            store.save_catalog_revision(failed.clone()).unwrap();
+        }
+
+        let store = SqliteStore::open(&path).unwrap();
+        let restored_source = store
+            .find_catalog_source(source.id())
+            .unwrap()
+            .expect("catalog source must persist");
+        assert_eq!(restored_source.active_revision(), Some(&ready_commit));
+        assert_eq!(
+            store
+                .find_catalog_revision(source.id(), &failed_commit)
+                .unwrap(),
+            Some(failed)
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sqlite_catalog_repository_refuses_to_rewrite_a_terminal_revision() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        let source = fleet_domain::CatalogSource::new(
+            fleet_domain::CatalogSourceId::new("public-catalog").unwrap(),
+            fleet_domain::PublicCatalogUrl::new("https://example.com/catalog.git").unwrap(),
+            fleet_domain::CatalogReference::new("main").unwrap(),
+        );
+        let commit = fleet_domain::CatalogCommitId::new("a".repeat(40)).unwrap();
+        let mut ready = source.begin_sync(commit.clone());
+        ready.begin_validation().unwrap();
+        ready.mark_ready(1).unwrap();
+        let failed = fleet_domain::CatalogRevision::restore(
+            source.id().clone(),
+            commit.clone(),
+            fleet_domain::CatalogRevisionState::Failed(
+                fleet_domain::CatalogSyncFailure::ValidationFailed,
+            ),
+        )
+        .unwrap();
+
+        store.save_catalog_source(source.clone()).unwrap();
+        store.save_catalog_revision(ready.clone()).unwrap();
+        assert!(matches!(
+            store.save_catalog_revision(failed),
+            Err(StoreError::ConstraintViolation(_))
+        ));
+        assert_eq!(
+            store.find_catalog_revision(source.id(), &commit).unwrap(),
+            Some(ready)
+        );
+    }
+
+    #[test]
+    fn sqlite_catalog_sync_operation_observes_one_active_operation_per_source_after_reopen() {
+        let root = artifact_test_root("catalog-sync-operation");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("catalog.db");
+        let source = fleet_domain::CatalogSource::new(
+            fleet_domain::CatalogSourceId::new("public-catalog").unwrap(),
+            fleet_domain::PublicCatalogUrl::new("https://example.com/catalog.git").unwrap(),
+            fleet_domain::CatalogReference::new("main").unwrap(),
+        );
+        let requested = fleet_domain::CatalogSyncOperation::new(
+            fleet_domain::CatalogSyncOperationId::new("sync-001").unwrap(),
+            source.id().clone(),
+        );
+
+        {
+            let mut store = SqliteStore::open(&path).unwrap();
+            store.save_catalog_source(source.clone()).unwrap();
+            let active = store
+                .begin_or_observe_catalog_sync_operation(requested.clone())
+                .unwrap();
+            let observed = store
+                .begin_or_observe_catalog_sync_operation(fleet_domain::CatalogSyncOperation::new(
+                    fleet_domain::CatalogSyncOperationId::new("sync-duplicate").unwrap(),
+                    source.id().clone(),
+                ))
+                .unwrap();
+            assert_eq!(observed.id(), active.id());
+
+            let other_source = fleet_domain::CatalogSource::new(
+                fleet_domain::CatalogSourceId::new("other-catalog").unwrap(),
+                fleet_domain::PublicCatalogUrl::new("https://example.com/other.git").unwrap(),
+                fleet_domain::CatalogReference::new("main").unwrap(),
+            );
+            store.save_catalog_source(other_source.clone()).unwrap();
+            let other_active = store
+                .begin_or_observe_catalog_sync_operation(fleet_domain::CatalogSyncOperation::new(
+                    fleet_domain::CatalogSyncOperationId::new("sync-other").unwrap(),
+                    other_source.id().clone(),
+                ))
+                .unwrap();
+            assert_ne!(other_active.id(), active.id());
+
+            let mut failed = active;
+            failed
+                .bind_commit(fleet_domain::CatalogCommitId::new("a".repeat(40)).unwrap())
+                .unwrap();
+            failed
+                .fail(fleet_domain::CatalogSyncFailure::FetchFailed)
+                .unwrap();
+            store.save_catalog_sync_operation(failed.clone()).unwrap();
+        }
+
+        let mut store = SqliteStore::open(&path).unwrap();
+        assert_eq!(
+            store
+                .find_catalog_sync_operation(
+                    &fleet_domain::CatalogSyncOperationId::new("sync-001").unwrap(),
+                )
+                .unwrap()
+                .expect("terminal operation must persist")
+                .state(),
+            fleet_domain::CatalogSyncOperationState::Failed(
+                fleet_domain::CatalogSyncFailure::FetchFailed
+            )
+        );
+        let replacement = store
+            .begin_or_observe_catalog_sync_operation(fleet_domain::CatalogSyncOperation::new(
+                fleet_domain::CatalogSyncOperationId::new("sync-002").unwrap(),
+                source.id().clone(),
+            ))
+            .unwrap();
+        assert_eq!(replacement.id().as_str(), "sync-002");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sqlite_catalog_sync_operation_refuses_to_rewrite_terminal_state() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        let source = fleet_domain::CatalogSource::new(
+            fleet_domain::CatalogSourceId::new("public-catalog").unwrap(),
+            fleet_domain::PublicCatalogUrl::new("https://example.com/catalog.git").unwrap(),
+            fleet_domain::CatalogReference::new("main").unwrap(),
+        );
+        let operation_id = fleet_domain::CatalogSyncOperationId::new("sync-001").unwrap();
+        let mut operation =
+            fleet_domain::CatalogSyncOperation::new(operation_id.clone(), source.id().clone());
+        operation
+            .bind_commit(fleet_domain::CatalogCommitId::new("a".repeat(40)).unwrap())
+            .unwrap();
+        operation
+            .fail(fleet_domain::CatalogSyncFailure::FetchFailed)
+            .unwrap();
+        let overwritten = fleet_domain::CatalogSyncOperation::restore(
+            operation_id,
+            source.id().clone(),
+            operation.commit().cloned(),
+            fleet_domain::CatalogSyncOperationState::Cancelled,
+        )
+        .unwrap();
+
+        store.save_catalog_source(source).unwrap();
+        store
+            .begin_or_observe_catalog_sync_operation(fleet_domain::CatalogSyncOperation::new(
+                fleet_domain::CatalogSyncOperationId::new("sync-001").unwrap(),
+                fleet_domain::CatalogSourceId::new("public-catalog").unwrap(),
+            ))
+            .unwrap();
+        store.save_catalog_sync_operation(operation).unwrap();
+        assert!(matches!(
+            store.save_catalog_sync_operation(overwritten),
+            Err(StoreError::ConstraintViolation(_))
+        ));
+    }
+
+    #[test]
+    fn sqlite_catalog_document_repository_roundtrips_validated_body_after_reopen() {
+        let root = artifact_test_root("catalog-document");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("catalog.db");
+        let source = fleet_domain::CatalogSource::new(
+            fleet_domain::CatalogSourceId::new("public-catalog").unwrap(),
+            fleet_domain::PublicCatalogUrl::new("https://example.com/catalog.git").unwrap(),
+            fleet_domain::CatalogReference::new("main").unwrap(),
+        );
+        let commit = fleet_domain::CatalogCommitId::new("a".repeat(40)).unwrap();
+        let mut revision = source.begin_sync(commit.clone());
+        revision.begin_validation().unwrap();
+        revision.mark_ready(1).unwrap();
+        let document = fleet_domain::CatalogDocument::new(
+            source.id().clone(),
+            commit.clone(),
+            fleet_domain::CatalogDocumentKind::Runbook,
+            "runbooks/nginx.yaml",
+            "c".repeat(64),
+        )
+        .unwrap();
+        let body = "apiVersion: fleet.sponzey.dev/v1alpha1\nkind: Runbook\nname: nginx\n";
+
+        {
+            let mut store = SqliteStore::open(&path).unwrap();
+            store.save_catalog_source(source.clone()).unwrap();
+            store.save_catalog_revision(revision).unwrap();
+            store
+                .save_catalog_document(document.clone(), body.to_owned())
+                .unwrap();
+        }
+
+        let store = SqliteStore::open(&path).unwrap();
+        let restored = store
+            .find_catalog_document(source.id(), &commit, document.path())
+            .unwrap()
+            .expect("catalog document must persist");
+        assert_eq!(restored.document, document);
+        assert_eq!(restored.body, body);
+
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sqlite_catalog_document_repository_reuses_a_source_checksum_without_new_body_input() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        let source = fleet_domain::CatalogSource::new(
+            fleet_domain::CatalogSourceId::new("public-catalog").unwrap(),
+            fleet_domain::PublicCatalogUrl::new("https://example.com/catalog.git").unwrap(),
+            fleet_domain::CatalogReference::new("main").unwrap(),
+        );
+        let old_commit = fleet_domain::CatalogCommitId::new("a".repeat(40)).unwrap();
+        let new_commit = fleet_domain::CatalogCommitId::new("b".repeat(40)).unwrap();
+        let mut old_revision = source.begin_sync(old_commit.clone());
+        old_revision.begin_validation().unwrap();
+        old_revision.mark_ready(1).unwrap();
+        let mut new_revision = source.begin_sync(new_commit.clone());
+        new_revision.begin_validation().unwrap();
+        new_revision.mark_ready(1).unwrap();
+        let old_document = fleet_domain::CatalogDocument::new(
+            source.id().clone(),
+            old_commit,
+            fleet_domain::CatalogDocumentKind::Runbook,
+            "runbooks/nginx.yaml",
+            "c".repeat(64),
+        )
+        .unwrap();
+        let new_document = fleet_domain::CatalogDocument::new(
+            source.id().clone(),
+            new_commit.clone(),
+            fleet_domain::CatalogDocumentKind::Runbook,
+            "runbooks/nginx.yaml",
+            "c".repeat(64),
+        )
+        .unwrap();
+
+        store.save_catalog_source(source.clone()).unwrap();
+        store.save_catalog_revision(old_revision).unwrap();
+        store.save_catalog_revision(new_revision).unwrap();
+        store
+            .save_catalog_document(old_document, "previous body".to_owned())
+            .unwrap();
+        store.reuse_catalog_document(new_document.clone()).unwrap();
+
+        assert_eq!(
+            store
+                .find_catalog_document(source.id(), &new_commit, new_document.path())
+                .unwrap()
+                .expect("reused document must exist")
+                .body,
+            "previous body"
+        );
+    }
+
+    #[test]
+    fn sqlite_catalog_query_repository_pages_durable_provenance_without_listing_bodies() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        let mut source_a = fleet_domain::CatalogSource::new(
+            fleet_domain::CatalogSourceId::new("catalog-a").unwrap(),
+            fleet_domain::PublicCatalogUrl::new("https://a.example.com/catalog.git").unwrap(),
+            fleet_domain::CatalogReference::new("main").unwrap(),
+        );
+        let source_b = fleet_domain::CatalogSource::new(
+            fleet_domain::CatalogSourceId::new("catalog-b").unwrap(),
+            fleet_domain::PublicCatalogUrl::new("https://b.example.com/catalog.git").unwrap(),
+            fleet_domain::CatalogReference::new("main").unwrap(),
+        );
+        let source_c = fleet_domain::CatalogSource::new(
+            fleet_domain::CatalogSourceId::new("catalog-c").unwrap(),
+            fleet_domain::PublicCatalogUrl::new("https://c.example.com/catalog.git").unwrap(),
+            fleet_domain::CatalogReference::new("main").unwrap(),
+        );
+        let commit_a = fleet_domain::CatalogCommitId::new("a".repeat(40)).unwrap();
+        let commit_b = fleet_domain::CatalogCommitId::new("b".repeat(40)).unwrap();
+        let commit_c = fleet_domain::CatalogCommitId::new("c".repeat(40)).unwrap();
+        let mut revision_a = source_a.begin_sync(commit_a.clone());
+        revision_a.begin_validation().unwrap();
+        revision_a.mark_ready(1).unwrap();
+        let mut revision_b = source_a.begin_sync(commit_b.clone());
+        revision_b.begin_validation().unwrap();
+        revision_b.mark_ready(3).unwrap();
+        let mut revision_c = source_a.begin_sync(commit_c.clone());
+        revision_c.begin_validation().unwrap();
+        revision_c.mark_ready(1).unwrap();
+
+        store.save_catalog_source(source_a.clone()).unwrap();
+        store.save_catalog_source(source_b.clone()).unwrap();
+        store.save_catalog_source(source_c.clone()).unwrap();
+        store.save_catalog_revision(revision_a).unwrap();
+        store.save_catalog_revision(revision_b.clone()).unwrap();
+        store.save_catalog_revision(revision_c).unwrap();
+        for (path, kind, body) in [
+            (
+                "policies/nginx.yaml",
+                fleet_domain::CatalogDocumentKind::Policy,
+                "policy body",
+            ),
+            (
+                "runbooks/cache.yaml",
+                fleet_domain::CatalogDocumentKind::Runbook,
+                "cache body",
+            ),
+            (
+                "runbooks/nginx.yaml",
+                fleet_domain::CatalogDocumentKind::Runbook,
+                "nginx body",
+            ),
+        ] {
+            store
+                .save_catalog_document(
+                    fleet_domain::CatalogDocument::new(
+                        source_a.id().clone(),
+                        commit_b.clone(),
+                        kind,
+                        path,
+                        "d".repeat(64),
+                    )
+                    .unwrap(),
+                    body.to_owned(),
+                )
+                .unwrap();
+        }
+        source_a.activate(&revision_b).unwrap();
+        store
+            .activate_catalog_revision(source_a.clone(), &revision_b)
+            .unwrap();
+
+        let first_sources = store.list_catalog_sources_after(None, 2).unwrap();
+        assert_eq!(
+            first_sources
+                .iter()
+                .map(|source| source.id().as_str())
+                .collect::<Vec<_>>(),
+            vec!["catalog-a", "catalog-b"]
+        );
+        assert_eq!(first_sources[0].active_revision(), Some(&commit_b));
+        assert_eq!(
+            store
+                .list_catalog_sources_after(Some(source_b.id()), 2)
+                .unwrap()
+                .iter()
+                .map(|source| source.id().as_str())
+                .collect::<Vec<_>>(),
+            vec!["catalog-c"]
+        );
+
+        assert_eq!(
+            store
+                .list_catalog_revisions_after(source_a.id(), None, 2)
+                .unwrap()
+                .iter()
+                .map(|revision| revision.commit().as_str())
+                .collect::<Vec<_>>(),
+            vec![commit_a.as_str(), commit_b.as_str()]
+        );
+        assert_eq!(
+            store
+                .list_catalog_revisions_after(source_a.id(), Some(&commit_b), 2)
+                .unwrap()
+                .iter()
+                .map(|revision| revision.commit().as_str())
+                .collect::<Vec<_>>(),
+            vec![commit_c.as_str()]
+        );
+
+        let first_documents = store
+            .list_catalog_documents_after(source_a.id(), &commit_b, None, 2)
+            .unwrap();
+        assert_eq!(
+            first_documents
+                .iter()
+                .map(fleet_domain::CatalogDocument::path)
+                .collect::<Vec<_>>(),
+            vec!["policies/nginx.yaml", "runbooks/cache.yaml"]
+        );
+        assert_eq!(
+            store
+                .list_catalog_documents_after(
+                    source_a.id(),
+                    &commit_b,
+                    Some("runbooks/cache.yaml"),
+                    2,
+                )
+                .unwrap()
+                .iter()
+                .map(fleet_domain::CatalogDocument::path)
+                .collect::<Vec<_>>(),
+            vec!["runbooks/nginx.yaml"]
+        );
+        assert_eq!(
+            store
+                .find_catalog_document_detail(source_a.id(), &commit_b, "runbooks/nginx.yaml")
+                .unwrap()
+                .expect("document detail exists")
+                .body,
+            "nginx body"
+        );
+    }
+
+    #[test]
+    fn sqlite_catalog_document_cursor_reads_one_thousand_rows_in_ten_indexed_pages() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        let source = fleet_domain::CatalogSource::new(
+            fleet_domain::CatalogSourceId::new("catalog-benchmark").unwrap(),
+            fleet_domain::PublicCatalogUrl::new("https://benchmark.example.com/catalog.git")
+                .unwrap(),
+            fleet_domain::CatalogReference::new("main").unwrap(),
+        );
+        let commit = fleet_domain::CatalogCommitId::new("a".repeat(40)).unwrap();
+        let mut revision = source.begin_sync(commit.clone());
+        revision.begin_validation().unwrap();
+        revision.mark_ready(1_000).unwrap();
+        store.save_catalog_source(source.clone()).unwrap();
+        store.save_catalog_revision(revision).unwrap();
+        for index in 0..1_000 {
+            store
+                .save_catalog_document(
+                    fleet_domain::CatalogDocument::new(
+                        source.id().clone(),
+                        commit.clone(),
+                        fleet_domain::CatalogDocumentKind::Runbook,
+                        format!("runbooks/{index:04}.yaml"),
+                        format!("{index:064x}"),
+                    )
+                    .unwrap(),
+                    "previously validated body".to_owned(),
+                )
+                .unwrap();
+        }
+
+        let mut after = None;
+        let mut page_count = 0;
+        let mut document_count = 0;
+        loop {
+            let page = store
+                .list_catalog_documents_after(source.id(), &commit, after.as_deref(), 101)
+                .unwrap();
+            if page.is_empty() {
+                break;
+            }
+            page_count += 1;
+            document_count += page.len().min(100);
+            after = page.get(99).map(|document| document.path().to_owned());
+            if page.len() <= 100 {
+                break;
+            }
+        }
+
+        assert_eq!(page_count, 10);
+        assert_eq!(document_count, 1_000);
+    }
+
+    #[test]
+    fn sqlite_catalog_document_repository_refuses_to_replace_same_revision_path() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        let source = fleet_domain::CatalogSource::new(
+            fleet_domain::CatalogSourceId::new("public-catalog").unwrap(),
+            fleet_domain::PublicCatalogUrl::new("https://example.com/catalog.git").unwrap(),
+            fleet_domain::CatalogReference::new("main").unwrap(),
+        );
+        let commit = fleet_domain::CatalogCommitId::new("a".repeat(40)).unwrap();
+        let mut revision = source.begin_sync(commit.clone());
+        revision.begin_validation().unwrap();
+        revision.mark_ready(1).unwrap();
+        let document = fleet_domain::CatalogDocument::new(
+            source.id().clone(),
+            commit.clone(),
+            fleet_domain::CatalogDocumentKind::Runbook,
+            "runbooks/nginx.yaml",
+            "c".repeat(64),
+        )
+        .unwrap();
+        let replacement = fleet_domain::CatalogDocument::new(
+            source.id().clone(),
+            commit.clone(),
+            fleet_domain::CatalogDocumentKind::Runbook,
+            "runbooks/nginx.yaml",
+            "d".repeat(64),
+        )
+        .unwrap();
+
+        store.save_catalog_source(source.clone()).unwrap();
+        store.save_catalog_revision(revision).unwrap();
+        store
+            .save_catalog_document(document.clone(), "version: one".to_owned())
+            .unwrap();
+        assert!(matches!(
+            store.save_catalog_document(replacement, "version: two".to_owned()),
+            Err(StoreError::ConstraintViolation(_))
+        ));
+
+        let saved = store
+            .find_catalog_document(source.id(), &commit, document.path())
+            .unwrap()
+            .expect("original catalog document must remain readable");
+        assert_eq!(saved.document, document);
+        assert_eq!(saved.body, "version: one");
+    }
+
+    #[test]
+    fn sqlite_catalog_runbook_job_persists_immutable_document_provenance() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        let source = CatalogSource::new(
+            CatalogSourceId::new("catalog-runbook").unwrap(),
+            PublicCatalogUrl::new("https://example.com/fleet/catalog.git").unwrap(),
+            CatalogReference::new("main").unwrap(),
+        );
+        let commit = CatalogCommitId::new("a".repeat(40)).unwrap();
+        let mut revision = source.begin_sync(commit.clone());
+        revision.begin_validation().unwrap();
+        revision.mark_ready(1).unwrap();
+        let document = CatalogDocument::new(
+            source.id().clone(),
+            commit.clone(),
+            CatalogDocumentKind::Runbook,
+            "runbooks/nginx.yaml",
+            "c".repeat(64),
+        )
+        .unwrap();
+        let provenance = fleet_domain::CatalogRunbookProvenance::from_document(&document).unwrap();
+        store.save_catalog_source(source).unwrap();
+        store.save_catalog_revision(revision).unwrap();
+        store
+            .save_catalog_document(document, "kind: Runbook".to_owned())
+            .unwrap();
+        let task = RunbookExecutionTask::new("kind: Runbook", Duration::from_secs(30)).unwrap();
+        let job = Job::new(
+            JobId::new("catalog-runbook-job").unwrap(),
+            task.risk(),
+            fleet_domain::ApprovalRequirement::ManualApproval,
+            task.timeout(),
+        );
+
+        store
+            .save_catalog_runbook_job_with_assignments_record(&job, &task, &provenance, &[])
+            .unwrap();
+
+        let persisted = store
+            .connection
+            .query_row(
+                "SELECT source_id, commit_id, path, checksum
+                 FROM job_catalog_runbook_provenance WHERE job_id = ?1",
+                [job.id().as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            persisted,
+            (
+                "catalog-runbook".to_owned(),
+                commit.as_str().to_owned(),
+                "runbooks/nginx.yaml".to_owned(),
+                "c".repeat(64),
+            )
+        );
+        assert!(store
+            .connection
+            .execute(
+                "DELETE FROM catalog_documents WHERE source_id = ?1 AND commit_id = ?2 AND path = ?3",
+                ["catalog-runbook", commit.as_str(), "runbooks/nginx.yaml"],
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn sqlite_catalog_policy_publish_preserves_owner_and_document_provenance() {
+        let mut store = SqliteStore::in_memory().unwrap();
+        let source = CatalogSource::new(
+            CatalogSourceId::new("catalog-policy").unwrap(),
+            PublicCatalogUrl::new("https://example.com/fleet/catalog.git").unwrap(),
+            CatalogReference::new("main").unwrap(),
+        );
+        let commit = CatalogCommitId::new("b".repeat(40)).unwrap();
+        let mut revision = source.begin_sync(commit.clone());
+        revision.begin_validation().unwrap();
+        revision.mark_ready(1).unwrap();
+        let document = CatalogDocument::new(
+            source.id().clone(),
+            commit.clone(),
+            CatalogDocumentKind::Policy,
+            "policies/nginx.yaml",
+            "e".repeat(64),
+        )
+        .unwrap();
+        let provenance = CatalogPolicyProvenance::from_document(&document).unwrap();
+        let policy = fleet_domain::parse_policy_document(
+            "apiVersion: fleet.sponzey.dev/v1alpha1\nkind: Policy\nmetadata:\n  name: nginx-running\nspec:\n  selector:\n    matchLabels:\n      role: web\n  checks:\n    - id: nginx-service\n      service:\n        name: nginx\n        state: running\n",
+        )
+        .unwrap();
+        store.save_catalog_source(source).unwrap();
+        store.save_catalog_revision(revision).unwrap();
+        store
+            .save_catalog_document(document, policy.source.clone())
+            .unwrap();
+
+        assert_eq!(
+            store
+                .publish_catalog_policy_source(&policy, &provenance)
+                .unwrap(),
+            CatalogPolicyPublishOutcome::Published
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT source_id, commit_id, path, checksum
+                     FROM policy_catalog_provenance WHERE policy_id = ?1",
+                    [policy.id.as_str()],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                        ))
+                    },
+                )
+                .unwrap(),
+            (
+                "catalog-policy".to_owned(),
+                commit.as_str().to_owned(),
+                "policies/nginx.yaml".to_owned(),
+                "e".repeat(64),
+            )
+        );
+        assert!(store
+            .connection
+            .execute(
+                "DELETE FROM catalog_documents WHERE source_id = ?1 AND commit_id = ?2 AND path = ?3",
+                ["catalog-policy", commit.as_str(), "policies/nginx.yaml"],
+            )
+            .is_err());
+
+        store
+            .save_policy_source("manual-policy", "manual-policy", 1, "kind: Policy")
+            .unwrap();
+        let manual_policy = fleet_domain::Policy {
+            id: "manual-policy".to_owned(),
+            ..policy.clone()
+        };
+        assert_eq!(
+            store
+                .publish_catalog_policy_source(&manual_policy, &provenance)
+                .unwrap(),
+            CatalogPolicyPublishOutcome::ManualPolicyConflict
+        );
+        let other_document = CatalogDocument::new(
+            CatalogSourceId::new("other-catalog").unwrap(),
+            CatalogCommitId::new("f".repeat(40)).unwrap(),
+            CatalogDocumentKind::Policy,
+            "policies/nginx.yaml",
+            "d".repeat(64),
+        )
+        .unwrap();
+        let other_provenance = CatalogPolicyProvenance::from_document(&other_document).unwrap();
+        assert_eq!(
+            store
+                .publish_catalog_policy_source(&policy, &other_provenance)
+                .unwrap(),
+            CatalogPolicyPublishOutcome::OtherCatalogSourceConflict
+        );
+    }
+
+    #[test]
     fn migration_is_repeatable() {
         let store = SqliteStore::in_memory().unwrap();
         store.migrate().unwrap();
@@ -11910,6 +14176,30 @@ mod tests {
         assert!(store.has_column("task_assignments", "accepted_at").unwrap());
         assert!(store.has_column("admin_tokens", "actor_id").unwrap());
         assert!(store.has_column("admin_tokens", "role").unwrap());
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'table' AND name = 'job_catalog_runbook_provenance'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'table' AND name = 'policy_catalog_provenance'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
         assert!(
             store
                 .has_column("rendered_artifacts", "checksum_sha256")
@@ -12026,6 +14316,25 @@ mod tests {
         assert!(store.has_column("jobs", "drift_policy_version").unwrap());
         assert!(store.has_column("jobs", "drift_purpose").unwrap());
         assert!(store.has_column("jobs", "runbook_document").unwrap());
+        assert!(
+            store
+                .has_column("catalog_sources", "active_revision")
+                .unwrap()
+        );
+        assert!(store.has_column("catalog_revisions", "commit_id").unwrap());
+        assert!(store.has_column("catalog_revisions", "state").unwrap());
+        assert!(store.has_column("catalog_documents", "checksum").unwrap());
+        assert!(store.has_column("catalog_documents", "body").unwrap());
+        assert!(
+            store
+                .has_column("catalog_sync_operations", "source_id")
+                .unwrap()
+        );
+        assert!(
+            store
+                .has_column("catalog_sync_operations", "state")
+                .unwrap()
+        );
         assert!(
             store
                 .has_column("remediation_requests", "origin_drift_report_id")
@@ -12680,6 +14989,18 @@ mod tests {
 
     #[cfg(feature = "postgres")]
     #[test]
+    fn postgres_store_implements_catalog_repository_trait() {
+        fn assert_trait<S>()
+        where
+            S: CatalogRepository<Error = StoreError> + CatalogQueryRepository<Error = StoreError>,
+        {
+        }
+
+        assert_trait::<PostgresStore>();
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
     #[ignore = "requires explicit FLEET_TEST_POSTGRES_URL and a disposable Postgres database"]
     fn postgres_migration_records_current_schema_version() {
         let Ok(url) = std::env::var("FLEET_TEST_POSTGRES_URL") else {
@@ -12692,6 +15013,93 @@ mod tests {
         assert_eq!(
             store.schema_version().unwrap(),
             Some(CURRENT_SCHEMA_VERSION)
+        );
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    #[ignore = "requires explicit FLEET_TEST_POSTGRES_URL and a disposable Postgres database"]
+    fn postgres_catalog_repository_roundtrips_source_operation_document_and_activation() {
+        let Ok(url) = std::env::var("FLEET_TEST_POSTGRES_URL") else {
+            return;
+        };
+        let mut store = PostgresStore::connect(&url).unwrap();
+        store.migrate().unwrap();
+
+        store
+            .checkout_client()
+            .unwrap()
+            .batch_execute(
+                "DELETE FROM catalog_documents;
+                 DELETE FROM catalog_sync_operations;
+                 DELETE FROM catalog_revisions;
+                 DELETE FROM catalog_sources;",
+            )
+            .unwrap();
+
+        let source = CatalogSource::new(
+            CatalogSourceId::new("public-catalog").unwrap(),
+            PublicCatalogUrl::new("https://example.com/catalog.git").unwrap(),
+            CatalogReference::new("main").unwrap(),
+        );
+        let commit = CatalogCommitId::new("a".repeat(40)).unwrap();
+        let mut revision = source.begin_sync(commit.clone());
+        revision.begin_validation().unwrap();
+        revision.mark_ready(1).unwrap();
+        let document = CatalogDocument::new(
+            source.id().clone(),
+            commit.clone(),
+            CatalogDocumentKind::Runbook,
+            "runbooks/nginx.yaml",
+            "c".repeat(64),
+        )
+        .unwrap();
+        let mut operation = CatalogSyncOperation::new(
+            CatalogSyncOperationId::new("sync-001").unwrap(),
+            source.id().clone(),
+        );
+
+        store.save_catalog_source(source.clone()).unwrap();
+        store.save_catalog_revision(revision.clone()).unwrap();
+        assert_eq!(
+            store
+                .begin_or_observe_catalog_sync_operation(operation.clone())
+                .unwrap(),
+            operation
+        );
+        operation.bind_commit(commit.clone()).unwrap();
+        operation.complete(&revision).unwrap();
+        store
+            .save_catalog_sync_operation(operation.clone())
+            .unwrap();
+        store
+            .save_catalog_document(document.clone(), "kind: Runbook".to_owned())
+            .unwrap();
+        let mut active_source = source.clone();
+        active_source.activate(&revision).unwrap();
+        store
+            .activate_catalog_revision(active_source, &revision)
+            .unwrap();
+
+        assert_eq!(
+            store
+                .find_catalog_source(source.id())
+                .unwrap()
+                .unwrap()
+                .active_revision(),
+            Some(&commit)
+        );
+        assert_eq!(
+            store.find_catalog_sync_operation(operation.id()).unwrap(),
+            Some(operation)
+        );
+        assert_eq!(
+            store
+                .find_catalog_document(source.id(), &commit, document.path())
+                .unwrap()
+                .unwrap()
+                .body,
+            "kind: Runbook"
         );
     }
 

@@ -34,6 +34,9 @@ PORT="${FLEET_PORT:-7700}"
 WORK_DIR="${TMPDIR:-/tmp}/fleet-nginx-runbook-smoke-$$"
 
 cleanup() {
+  if [ -n "${AGENT_PID:-}" ]; then
+    kill "$AGENT_PID" 2>/dev/null || true
+  fi
   if [ -n "${CONTROLLER_PID:-}" ]; then
     kill "$CONTROLLER_PID" 2>/dev/null || true
   fi
@@ -75,6 +78,24 @@ TOKEN="$("$BIN" enroll-token create --data-dir "$WORK_DIR" --labels role=web,env
   --token "$TOKEN" \
   --name web-01 \
   --labels role=web,env=manual
+"$BIN" agent start --data-dir "$WORK_DIR" > "$WORK_DIR/agent.log" 2>&1 &
+AGENT_PID="$!"
+
+i=0
+AGENTS_API=""
+while [ "$i" -lt 50 ]; do
+  AGENTS_API="$(curl -fsS -H "Authorization: Bearer $ADMIN_TOKEN" "http://127.0.0.1:$PORT/api/agents" 2>/dev/null || true)"
+  case "$AGENTS_API" in
+    *'"id":"agent-web-01"'*'"status":"online"'*) break ;;
+  esac
+  i=$((i + 1))
+  sleep 0.2
+done
+if [ "$i" -eq 50 ]; then
+  cat "$WORK_DIR/agent.log" >&2
+  echo "agent did not become online: $AGENTS_API" >&2
+  exit 1
+fi
 
 REQUEST="$WORK_DIR/runbook-request.json"
 cat > "$REQUEST" <<'JSON'
@@ -91,13 +112,41 @@ cat > "$REQUEST" <<'JSON'
 }
 JSON
 
-curl -fsS \
+RUNBOOK_CREATE_API="$(curl -fsS \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   --data-binary "@$REQUEST" \
-  "http://127.0.0.1:$PORT/api/jobs/runbook" >/dev/null
+  "http://127.0.0.1:$PORT/api/jobs/runbook")"
+RUNBOOK_APPROVAL_ID="$(printf '%s\n' "$RUNBOOK_CREATE_API" | sed -n 's/.*"approval_request_id":"\([^"]*\)".*/\1/p')"
+if [ -z "$RUNBOOK_APPROVAL_ID" ]; then
+  echo "runbook approval id was not returned" >&2
+  exit 1
+fi
+curl -fsS \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"reason":"approved by manual Linux smoke"}' \
+  "http://127.0.0.1:$PORT/api/approvals/$RUNBOOK_APPROVAL_ID/approve" >/dev/null
 
-"$BIN" agent start --data-dir "$WORK_DIR" --once
+i=0
+RUNBOOK_JOB_API=""
+while [ "$i" -lt 900 ]; do
+  RUNBOOK_JOB_API="$(curl -fsS -H "Authorization: Bearer $ADMIN_TOKEN" "http://127.0.0.1:$PORT/api/jobs/job-nginx-runbook-1" 2>/dev/null || true)"
+  case "$RUNBOOK_JOB_API" in
+    *'"status":"success"'*|*'"status":"failed"'*|*'"status":"expired"'*) break ;;
+  esac
+  i=$((i + 1))
+  sleep 0.2
+done
+case "$RUNBOOK_JOB_API" in
+  *'"status":"success"'*) ;;
+  *)
+    cat "$WORK_DIR/controller.log" >&2
+    cat "$WORK_DIR/agent.log" >&2
+    echo "nginx runbook did not succeed: $RUNBOOK_JOB_API" >&2
+    exit 1
+    ;;
+esac
 
 if ! systemctl is-active nginx.service >/dev/null 2>&1; then
   echo "nginx.service is not active after runbook execution" >&2

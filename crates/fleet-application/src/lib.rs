@@ -2,15 +2,20 @@ use fleet_domain::{
     Agent, AgentCapabilitySnapshot, AgentError, AgentId, AgentLabel, AgentStatus, ApprovalId,
     ApprovalRequest, ApprovalStatus, ArtifactChecksum, ArtifactId, ArtifactRetentionClass,
     AuditActor, AuditCategory, AuditEvent, AuditTarget, AuditValue, CapabilitySnapshotStatus,
-    CommandTask, DriftCheckTask, DriftJobProvenance, DriftReport, DriftReportId,
-    DriftReportProvenance, DriftStatus, Job, JobError, JobId, JobStatus, JobTarget, Policy,
-    RemediationRequest, RemediationStatus, RenderedArtifactMetadata, RunbookExecutionTask,
-    RuntimePrimitive, SecretRef, Selector, TaskEnvelope, TaskExpiry, TaskId, TaskKind, TaskNonce,
-    TaskSignature, TemplateRenderError, TemplateSecretResolutionFailure, TemplateVariableValue,
-    VerifiedDriftEvidence, approval_requirement_for_task, scheduled_drift_due,
+    CatalogCommitId, CatalogDocument, CatalogDocumentKind, CatalogError, CatalogPolicyProvenance,
+    CatalogReference, CatalogRevision, CatalogRevisionState, CatalogSource, CatalogSourceId,
+    CatalogSyncFailure, CatalogSyncOperation, CatalogSyncOperationId, CommandTask, DriftCheckTask,
+    DriftJobProvenance, DriftReport, DriftReportId, DriftReportProvenance, DriftStatus, Job,
+    JobError, JobId, JobStatus, JobTarget, Policy, PublicCatalogUrl, RemediationRequest,
+    RemediationStatus, RenderedArtifactMetadata, RunbookExecutionTask, RuntimePrimitive, SecretRef,
+    Selector, TaskEnvelope, TaskExpiry, TaskId, TaskKind, TaskNonce, TaskSignature,
+    TemplateRenderError, TemplateSecretResolutionFailure, TemplateVariableValue,
+    VerifiedDriftEvidence, approval_requirement_for_task, parse_policy_document,
+    parse_runbook_document, scheduled_drift_due,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Debug, Display, Formatter};
+use std::sync::{Arc, atomic::AtomicBool};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub trait AgentRepository {
@@ -135,6 +140,1796 @@ pub trait AuditWriter {
     type Error;
 
     fn write(&mut self, event: AuditEvent) -> Result<(), Self::Error>;
+}
+
+/// Persistence boundary for catalog source registration, revision lookup, and activation.
+///
+/// Implementations must make `activate_catalog_revision` atomic with any persisted active
+/// pointer or publication state; callers have already applied the domain activation guard.
+pub trait CatalogRepository {
+    type Error;
+
+    fn save_catalog_source(&mut self, source: CatalogSource) -> Result<(), Self::Error>;
+    fn find_catalog_source(
+        &self,
+        source_id: &CatalogSourceId,
+    ) -> Result<Option<CatalogSource>, Self::Error>;
+    fn find_catalog_revision(
+        &self,
+        source_id: &CatalogSourceId,
+        commit: &CatalogCommitId,
+    ) -> Result<Option<CatalogRevision>, Self::Error>;
+    /// Saves a state transition for one immutable source/commit revision.
+    fn save_catalog_revision(&mut self, revision: CatalogRevision) -> Result<(), Self::Error>;
+    /// Atomically returns the source's existing active operation or persists the supplied request.
+    fn begin_or_observe_catalog_sync_operation(
+        &mut self,
+        operation: CatalogSyncOperation,
+    ) -> Result<CatalogSyncOperation, Self::Error>;
+    fn save_catalog_sync_operation(
+        &mut self,
+        operation: CatalogSyncOperation,
+    ) -> Result<(), Self::Error>;
+    fn find_catalog_sync_operation(
+        &self,
+        operation_id: &CatalogSyncOperationId,
+    ) -> Result<Option<CatalogSyncOperation>, Self::Error>;
+    fn save_catalog_document(
+        &mut self,
+        document: CatalogDocument,
+        body: String,
+    ) -> Result<(), Self::Error>;
+    /// Persists a new immutable document provenance row by copying a body already validated for
+    /// the same source and checksum. Implementations fail when no such durable body exists.
+    fn reuse_catalog_document(&mut self, document: CatalogDocument) -> Result<(), Self::Error>;
+    fn find_catalog_document(
+        &self,
+        source_id: &CatalogSourceId,
+        commit: &CatalogCommitId,
+        path: &str,
+    ) -> Result<Option<CatalogDocumentRecord>, Self::Error>;
+    fn activate_catalog_revision(
+        &mut self,
+        source: CatalogSource,
+        revision: &CatalogRevision,
+    ) -> Result<(), Self::Error>;
+}
+
+/// Validated catalog source text with its immutable document provenance.
+///
+/// This is durable catalog data for detail lookup and later job snapshot creation, not an audit
+/// or product-log payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogDocumentRecord {
+    pub document: CatalogDocument,
+    pub body: String,
+}
+
+/// A durable catalog query boundary. Implementations read only persisted catalog state and must
+/// not invoke a Git transport, refresh a source, or otherwise perform remote I/O.
+pub trait CatalogQueryRepository {
+    type Error;
+
+    fn list_catalog_sources_after(
+        &self,
+        after: Option<&CatalogSourceId>,
+        limit: usize,
+    ) -> Result<Vec<CatalogSource>, Self::Error>;
+    fn list_catalog_revisions_after(
+        &self,
+        source_id: &CatalogSourceId,
+        after: Option<&CatalogCommitId>,
+        limit: usize,
+    ) -> Result<Vec<CatalogRevision>, Self::Error>;
+    fn list_catalog_documents_after(
+        &self,
+        source_id: &CatalogSourceId,
+        commit: &CatalogCommitId,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<CatalogDocument>, Self::Error>;
+    /// Returns the raw validated body only for one previously selected durable document.
+    fn find_catalog_document_detail(
+        &self,
+        source_id: &CatalogSourceId,
+        commit: &CatalogCommitId,
+        path: &str,
+    ) -> Result<Option<CatalogDocumentRecord>, Self::Error>;
+}
+
+pub const MAX_CATALOG_PAGE_SIZE: usize = 100;
+
+/// One stable, exclusive cursor page of durable catalog records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogPage<Record, Cursor> {
+    pub records: Vec<Record>,
+    pub next_after: Option<Cursor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatalogPageQueryError<RepositoryError> {
+    InvalidLimit { requested: usize },
+    Repository(RepositoryError),
+}
+
+impl<RepositoryError> Display for CatalogPageQueryError<RepositoryError>
+where
+    RepositoryError: Display,
+{
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidLimit { requested } => write!(
+                formatter,
+                "catalog page limit must be between 1 and {MAX_CATALOG_PAGE_SIZE}, got {requested}"
+            ),
+            Self::Repository(error) => write!(formatter, "catalog repository error: {error}"),
+        }
+    }
+}
+
+/// Reads a bounded, source-id ordered page from the durable catalog index.
+pub struct ListCatalogSources;
+
+impl ListCatalogSources {
+    pub fn execute<R>(
+        repository: &R,
+        after: Option<CatalogSourceId>,
+        limit: usize,
+    ) -> Result<CatalogPage<CatalogSource, CatalogSourceId>, CatalogPageQueryError<R::Error>>
+    where
+        R: CatalogQueryRepository,
+    {
+        ensure_catalog_page_limit(limit)?;
+        let records = repository
+            .list_catalog_sources_after(after.as_ref(), catalog_page_fetch_limit(limit))
+            .map_err(CatalogPageQueryError::Repository)?;
+        Ok(catalog_page(records, limit, |source| source.id().clone()))
+    }
+}
+
+/// Reads a bounded, commit-id ordered page for one durable catalog source.
+pub struct ListCatalogRevisions;
+
+impl ListCatalogRevisions {
+    pub fn execute<R>(
+        repository: &R,
+        source_id: &CatalogSourceId,
+        after: Option<CatalogCommitId>,
+        limit: usize,
+    ) -> Result<CatalogPage<CatalogRevision, CatalogCommitId>, CatalogPageQueryError<R::Error>>
+    where
+        R: CatalogQueryRepository,
+    {
+        ensure_catalog_page_limit(limit)?;
+        let records = repository
+            .list_catalog_revisions_after(
+                source_id,
+                after.as_ref(),
+                catalog_page_fetch_limit(limit),
+            )
+            .map_err(CatalogPageQueryError::Repository)?;
+        Ok(catalog_page(records, limit, |revision| {
+            revision.commit().clone()
+        }))
+    }
+}
+
+/// Reads a bounded, path ordered document-provenance page without copying document bodies.
+pub struct ListCatalogDocuments;
+
+impl ListCatalogDocuments {
+    pub fn execute<R>(
+        repository: &R,
+        source_id: &CatalogSourceId,
+        commit: &CatalogCommitId,
+        after: Option<String>,
+        limit: usize,
+    ) -> Result<CatalogPage<CatalogDocument, String>, CatalogPageQueryError<R::Error>>
+    where
+        R: CatalogQueryRepository,
+    {
+        ensure_catalog_page_limit(limit)?;
+        let records = repository
+            .list_catalog_documents_after(
+                source_id,
+                commit,
+                after.as_deref(),
+                catalog_page_fetch_limit(limit),
+            )
+            .map_err(CatalogPageQueryError::Repository)?;
+        Ok(catalog_page(records, limit, |document| {
+            document.path().to_owned()
+        }))
+    }
+}
+
+/// Looks up a single durable catalog document detail. Authorization belongs to the interface
+/// boundary that selects this use case; list pages deliberately never include `body`.
+pub struct GetCatalogDocumentDetail;
+
+impl GetCatalogDocumentDetail {
+    pub fn execute<R>(
+        repository: &R,
+        source_id: &CatalogSourceId,
+        commit: &CatalogCommitId,
+        path: &str,
+    ) -> Result<Option<CatalogDocumentRecord>, R::Error>
+    where
+        R: CatalogQueryRepository,
+    {
+        repository.find_catalog_document_detail(source_id, commit, path)
+    }
+}
+
+fn catalog_page_fetch_limit(limit: usize) -> usize {
+    limit.saturating_add(1)
+}
+
+fn ensure_catalog_page_limit<RepositoryError>(
+    limit: usize,
+) -> Result<(), CatalogPageQueryError<RepositoryError>> {
+    if !(1..=MAX_CATALOG_PAGE_SIZE).contains(&limit) {
+        return Err(CatalogPageQueryError::InvalidLimit { requested: limit });
+    }
+    Ok(())
+}
+
+fn catalog_page<Record, Cursor>(
+    mut records: Vec<Record>,
+    limit: usize,
+    cursor: impl Fn(&Record) -> Cursor,
+) -> CatalogPage<Record, Cursor> {
+    let next_after = if records.len() > limit {
+        records.pop();
+        records.last().map(cursor)
+    } else {
+        None
+    };
+    CatalogPage {
+        records,
+        next_after,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisterCatalogSourceInput {
+    pub source_id: String,
+    pub url: String,
+    pub reference: String,
+    pub actor: String,
+    pub occurred_at: SystemTime,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivateCatalogRevisionInput {
+    pub source_id: String,
+    pub commit: String,
+    pub actor: String,
+    pub occurred_at: SystemTime,
+}
+
+/// Starts a durable source-scoped catalog sync request.
+///
+/// The interface supplies the operation identifier; it does not carry a URL, credential, or
+/// network setting. Repeated requests observe the source's active operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartCatalogSyncInput {
+    pub source_id: String,
+    pub operation_id: String,
+}
+
+/// One public catalog document already collected by an outer fetch adapter.
+///
+/// Its body stays inside the application/repository path and is never copied into audit data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogFetchedDocument {
+    pub kind: CatalogDocumentKind,
+    pub path: String,
+    pub checksum: String,
+    pub body: String,
+}
+
+/// Boundary owned by the application for a public catalog fetch.
+///
+/// Implementations resolve the configured ref to an immutable commit and return only already
+/// bounded, public document data. They must not accept credentials through this model.
+pub trait CatalogFetchCancellation {
+    /// Returns true when the controller has abandoned this fetch operation.
+    fn is_cancelled(&self) -> bool;
+
+    /// Shares the controller-owned signal with a transport that must interrupt native I/O.
+    ///
+    /// Stateless test doubles may return `None`; production adapters use the signal only to close
+    /// resources they already own and never to expose controller runtime state to the domain.
+    fn shared_signal(&self) -> Option<Arc<AtomicBool>> {
+        None
+    }
+}
+
+/// Fetches one public catalog source under a controller-owned cancellation signal.
+pub trait CatalogFetcher {
+    type Error;
+
+    fn fetch_public_catalog(
+        &self,
+        source: &CatalogSource,
+        cancellation: &dyn CatalogFetchCancellation,
+    ) -> Result<CatalogFetchResult, Self::Error>;
+}
+
+/// Immutable fetch output handed from a controller adapter to the catalog sync reducer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogFetchResult {
+    pub commit: String,
+    pub documents: Vec<CatalogFetchedDocument>,
+}
+
+/// Completes validation for a single immutable commit returned by an outer fetch adapter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompleteCatalogSyncInput {
+    pub operation_id: String,
+    pub result: CatalogFetchResult,
+}
+
+/// Records a terminal non-cancellation failure after an outer fetch attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailCatalogSyncInput {
+    pub operation_id: String,
+    pub failure: CatalogSyncFailure,
+}
+
+/// Cancels an active sync when its controller-owned worker is shut down or explicitly stopped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CancelCatalogSyncInput {
+    pub operation_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatalogUseCaseError<RepositoryError, AuditError> {
+    Domain(CatalogError),
+    AlreadyExists,
+    SourceNotFound,
+    RevisionNotFound,
+    SyncOperationNotFound,
+    ValidationFailed,
+    Repository(RepositoryError),
+    Audit(AuditError),
+}
+
+impl<RepositoryError, AuditError> Display for CatalogUseCaseError<RepositoryError, AuditError>
+where
+    RepositoryError: Display,
+    AuditError: Display,
+{
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Domain(error) => write!(formatter, "{error}"),
+            Self::AlreadyExists => formatter.write_str("catalog source already exists"),
+            Self::SourceNotFound => formatter.write_str("catalog source was not found"),
+            Self::RevisionNotFound => formatter.write_str("catalog revision was not found"),
+            Self::SyncOperationNotFound => {
+                formatter.write_str("catalog sync operation was not found")
+            }
+            Self::ValidationFailed => formatter.write_str("catalog document validation failed"),
+            Self::Repository(error) => write!(formatter, "catalog repository error: {error}"),
+            Self::Audit(error) => write!(formatter, "catalog audit error: {error}"),
+        }
+    }
+}
+
+impl<RepositoryError, AuditError> std::error::Error
+    for CatalogUseCaseError<RepositoryError, AuditError>
+where
+    RepositoryError: std::error::Error + 'static,
+    AuditError: std::error::Error + 'static,
+{
+}
+
+pub struct RegisterCatalogSource;
+
+impl RegisterCatalogSource {
+    /// Registers a source when one adapter owns both durable catalog state and audit append.
+    pub fn execute_with_unified_repository<R>(
+        repository: &mut R,
+        input: RegisterCatalogSourceInput,
+    ) -> Result<
+        CatalogSource,
+        CatalogUseCaseError<<R as CatalogRepository>::Error, <R as AuditWriter>::Error>,
+    >
+    where
+        R: CatalogRepository + AuditWriter<Error = <R as CatalogRepository>::Error>,
+    {
+        let source_id =
+            CatalogSourceId::new(input.source_id).map_err(CatalogUseCaseError::Domain)?;
+        if repository
+            .find_catalog_source(&source_id)
+            .map_err(CatalogUseCaseError::Repository)?
+            .is_some()
+        {
+            return Err(CatalogUseCaseError::AlreadyExists);
+        }
+        let source = CatalogSource::new(
+            source_id.clone(),
+            PublicCatalogUrl::new(input.url).map_err(CatalogUseCaseError::Domain)?,
+            CatalogReference::new(input.reference).map_err(CatalogUseCaseError::Domain)?,
+        );
+        repository
+            .save_catalog_source(source.clone())
+            .map_err(CatalogUseCaseError::Repository)?;
+        repository
+            .write(AuditEvent {
+                category: AuditCategory::Policy,
+                action: "catalog_source_registered".to_owned(),
+                actor: AuditActor::new(input.actor),
+                target: AuditTarget::new(source_id.as_str()),
+                value: AuditValue::Redacted,
+                occurred_at: input.occurred_at,
+            })
+            .map_err(CatalogUseCaseError::Audit)?;
+        Ok(source)
+    }
+
+    pub fn execute<R, A>(
+        repository: &mut R,
+        audit: &mut A,
+        input: RegisterCatalogSourceInput,
+    ) -> Result<CatalogSource, CatalogUseCaseError<R::Error, A::Error>>
+    where
+        R: CatalogRepository,
+        A: AuditWriter,
+    {
+        let source_id =
+            CatalogSourceId::new(input.source_id).map_err(CatalogUseCaseError::Domain)?;
+        if repository
+            .find_catalog_source(&source_id)
+            .map_err(CatalogUseCaseError::Repository)?
+            .is_some()
+        {
+            return Err(CatalogUseCaseError::AlreadyExists);
+        }
+        let source = CatalogSource::new(
+            source_id.clone(),
+            PublicCatalogUrl::new(input.url).map_err(CatalogUseCaseError::Domain)?,
+            CatalogReference::new(input.reference).map_err(CatalogUseCaseError::Domain)?,
+        );
+        repository
+            .save_catalog_source(source.clone())
+            .map_err(CatalogUseCaseError::Repository)?;
+        audit
+            .write(AuditEvent {
+                category: AuditCategory::Policy,
+                action: "catalog_source_registered".to_owned(),
+                actor: AuditActor::new(input.actor),
+                target: AuditTarget::new(source_id.as_str()),
+                value: AuditValue::Redacted,
+                occurred_at: input.occurred_at,
+            })
+            .map_err(CatalogUseCaseError::Audit)?;
+        Ok(source)
+    }
+}
+
+pub struct ActivateCatalogRevision;
+
+impl ActivateCatalogRevision {
+    pub fn execute_with_unified_repository<R>(
+        repository: &mut R,
+        input: ActivateCatalogRevisionInput,
+    ) -> Result<
+        CatalogSource,
+        CatalogUseCaseError<<R as CatalogRepository>::Error, <R as AuditWriter>::Error>,
+    >
+    where
+        R: CatalogRepository + AuditWriter<Error = <R as CatalogRepository>::Error>,
+    {
+        let source_id =
+            CatalogSourceId::new(input.source_id).map_err(CatalogUseCaseError::Domain)?;
+        let commit = CatalogCommitId::new(input.commit).map_err(CatalogUseCaseError::Domain)?;
+        let mut source = repository
+            .find_catalog_source(&source_id)
+            .map_err(CatalogUseCaseError::Repository)?
+            .ok_or(CatalogUseCaseError::SourceNotFound)?;
+        let revision = repository
+            .find_catalog_revision(&source_id, &commit)
+            .map_err(CatalogUseCaseError::Repository)?
+            .ok_or(CatalogUseCaseError::RevisionNotFound)?;
+        source
+            .activate(&revision)
+            .map_err(CatalogUseCaseError::Domain)?;
+        repository
+            .activate_catalog_revision(source.clone(), &revision)
+            .map_err(CatalogUseCaseError::Repository)?;
+        repository
+            .write(AuditEvent {
+                category: AuditCategory::Policy,
+                action: "catalog_revision_activated".to_owned(),
+                actor: AuditActor::new(input.actor),
+                target: AuditTarget::new(source_id.as_str()),
+                value: AuditValue::Plain(format!("commit={}", commit.as_str())),
+                occurred_at: input.occurred_at,
+            })
+            .map_err(CatalogUseCaseError::Audit)?;
+        Ok(source)
+    }
+
+    pub fn execute<R, A>(
+        repository: &mut R,
+        audit: &mut A,
+        input: ActivateCatalogRevisionInput,
+    ) -> Result<CatalogSource, CatalogUseCaseError<R::Error, A::Error>>
+    where
+        R: CatalogRepository,
+        A: AuditWriter,
+    {
+        let source_id =
+            CatalogSourceId::new(input.source_id).map_err(CatalogUseCaseError::Domain)?;
+        let commit = CatalogCommitId::new(input.commit).map_err(CatalogUseCaseError::Domain)?;
+        let mut source = repository
+            .find_catalog_source(&source_id)
+            .map_err(CatalogUseCaseError::Repository)?
+            .ok_or(CatalogUseCaseError::SourceNotFound)?;
+        let revision = repository
+            .find_catalog_revision(&source_id, &commit)
+            .map_err(CatalogUseCaseError::Repository)?
+            .ok_or(CatalogUseCaseError::RevisionNotFound)?;
+        source
+            .activate(&revision)
+            .map_err(CatalogUseCaseError::Domain)?;
+        repository
+            .activate_catalog_revision(source.clone(), &revision)
+            .map_err(CatalogUseCaseError::Repository)?;
+        audit
+            .write(AuditEvent {
+                category: AuditCategory::Policy,
+                action: "catalog_revision_activated".to_owned(),
+                actor: AuditActor::new(input.actor),
+                target: AuditTarget::new(source_id.as_str()),
+                value: AuditValue::Plain(format!("commit={}", commit.as_str())),
+                occurred_at: input.occurred_at,
+            })
+            .map_err(CatalogUseCaseError::Audit)?;
+        Ok(source)
+    }
+}
+
+pub struct StartCatalogSync;
+
+impl StartCatalogSync {
+    pub fn execute<R>(
+        repository: &mut R,
+        input: StartCatalogSyncInput,
+    ) -> Result<CatalogSyncOperation, CatalogUseCaseError<R::Error, std::convert::Infallible>>
+    where
+        R: CatalogRepository,
+    {
+        let source_id =
+            CatalogSourceId::new(input.source_id).map_err(CatalogUseCaseError::Domain)?;
+        if repository
+            .find_catalog_source(&source_id)
+            .map_err(CatalogUseCaseError::Repository)?
+            .is_none()
+        {
+            return Err(CatalogUseCaseError::SourceNotFound);
+        }
+        let operation_id =
+            CatalogSyncOperationId::new(input.operation_id).map_err(CatalogUseCaseError::Domain)?;
+        repository
+            .begin_or_observe_catalog_sync_operation(CatalogSyncOperation::new(
+                operation_id,
+                source_id,
+            ))
+            .map_err(CatalogUseCaseError::Repository)
+    }
+}
+
+pub struct FailCatalogSync;
+
+impl FailCatalogSync {
+    pub fn execute<R>(
+        repository: &mut R,
+        input: FailCatalogSyncInput,
+    ) -> Result<CatalogSyncOperation, CatalogUseCaseError<R::Error, std::convert::Infallible>>
+    where
+        R: CatalogRepository,
+    {
+        if input.failure == CatalogSyncFailure::Cancelled {
+            return Err(CatalogUseCaseError::Domain(
+                CatalogError::InvalidSyncOperationTransition,
+            ));
+        }
+        let operation_id =
+            CatalogSyncOperationId::new(input.operation_id).map_err(CatalogUseCaseError::Domain)?;
+        let mut operation = repository
+            .find_catalog_sync_operation(&operation_id)
+            .map_err(CatalogUseCaseError::Repository)?
+            .ok_or(CatalogUseCaseError::SyncOperationNotFound)?;
+        operation
+            .fail(input.failure)
+            .map_err(CatalogUseCaseError::Domain)?;
+        repository
+            .save_catalog_sync_operation(operation.clone())
+            .map_err(CatalogUseCaseError::Repository)?;
+        Ok(operation)
+    }
+}
+
+pub struct CancelCatalogSync;
+
+impl CancelCatalogSync {
+    pub fn execute<R>(
+        repository: &mut R,
+        input: CancelCatalogSyncInput,
+    ) -> Result<CatalogSyncOperation, CatalogUseCaseError<R::Error, std::convert::Infallible>>
+    where
+        R: CatalogRepository,
+    {
+        let operation_id =
+            CatalogSyncOperationId::new(input.operation_id).map_err(CatalogUseCaseError::Domain)?;
+        let mut operation = repository
+            .find_catalog_sync_operation(&operation_id)
+            .map_err(CatalogUseCaseError::Repository)?
+            .ok_or(CatalogUseCaseError::SyncOperationNotFound)?;
+        operation.cancel().map_err(CatalogUseCaseError::Domain)?;
+        repository
+            .save_catalog_sync_operation(operation.clone())
+            .map_err(CatalogUseCaseError::Repository)?;
+        Ok(operation)
+    }
+}
+
+pub struct CompleteCatalogSync;
+
+impl CompleteCatalogSync {
+    pub fn execute<R>(
+        repository: &mut R,
+        input: CompleteCatalogSyncInput,
+    ) -> Result<CatalogSyncOperation, CatalogUseCaseError<R::Error, std::convert::Infallible>>
+    where
+        R: CatalogRepository,
+    {
+        let operation_id =
+            CatalogSyncOperationId::new(input.operation_id).map_err(CatalogUseCaseError::Domain)?;
+        let mut operation = repository
+            .find_catalog_sync_operation(&operation_id)
+            .map_err(CatalogUseCaseError::Repository)?
+            .ok_or(CatalogUseCaseError::SyncOperationNotFound)?;
+        let source = repository
+            .find_catalog_source(operation.source_id())
+            .map_err(CatalogUseCaseError::Repository)?
+            .ok_or(CatalogUseCaseError::SourceNotFound)?;
+        let commit =
+            CatalogCommitId::new(input.result.commit).map_err(CatalogUseCaseError::Domain)?;
+        operation
+            .bind_commit(commit.clone())
+            .map_err(CatalogUseCaseError::Domain)?;
+        if let Some(existing_revision) = repository
+            .find_catalog_revision(source.id(), &commit)
+            .map_err(CatalogUseCaseError::Repository)?
+            && matches!(
+                existing_revision.state(),
+                CatalogRevisionState::Ready { .. }
+            )
+        {
+            operation
+                .complete(&existing_revision)
+                .map_err(CatalogUseCaseError::Domain)?;
+            repository
+                .save_catalog_sync_operation(operation.clone())
+                .map_err(CatalogUseCaseError::Repository)?;
+            return Ok(operation);
+        }
+        let mut revision = source.begin_sync(commit);
+        repository
+            .save_catalog_revision(revision.clone())
+            .map_err(CatalogUseCaseError::Repository)?;
+        revision
+            .begin_validation()
+            .map_err(CatalogUseCaseError::Domain)?;
+        repository
+            .save_catalog_revision(revision.clone())
+            .map_err(CatalogUseCaseError::Repository)?;
+
+        let documents =
+            match prepare_catalog_documents(repository, &source, &revision, input.result.documents)
+            {
+                Ok(documents) => documents,
+                Err(CatalogUseCaseError::ValidationFailed) => {
+                    revision
+                        .fail(CatalogSyncFailure::ValidationFailed)
+                        .map_err(CatalogUseCaseError::Domain)?;
+                    repository
+                        .save_catalog_revision(revision)
+                        .map_err(CatalogUseCaseError::Repository)?;
+                    operation
+                        .fail(CatalogSyncFailure::ValidationFailed)
+                        .map_err(CatalogUseCaseError::Domain)?;
+                    repository
+                        .save_catalog_sync_operation(operation)
+                        .map_err(CatalogUseCaseError::Repository)?;
+                    return Err(CatalogUseCaseError::ValidationFailed);
+                }
+                Err(error) => return Err(error),
+            };
+        let document_count = documents.len();
+        for record in documents {
+            match record {
+                PreparedCatalogDocument::Validated(record) => repository
+                    .save_catalog_document(record.document, record.body)
+                    .map_err(CatalogUseCaseError::Repository)?,
+                PreparedCatalogDocument::Reuse(document) => repository
+                    .reuse_catalog_document(document)
+                    .map_err(CatalogUseCaseError::Repository)?,
+            }
+        }
+        revision
+            .mark_ready(document_count)
+            .map_err(CatalogUseCaseError::Domain)?;
+        repository
+            .save_catalog_revision(revision.clone())
+            .map_err(CatalogUseCaseError::Repository)?;
+        operation
+            .complete(&revision)
+            .map_err(CatalogUseCaseError::Domain)?;
+        repository
+            .save_catalog_sync_operation(operation.clone())
+            .map_err(CatalogUseCaseError::Repository)?;
+        Ok(operation)
+    }
+}
+
+enum PreparedCatalogDocument {
+    Validated(CatalogDocumentRecord),
+    Reuse(CatalogDocument),
+}
+
+fn prepare_catalog_documents<R>(
+    repository: &R,
+    source: &CatalogSource,
+    revision: &CatalogRevision,
+    documents: Vec<CatalogFetchedDocument>,
+) -> Result<Vec<PreparedCatalogDocument>, CatalogUseCaseError<R::Error, std::convert::Infallible>>
+where
+    R: CatalogRepository,
+{
+    if documents.is_empty() {
+        return Err(CatalogUseCaseError::ValidationFailed);
+    }
+    let mut paths = BTreeSet::new();
+    documents
+        .into_iter()
+        .map(|fetched| {
+            if !paths.insert(fetched.path.clone()) {
+                return Err(CatalogUseCaseError::ValidationFailed);
+            }
+            let document = CatalogDocument::new(
+                source.id().clone(),
+                revision.commit().clone(),
+                fetched.kind,
+                fetched.path.clone(),
+                fetched.checksum,
+            )
+            .map_err(CatalogUseCaseError::Domain)?;
+            if let Some(active_commit) = source.active_revision() {
+                let existing = repository
+                    .find_catalog_document(source.id(), active_commit, document.path())
+                    .map_err(CatalogUseCaseError::Repository)?;
+                if let Some(existing) = existing
+                    && existing.document.kind() == document.kind()
+                    && existing.document.checksum() == document.checksum()
+                {
+                    return Ok(PreparedCatalogDocument::Reuse(document));
+                }
+            }
+            let parsed = match fetched.kind {
+                CatalogDocumentKind::Policy => parse_policy_document(&fetched.body).is_ok(),
+                CatalogDocumentKind::Runbook => parse_runbook_document(&fetched.body).is_ok(),
+            };
+            if !parsed {
+                return Err(CatalogUseCaseError::ValidationFailed);
+            }
+            Ok(PreparedCatalogDocument::Validated(CatalogDocumentRecord {
+                document,
+                body: fetched.body,
+            }))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod catalog_application_tests {
+    use super::*;
+    use fleet_domain::{CatalogRevisionState, CatalogSyncOperationState};
+    use std::cell::{Cell, RefCell};
+    use std::convert::Infallible;
+
+    #[derive(Default)]
+    struct FakeCatalogRepository {
+        sources: Vec<CatalogSource>,
+        revisions: Vec<CatalogRevision>,
+        operations: Vec<CatalogSyncOperation>,
+        documents: Vec<CatalogDocumentRecord>,
+        catalog_document_writes: usize,
+        catalog_document_write_bytes: usize,
+        catalog_document_reuses: usize,
+        catalog_document_find_calls: Cell<usize>,
+    }
+
+    impl CatalogRepository for FakeCatalogRepository {
+        type Error = Infallible;
+
+        fn save_catalog_source(&mut self, source: CatalogSource) -> Result<(), Self::Error> {
+            self.sources.push(source);
+            Ok(())
+        }
+
+        fn find_catalog_source(
+            &self,
+            source_id: &CatalogSourceId,
+        ) -> Result<Option<CatalogSource>, Self::Error> {
+            Ok(self
+                .sources
+                .iter()
+                .find(|source| source.id() == source_id)
+                .cloned())
+        }
+
+        fn find_catalog_revision(
+            &self,
+            source_id: &CatalogSourceId,
+            commit: &CatalogCommitId,
+        ) -> Result<Option<CatalogRevision>, Self::Error> {
+            Ok(self
+                .revisions
+                .iter()
+                .find(|revision| revision.source_id() == source_id && revision.commit() == commit)
+                .cloned())
+        }
+
+        fn save_catalog_revision(&mut self, revision: CatalogRevision) -> Result<(), Self::Error> {
+            if let Some(index) = self.revisions.iter().position(|existing| {
+                existing.source_id() == revision.source_id()
+                    && existing.commit() == revision.commit()
+            }) {
+                self.revisions[index] = revision;
+            } else {
+                self.revisions.push(revision);
+            }
+            Ok(())
+        }
+
+        fn begin_or_observe_catalog_sync_operation(
+            &mut self,
+            operation: CatalogSyncOperation,
+        ) -> Result<CatalogSyncOperation, Self::Error> {
+            if let Some(existing) = self.operations.iter().find(|existing| {
+                existing.source_id() == operation.source_id() && existing.is_active()
+            }) {
+                return Ok(existing.clone());
+            }
+            self.operations.push(operation.clone());
+            Ok(operation)
+        }
+
+        fn save_catalog_sync_operation(
+            &mut self,
+            operation: CatalogSyncOperation,
+        ) -> Result<(), Self::Error> {
+            let index = self
+                .operations
+                .iter()
+                .position(|existing| existing.id() == operation.id())
+                .expect("operation exists in fake");
+            self.operations[index] = operation;
+            Ok(())
+        }
+
+        fn find_catalog_sync_operation(
+            &self,
+            operation_id: &CatalogSyncOperationId,
+        ) -> Result<Option<CatalogSyncOperation>, Self::Error> {
+            Ok(self
+                .operations
+                .iter()
+                .find(|operation| operation.id() == operation_id)
+                .cloned())
+        }
+
+        fn save_catalog_document(
+            &mut self,
+            document: CatalogDocument,
+            body: String,
+        ) -> Result<(), Self::Error> {
+            self.catalog_document_writes += 1;
+            self.catalog_document_write_bytes += body.len();
+            self.documents
+                .push(CatalogDocumentRecord { document, body });
+            Ok(())
+        }
+
+        fn reuse_catalog_document(&mut self, document: CatalogDocument) -> Result<(), Self::Error> {
+            let body = self
+                .documents
+                .iter()
+                .find(|existing| {
+                    existing.document.source_id() == document.source_id()
+                        && existing.document.checksum() == document.checksum()
+                })
+                .expect("validated source checksum exists in fake")
+                .body
+                .clone();
+            self.catalog_document_reuses += 1;
+            self.catalog_document_write_bytes += body.len();
+            self.documents
+                .push(CatalogDocumentRecord { document, body });
+            Ok(())
+        }
+
+        fn find_catalog_document(
+            &self,
+            source_id: &CatalogSourceId,
+            commit: &CatalogCommitId,
+            path: &str,
+        ) -> Result<Option<CatalogDocumentRecord>, Self::Error> {
+            self.catalog_document_find_calls
+                .set(self.catalog_document_find_calls.get() + 1);
+            Ok(self
+                .documents
+                .iter()
+                .find(|record| {
+                    record.document.source_id() == source_id
+                        && record.document.commit() == commit
+                        && record.document.path() == path
+                })
+                .cloned())
+        }
+
+        fn activate_catalog_revision(
+            &mut self,
+            source: CatalogSource,
+            _revision: &CatalogRevision,
+        ) -> Result<(), Self::Error> {
+            let index = self
+                .sources
+                .iter()
+                .position(|existing| existing.id() == source.id())
+                .expect("activation source exists in fake");
+            self.sources[index] = source;
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeCatalogQueryRepository {
+        sources: Vec<CatalogSource>,
+        revisions: Vec<CatalogRevision>,
+        documents: Vec<CatalogDocumentRecord>,
+        requested_limits: RefCell<Vec<usize>>,
+    }
+
+    impl CatalogQueryRepository for FakeCatalogQueryRepository {
+        type Error = Infallible;
+
+        fn list_catalog_sources_after(
+            &self,
+            after: Option<&CatalogSourceId>,
+            limit: usize,
+        ) -> Result<Vec<CatalogSource>, Self::Error> {
+            self.requested_limits.borrow_mut().push(limit);
+            Ok(self
+                .sources
+                .iter()
+                .filter(|source| after.is_none_or(|cursor| source.id() > cursor))
+                .take(limit)
+                .cloned()
+                .collect())
+        }
+
+        fn list_catalog_revisions_after(
+            &self,
+            source_id: &CatalogSourceId,
+            after: Option<&CatalogCommitId>,
+            limit: usize,
+        ) -> Result<Vec<CatalogRevision>, Self::Error> {
+            self.requested_limits.borrow_mut().push(limit);
+            Ok(self
+                .revisions
+                .iter()
+                .filter(|revision| {
+                    revision.source_id() == source_id
+                        && after.is_none_or(|cursor| revision.commit() > cursor)
+                })
+                .take(limit)
+                .cloned()
+                .collect())
+        }
+
+        fn list_catalog_documents_after(
+            &self,
+            source_id: &CatalogSourceId,
+            commit: &CatalogCommitId,
+            after: Option<&str>,
+            limit: usize,
+        ) -> Result<Vec<CatalogDocument>, Self::Error> {
+            self.requested_limits.borrow_mut().push(limit);
+            Ok(self
+                .documents
+                .iter()
+                .filter(|record| {
+                    record.document.source_id() == source_id
+                        && record.document.commit() == commit
+                        && after.is_none_or(|cursor| record.document.path() > cursor)
+                })
+                .take(limit)
+                .map(|record| record.document.clone())
+                .collect())
+        }
+
+        fn find_catalog_document_detail(
+            &self,
+            source_id: &CatalogSourceId,
+            commit: &CatalogCommitId,
+            path: &str,
+        ) -> Result<Option<CatalogDocumentRecord>, Self::Error> {
+            Ok(self
+                .documents
+                .iter()
+                .find(|record| {
+                    record.document.source_id() == source_id
+                        && record.document.commit() == commit
+                        && record.document.path() == path
+                })
+                .cloned())
+        }
+    }
+
+    fn catalog_source(id: &str) -> CatalogSource {
+        CatalogSource::new(
+            CatalogSourceId::new(id).unwrap(),
+            PublicCatalogUrl::new(format!("https://{id}.example.com/catalog.git")).unwrap(),
+            CatalogReference::new("main").unwrap(),
+        )
+    }
+
+    #[derive(Default)]
+    struct FakeCatalogAudit {
+        events: Vec<AuditEvent>,
+    }
+
+    impl AuditWriter for FakeCatalogAudit {
+        type Error = Infallible;
+
+        fn write(&mut self, event: AuditEvent) -> Result<(), Self::Error> {
+            self.events.push(event);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn registers_catalog_source_once_and_audits_without_url() {
+        let mut repository = FakeCatalogRepository::default();
+        let mut audit = FakeCatalogAudit::default();
+        let input = RegisterCatalogSourceInput {
+            source_id: "public-catalog".to_owned(),
+            url: "https://example.com/fleet/catalog.git".to_owned(),
+            reference: "main".to_owned(),
+            actor: "admin".to_owned(),
+            occurred_at: UNIX_EPOCH,
+        };
+
+        RegisterCatalogSource::execute(&mut repository, &mut audit, input.clone()).unwrap();
+        assert!(matches!(
+            RegisterCatalogSource::execute(&mut repository, &mut audit, input),
+            Err(CatalogUseCaseError::AlreadyExists)
+        ));
+        assert_eq!(audit.events.len(), 1);
+        assert!(!format!("{:?}", audit.events[0]).contains("example.com"));
+    }
+
+    #[test]
+    fn activates_only_a_ready_revision_and_records_commit_provenance() {
+        let source = CatalogSource::new(
+            CatalogSourceId::new("public-catalog").unwrap(),
+            PublicCatalogUrl::new("https://example.com/fleet/catalog.git").unwrap(),
+            CatalogReference::new("main").unwrap(),
+        );
+        let commit = CatalogCommitId::new("a".repeat(40)).unwrap();
+        let mut revision = source.begin_sync(commit.clone());
+        revision.begin_validation().unwrap();
+        revision.mark_ready(2).unwrap();
+        let mut repository = FakeCatalogRepository {
+            sources: vec![source],
+            revisions: vec![revision],
+            operations: Vec::new(),
+            documents: Vec::new(),
+            ..Default::default()
+        };
+        let mut audit = FakeCatalogAudit::default();
+
+        let activated = ActivateCatalogRevision::execute(
+            &mut repository,
+            &mut audit,
+            ActivateCatalogRevisionInput {
+                source_id: "public-catalog".to_owned(),
+                commit: commit.as_str().to_owned(),
+                actor: "admin".to_owned(),
+                occurred_at: UNIX_EPOCH,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(activated.active_revision(), Some(&commit));
+        assert_eq!(audit.events.len(), 1);
+        assert!(matches!(
+            audit.events[0].value,
+            AuditValue::Plain(ref value) if value == &format!("commit={commit}")
+        ));
+    }
+
+    #[test]
+    fn starts_one_catalog_sync_operation_per_source_and_observes_duplicates() {
+        let source = CatalogSource::new(
+            CatalogSourceId::new("public-catalog").unwrap(),
+            PublicCatalogUrl::new("https://example.com/fleet/catalog.git").unwrap(),
+            CatalogReference::new("main").unwrap(),
+        );
+        let mut repository = FakeCatalogRepository {
+            sources: vec![source],
+            revisions: Vec::new(),
+            operations: Vec::new(),
+            documents: Vec::new(),
+            ..Default::default()
+        };
+
+        let first = StartCatalogSync::execute(
+            &mut repository,
+            StartCatalogSyncInput {
+                source_id: "public-catalog".to_owned(),
+                operation_id: "sync-001".to_owned(),
+            },
+        )
+        .unwrap();
+        let observed = StartCatalogSync::execute(
+            &mut repository,
+            StartCatalogSyncInput {
+                source_id: "public-catalog".to_owned(),
+                operation_id: "sync-002".to_owned(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(first.id().as_str(), "sync-001");
+        assert_eq!(observed, first);
+        assert_eq!(repository.operations.len(), 1);
+    }
+
+    #[test]
+    fn terminal_fetch_failure_and_cancellation_preserve_the_active_revision() {
+        let mut source = CatalogSource::new(
+            CatalogSourceId::new("public-catalog").unwrap(),
+            PublicCatalogUrl::new("https://example.com/fleet/catalog.git").unwrap(),
+            CatalogReference::new("main").unwrap(),
+        );
+        let mut ready_revision = source.begin_sync(CatalogCommitId::new("a".repeat(40)).unwrap());
+        ready_revision.begin_validation().unwrap();
+        ready_revision.mark_ready(1).unwrap();
+        source.activate(&ready_revision).unwrap();
+        let mut repository = FakeCatalogRepository {
+            sources: vec![source],
+            revisions: vec![ready_revision],
+            operations: Vec::new(),
+            documents: Vec::new(),
+            ..Default::default()
+        };
+
+        StartCatalogSync::execute(
+            &mut repository,
+            StartCatalogSyncInput {
+                source_id: "public-catalog".to_owned(),
+                operation_id: "sync-failed".to_owned(),
+            },
+        )
+        .unwrap();
+        let failed = FailCatalogSync::execute(
+            &mut repository,
+            FailCatalogSyncInput {
+                operation_id: "sync-failed".to_owned(),
+                failure: CatalogSyncFailure::FetchFailed,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            failed.state(),
+            CatalogSyncOperationState::Failed(CatalogSyncFailure::FetchFailed)
+        ));
+
+        StartCatalogSync::execute(
+            &mut repository,
+            StartCatalogSyncInput {
+                source_id: "public-catalog".to_owned(),
+                operation_id: "sync-cancelled".to_owned(),
+            },
+        )
+        .unwrap();
+        let cancelled = CancelCatalogSync::execute(
+            &mut repository,
+            CancelCatalogSyncInput {
+                operation_id: "sync-cancelled".to_owned(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            cancelled.state(),
+            CatalogSyncOperationState::Cancelled
+        ));
+        assert_eq!(
+            repository.sources[0]
+                .active_revision()
+                .map(CatalogCommitId::as_str),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+    }
+
+    #[test]
+    fn completes_validated_catalog_sync_without_activating_the_revision() {
+        let source = CatalogSource::new(
+            CatalogSourceId::new("public-catalog").unwrap(),
+            PublicCatalogUrl::new("https://example.com/fleet/catalog.git").unwrap(),
+            CatalogReference::new("main").unwrap(),
+        );
+        let mut repository = FakeCatalogRepository {
+            sources: vec![source.clone()],
+            revisions: Vec::new(),
+            operations: Vec::new(),
+            documents: Vec::new(),
+            ..Default::default()
+        };
+        StartCatalogSync::execute(
+            &mut repository,
+            StartCatalogSyncInput {
+                source_id: "public-catalog".to_owned(),
+                operation_id: "sync-001".to_owned(),
+            },
+        )
+        .unwrap();
+
+        let operation = CompleteCatalogSync::execute(
+            &mut repository,
+            CompleteCatalogSyncInput {
+                operation_id: "sync-001".to_owned(),
+                result: CatalogFetchResult {
+                    commit: "a".repeat(40),
+                    documents: vec![CatalogFetchedDocument {
+                        kind: CatalogDocumentKind::Runbook,
+                        path: "runbooks/nginx.yaml".to_owned(),
+                        checksum: "c".repeat(64),
+                        body: "apiVersion: fleet.sponzey.dev/v1alpha1\nkind: Runbook\nname: nginx\nselector: role=web\nsteps:\n  - id: nginx\n    service:\n      name: nginx\n      state: started\n"
+                            .to_owned(),
+                    }],
+                },
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            operation.state(),
+            CatalogSyncOperationState::Completed
+        ));
+        assert_eq!(repository.documents.len(), 1);
+        assert_eq!(source.active_revision(), None);
+    }
+
+    #[test]
+    fn completes_an_already_ready_commit_without_revalidating_or_rewriting_documents() {
+        let source = CatalogSource::new(
+            CatalogSourceId::new("public-catalog").unwrap(),
+            PublicCatalogUrl::new("https://example.com/fleet/catalog.git").unwrap(),
+            CatalogReference::new("main").unwrap(),
+        );
+        let commit = CatalogCommitId::new("a".repeat(40)).unwrap();
+        let mut ready_revision = source.begin_sync(commit.clone());
+        ready_revision.begin_validation().unwrap();
+        ready_revision.mark_ready(1).unwrap();
+        let existing_document = CatalogDocument::new(
+            source.id().clone(),
+            commit.clone(),
+            CatalogDocumentKind::Runbook,
+            "runbooks/nginx.yaml",
+            "c".repeat(64),
+        )
+        .unwrap();
+        let mut repository = FakeCatalogRepository {
+            sources: vec![source],
+            revisions: vec![ready_revision],
+            operations: Vec::new(),
+            documents: vec![CatalogDocumentRecord {
+                document: existing_document,
+                body: "already-validated".to_owned(),
+            }],
+            ..Default::default()
+        };
+        StartCatalogSync::execute(
+            &mut repository,
+            StartCatalogSyncInput {
+                source_id: "public-catalog".to_owned(),
+                operation_id: "sync-unchanged".to_owned(),
+            },
+        )
+        .unwrap();
+
+        let operation = CompleteCatalogSync::execute(
+            &mut repository,
+            CompleteCatalogSyncInput {
+                operation_id: "sync-unchanged".to_owned(),
+                result: CatalogFetchResult {
+                    commit: commit.as_str().to_owned(),
+                    documents: vec![CatalogFetchedDocument {
+                        kind: CatalogDocumentKind::Runbook,
+                        path: "runbooks/nginx.yaml".to_owned(),
+                        checksum: "c".repeat(64),
+                        body: "not a valid document and must not be parsed".to_owned(),
+                    }],
+                },
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            operation.state(),
+            CatalogSyncOperationState::Completed
+        ));
+        assert_eq!(repository.revisions.len(), 1);
+        assert_eq!(repository.documents.len(), 1);
+        assert_eq!(repository.documents[0].body, "already-validated");
+    }
+
+    #[test]
+    fn changed_commit_reuses_unchanged_document_body_and_validates_only_the_changed_document() {
+        let mut source = CatalogSource::new(
+            CatalogSourceId::new("public-catalog").unwrap(),
+            PublicCatalogUrl::new("https://example.com/fleet/catalog.git").unwrap(),
+            CatalogReference::new("main").unwrap(),
+        );
+        let previous_commit = CatalogCommitId::new("a".repeat(40)).unwrap();
+        let mut previous_revision = source.begin_sync(previous_commit.clone());
+        previous_revision.begin_validation().unwrap();
+        previous_revision.mark_ready(1).unwrap();
+        source.activate(&previous_revision).unwrap();
+        let previous_document = CatalogDocument::new(
+            source.id().clone(),
+            previous_commit,
+            CatalogDocumentKind::Runbook,
+            "runbooks/nginx.yaml",
+            "c".repeat(64),
+        )
+        .unwrap();
+        let mut repository = FakeCatalogRepository {
+            sources: vec![source],
+            revisions: vec![previous_revision],
+            operations: Vec::new(),
+            documents: vec![CatalogDocumentRecord {
+                document: previous_document,
+                body: "previously-validated-body".to_owned(),
+            }],
+            ..Default::default()
+        };
+        StartCatalogSync::execute(
+            &mut repository,
+            StartCatalogSyncInput {
+                source_id: "public-catalog".to_owned(),
+                operation_id: "sync-changed".to_owned(),
+            },
+        )
+        .unwrap();
+
+        CompleteCatalogSync::execute(
+            &mut repository,
+            CompleteCatalogSyncInput {
+                operation_id: "sync-changed".to_owned(),
+                result: CatalogFetchResult {
+                    commit: "b".repeat(40),
+                    documents: vec![
+                        CatalogFetchedDocument {
+                            kind: CatalogDocumentKind::Runbook,
+                            path: "runbooks/nginx.yaml".to_owned(),
+                            checksum: "c".repeat(64),
+                            body: "invalid input must be ignored because its checksum is unchanged"
+                                .to_owned(),
+                        },
+                        CatalogFetchedDocument {
+                            kind: CatalogDocumentKind::Runbook,
+                            path: "runbooks/redis.yaml".to_owned(),
+                            checksum: "d".repeat(64),
+                            body: "apiVersion: fleet.sponzey.dev/v1alpha1\nkind: Runbook\nname: redis\nselector: role=web\nsteps:\n  - id: redis\n    service:\n      name: redis\n      state: started\n"
+                                .to_owned(),
+                        },
+                    ],
+                },
+            },
+        )
+        .unwrap();
+
+        assert_eq!(repository.documents.len(), 3);
+        assert!(repository.documents.iter().any(|record| {
+            record.document.commit().as_str() == "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                && record.document.path() == "runbooks/nginx.yaml"
+                && record.body == "previously-validated-body"
+        }));
+        assert!(repository.documents.iter().any(|record| {
+            record.document.commit().as_str() == "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                && record.document.path() == "runbooks/redis.yaml"
+                && record.body.contains("name: redis")
+        }));
+    }
+
+    #[test]
+    fn catalog_source_query_enforces_the_page_bound_and_returns_an_exclusive_cursor() {
+        let repository = FakeCatalogQueryRepository {
+            sources: vec![
+                catalog_source("catalog-a"),
+                catalog_source("catalog-b"),
+                catalog_source("catalog-c"),
+            ],
+            ..Default::default()
+        };
+
+        let first = ListCatalogSources::execute(&repository, None, 2).unwrap();
+        assert_eq!(
+            first
+                .records
+                .iter()
+                .map(|source| source.id().as_str())
+                .collect::<Vec<_>>(),
+            vec!["catalog-a", "catalog-b"]
+        );
+        assert_eq!(first.next_after.as_ref().unwrap().as_str(), "catalog-b");
+
+        let second = ListCatalogSources::execute(&repository, first.next_after, 2).unwrap();
+        assert_eq!(
+            second
+                .records
+                .iter()
+                .map(|source| source.id().as_str())
+                .collect::<Vec<_>>(),
+            vec!["catalog-c"]
+        );
+        assert!(second.next_after.is_none());
+        assert_eq!(*repository.requested_limits.borrow(), vec![3, 3]);
+        assert!(matches!(
+            ListCatalogSources::execute(&repository, None, 101),
+            Err(CatalogPageQueryError::InvalidLimit { requested: 101 })
+        ));
+        assert_eq!(*repository.requested_limits.borrow(), vec![3, 3]);
+    }
+
+    #[test]
+    fn one_thousand_catalog_sources_are_read_in_ten_bounded_cursor_queries() {
+        let repository = FakeCatalogQueryRepository {
+            sources: (0..1_000)
+                .map(|index| catalog_source(&format!("catalog-{index:04}")))
+                .collect(),
+            ..Default::default()
+        };
+        let mut after = None;
+        let mut returned = 0;
+
+        loop {
+            let page = ListCatalogSources::execute(&repository, after, 100).unwrap();
+            returned += page.records.len();
+            after = page.next_after;
+            if after.is_none() {
+                break;
+            }
+        }
+
+        assert_eq!(returned, 1_000);
+        assert_eq!(*repository.requested_limits.borrow(), vec![101; 10]);
+    }
+
+    #[test]
+    fn catalog_revision_document_and_detail_queries_use_only_the_durable_query_port() {
+        let source = catalog_source("catalog-a");
+        let commit_a = CatalogCommitId::new("a".repeat(40)).unwrap();
+        let commit_b = CatalogCommitId::new("b".repeat(40)).unwrap();
+        let commit_c = CatalogCommitId::new("c".repeat(40)).unwrap();
+        let mut revision_a = source.begin_sync(commit_a.clone());
+        revision_a.begin_validation().unwrap();
+        revision_a.mark_ready(1).unwrap();
+        let mut revision_b = source.begin_sync(commit_b.clone());
+        revision_b.begin_validation().unwrap();
+        revision_b.mark_ready(2).unwrap();
+        let mut revision_c = source.begin_sync(commit_c.clone());
+        revision_c.begin_validation().unwrap();
+        revision_c.mark_ready(1).unwrap();
+        let document_a = CatalogDocument::new(
+            source.id().clone(),
+            commit_b.clone(),
+            CatalogDocumentKind::Policy,
+            "policies/nginx.yaml",
+            "a".repeat(64),
+        )
+        .unwrap();
+        let document_b = CatalogDocument::new(
+            source.id().clone(),
+            commit_b.clone(),
+            CatalogDocumentKind::Runbook,
+            "runbooks/nginx.yaml",
+            "b".repeat(64),
+        )
+        .unwrap();
+        let repository = FakeCatalogQueryRepository {
+            revisions: vec![revision_a, revision_b, revision_c],
+            documents: vec![
+                CatalogDocumentRecord {
+                    document: document_a,
+                    body: "policy body".to_owned(),
+                },
+                CatalogDocumentRecord {
+                    document: document_b,
+                    body: "runbook body".to_owned(),
+                },
+            ],
+            ..Default::default()
+        };
+
+        let revisions = ListCatalogRevisions::execute(&repository, source.id(), None, 2).unwrap();
+        assert_eq!(revisions.records.len(), 2);
+        assert_eq!(revisions.next_after.as_ref(), Some(&commit_b));
+        let documents =
+            ListCatalogDocuments::execute(&repository, source.id(), &commit_b, None, 1).unwrap();
+        assert_eq!(documents.records.len(), 1);
+        assert_eq!(documents.records[0].path(), "policies/nginx.yaml");
+        assert_eq!(documents.next_after.as_deref(), Some("policies/nginx.yaml"));
+        assert_eq!(
+            GetCatalogDocumentDetail::execute(
+                &repository,
+                source.id(),
+                &commit_b,
+                "runbooks/nginx.yaml",
+            )
+            .unwrap()
+            .expect("durable detail")
+            .body,
+            "runbook body"
+        );
+        assert_eq!(*repository.requested_limits.borrow(), vec![3, 2]);
+    }
+
+    #[test]
+    fn one_thousand_document_sync_keeps_ready_and_checksum_reuse_paths_deterministic() {
+        let mut source = CatalogSource::new(
+            CatalogSourceId::new("benchmark-catalog").unwrap(),
+            PublicCatalogUrl::new("https://benchmark.example.com/catalog.git").unwrap(),
+            CatalogReference::new("main").unwrap(),
+        );
+        let first_commit = "a".repeat(40);
+        let second_commit = "b".repeat(40);
+        let mut repository = FakeCatalogRepository {
+            sources: vec![source.clone()],
+            revisions: Vec::new(),
+            operations: Vec::new(),
+            documents: Vec::new(),
+            ..Default::default()
+        };
+        let documents = benchmark_catalog_documents(false);
+
+        StartCatalogSync::execute(
+            &mut repository,
+            StartCatalogSyncInput {
+                source_id: "benchmark-catalog".to_owned(),
+                operation_id: "benchmark-first".to_owned(),
+            },
+        )
+        .unwrap();
+        CompleteCatalogSync::execute(
+            &mut repository,
+            CompleteCatalogSyncInput {
+                operation_id: "benchmark-first".to_owned(),
+                result: CatalogFetchResult {
+                    commit: first_commit.clone(),
+                    documents: documents.clone(),
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(repository.documents.len(), 1_000);
+        assert_eq!(repository.catalog_document_writes, 1_000);
+        assert_eq!(repository.catalog_document_reuses, 0);
+        assert_eq!(repository.catalog_document_find_calls.get(), 0);
+        let initial_document_body_bytes = repository.catalog_document_write_bytes;
+        assert!(initial_document_body_bytes > 0);
+        let first_revision = repository
+            .find_catalog_revision(
+                source.id(),
+                &CatalogCommitId::new(first_commit.clone()).unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+        source.activate(&first_revision).unwrap();
+        repository.sources[0] = source;
+
+        StartCatalogSync::execute(
+            &mut repository,
+            StartCatalogSyncInput {
+                source_id: "benchmark-catalog".to_owned(),
+                operation_id: "benchmark-ready".to_owned(),
+            },
+        )
+        .unwrap();
+        CompleteCatalogSync::execute(
+            &mut repository,
+            CompleteCatalogSyncInput {
+                operation_id: "benchmark-ready".to_owned(),
+                result: CatalogFetchResult {
+                    commit: first_commit,
+                    documents: benchmark_catalog_documents(true),
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(repository.documents.len(), 1_000);
+        assert_eq!(repository.catalog_document_writes, 1_000);
+        assert_eq!(repository.catalog_document_reuses, 0);
+        assert_eq!(
+            repository.catalog_document_write_bytes,
+            initial_document_body_bytes
+        );
+        assert_eq!(repository.catalog_document_find_calls.get(), 0);
+
+        let mut changed = benchmark_catalog_documents(true);
+        changed.push(CatalogFetchedDocument {
+            kind: CatalogDocumentKind::Runbook,
+            path: "runbooks/added.yaml".to_owned(),
+            checksum: "f".repeat(64),
+            body: valid_benchmark_runbook("added"),
+        });
+        StartCatalogSync::execute(
+            &mut repository,
+            StartCatalogSyncInput {
+                source_id: "benchmark-catalog".to_owned(),
+                operation_id: "benchmark-changed".to_owned(),
+            },
+        )
+        .unwrap();
+        CompleteCatalogSync::execute(
+            &mut repository,
+            CompleteCatalogSyncInput {
+                operation_id: "benchmark-changed".to_owned(),
+                result: CatalogFetchResult {
+                    commit: second_commit,
+                    documents: changed,
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(repository.documents.len(), 2_001);
+        assert_eq!(repository.catalog_document_writes, 1_001);
+        assert_eq!(repository.catalog_document_reuses, 1_000);
+        assert_eq!(repository.catalog_document_find_calls.get(), 1_001);
+        assert_eq!(
+            repository.catalog_document_write_bytes,
+            initial_document_body_bytes * 2 + valid_benchmark_runbook("added").len()
+        );
+        assert_eq!(
+            repository
+                .documents
+                .iter()
+                .filter(|record| record.document.path() == "runbooks/added.yaml")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn warm_run_median_uses_the_middle_of_seven_samples() {
+        assert_eq!(
+            warm_run_median_millis(vec![110, 100, 100, 100, 100, 100, 100]),
+            100
+        );
+    }
+
+    fn benchmark_catalog_documents(invalid_body: bool) -> Vec<CatalogFetchedDocument> {
+        (0..1_000)
+            .map(|index| {
+                let (kind, path, body) = if index % 2 == 0 {
+                    (
+                        CatalogDocumentKind::Policy,
+                        format!("policies/policy-{index:04}.yaml"),
+                        valid_benchmark_policy(index),
+                    )
+                } else {
+                    (
+                        CatalogDocumentKind::Runbook,
+                        format!("runbooks/runbook-{index:04}.yaml"),
+                        valid_benchmark_runbook(&index.to_string()),
+                    )
+                };
+                CatalogFetchedDocument {
+                    kind,
+                    path,
+                    checksum: format!("{index:064x}"),
+                    body: if invalid_body {
+                        "invalid document body that must not be parsed".to_owned()
+                    } else {
+                        body
+                    },
+                }
+            })
+            .collect()
+    }
+
+    fn valid_benchmark_policy(index: usize) -> String {
+        format!(
+            "apiVersion: fleet.sponzey.dev/v1alpha1\nkind: Policy\nmetadata:\n  id: benchmark-policy-{index}\n  name: benchmark-policy-{index}\n  version: 1\nspec:\n  selector:\n    matchLabels:\n      role: web\n  checks:\n    - id: nginx-service\n      service:\n        name: nginx\n        state: running\n"
+        )
+    }
+
+    fn valid_benchmark_runbook(name: &str) -> String {
+        format!(
+            "apiVersion: fleet.sponzey.dev/v1alpha1\nkind: Runbook\nname: benchmark-{name}\nselector: role=web\nsteps:\n  - id: nginx\n    service:\n      name: nginx\n      state: started\n"
+        )
+    }
+
+    fn warm_run_median_millis(mut samples: Vec<u128>) -> u128 {
+        assert_eq!(
+            samples.len(),
+            7,
+            "baseline requires exactly seven warm samples"
+        );
+        samples.sort_unstable();
+        samples[3]
+    }
+
+    #[test]
+    fn failed_catalog_validation_preserves_the_active_revision() {
+        let source = CatalogSource::new(
+            CatalogSourceId::new("public-catalog").unwrap(),
+            PublicCatalogUrl::new("https://example.com/fleet/catalog.git").unwrap(),
+            CatalogReference::new("main").unwrap(),
+        );
+        let mut repository = FakeCatalogRepository {
+            sources: vec![source.clone()],
+            revisions: Vec::new(),
+            operations: Vec::new(),
+            documents: Vec::new(),
+            ..Default::default()
+        };
+        StartCatalogSync::execute(
+            &mut repository,
+            StartCatalogSyncInput {
+                source_id: "public-catalog".to_owned(),
+                operation_id: "sync-001".to_owned(),
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            CompleteCatalogSync::execute(
+                &mut repository,
+                CompleteCatalogSyncInput {
+                    operation_id: "sync-001".to_owned(),
+                    result: CatalogFetchResult {
+                        commit: "a".repeat(40),
+                        documents: vec![CatalogFetchedDocument {
+                            kind: CatalogDocumentKind::Runbook,
+                            path: "runbooks/bad.yaml".to_owned(),
+                            checksum: "c".repeat(64),
+                            body: "kind: Runbook".to_owned(),
+                        }],
+                    },
+                },
+            ),
+            Err(CatalogUseCaseError::ValidationFailed)
+        ));
+        assert_eq!(source.active_revision(), None);
+        assert!(matches!(
+            repository.operations[0].state(),
+            CatalogSyncOperationState::Failed(CatalogSyncFailure::ValidationFailed)
+        ));
+        assert!(matches!(
+            repository.revisions[0].state(),
+            CatalogRevisionState::Failed(CatalogSyncFailure::ValidationFailed)
+        ));
+    }
 }
 
 pub trait SecretProvider {
@@ -460,6 +2255,14 @@ pub trait RunbookJobRepository:
         }
         Ok(())
     }
+
+    fn save_catalog_runbook_job_with_assignments(
+        &mut self,
+        job: Job,
+        task: &RunbookExecutionTask,
+        provenance: &fleet_domain::CatalogRunbookProvenance,
+        assignments: &[TaskEnvelope],
+    ) -> Result<(), <Self as TaskAssignmentRepository>::Error>;
 }
 
 pub trait TaskAssignmentRepository {
@@ -988,6 +2791,14 @@ pub struct PolicyRecord {
     pub updated_at: SystemTime,
 }
 
+/// Outcome of a provenance-aware catalog Policy publication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogPolicyPublishOutcome {
+    Published,
+    ManualPolicyConflict,
+    OtherCatalogSourceConflict,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyAssignmentRecord {
     pub policy_id: String,
@@ -1014,6 +2825,12 @@ pub trait PolicyRepository {
         version: u32,
         source: &str,
     ) -> Result<(), Self::Error>;
+    /// Atomically publishes a Policy only when its id is unowned or already owned by this source.
+    fn publish_catalog_policy_source(
+        &mut self,
+        policy: &Policy,
+        provenance: &CatalogPolicyProvenance,
+    ) -> Result<CatalogPolicyPublishOutcome, Self::Error>;
     fn list_policies(&self) -> Result<Vec<PolicyRecord>, Self::Error>;
     fn find_policy(&self, policy_id: &str) -> Result<Option<PolicyRecord>, Self::Error>;
     fn assign_policy_to_agent(
@@ -2799,6 +4616,138 @@ impl SavePolicy {
                 occurred_at: input.now,
             })
             .map_err(PolicyUseCaseError::Audit)?;
+        Ok(policy)
+    }
+}
+
+/// Selects one immutable active catalog Policy for an explicit publication operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishCatalogPolicyInput {
+    pub source_id: String,
+    pub commit: String,
+    pub path: String,
+    pub checksum: String,
+    pub actor: String,
+    pub now: SystemTime,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublishCatalogPolicyError<RepoError, AuditError> {
+    Catalog(CatalogError),
+    SourceNotFound,
+    RevisionNotFound,
+    RevisionNotActive,
+    RevisionNotReady,
+    DocumentNotFound,
+    ChecksumMismatch,
+    ManualPolicyConflict,
+    OtherCatalogSourceConflict,
+    InvalidPolicy(String),
+    Repository(RepoError),
+    Audit(AuditError),
+}
+
+impl<RepoError, AuditError> Display for PublishCatalogPolicyError<RepoError, AuditError>
+where
+    RepoError: Display,
+    AuditError: Display,
+{
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Catalog(error) => write!(formatter, "catalog error: {error}"),
+            Self::SourceNotFound => formatter.write_str("catalog source was not found"),
+            Self::RevisionNotFound => formatter.write_str("catalog revision was not found"),
+            Self::RevisionNotActive => formatter.write_str("catalog revision is not active"),
+            Self::RevisionNotReady => formatter.write_str("catalog revision is not ready"),
+            Self::DocumentNotFound => formatter.write_str("catalog document was not found"),
+            Self::ChecksumMismatch => {
+                formatter.write_str("catalog document checksum does not match")
+            }
+            Self::ManualPolicyConflict => {
+                formatter.write_str("catalog policy conflicts with a manually managed policy")
+            }
+            Self::OtherCatalogSourceConflict => {
+                formatter.write_str("catalog policy conflicts with another catalog source")
+            }
+            Self::InvalidPolicy(error) => write!(formatter, "invalid policy: {error}"),
+            Self::Repository(error) => write!(formatter, "repository error: {error}"),
+            Self::Audit(error) => write!(formatter, "audit error: {error}"),
+        }
+    }
+}
+
+/// Publishes a validated Policy from one active catalog revision without creating assignments.
+pub struct PublishCatalogPolicy;
+
+impl PublishCatalogPolicy {
+    pub fn execute<R, A>(
+        repo: &mut R,
+        audit: &mut A,
+        input: PublishCatalogPolicyInput,
+    ) -> Result<Policy, PublishCatalogPolicyError<<R as PolicyRepository>::Error, A::Error>>
+    where
+        R: CatalogRepository<Error = <R as PolicyRepository>::Error> + PolicyRepository,
+        A: AuditWriter,
+    {
+        let source_id = CatalogSourceId::new(input.source_id.clone())
+            .map_err(PublishCatalogPolicyError::Catalog)?;
+        let commit = CatalogCommitId::new(input.commit.clone())
+            .map_err(PublishCatalogPolicyError::Catalog)?;
+        let source = repo
+            .find_catalog_source(&source_id)
+            .map_err(PublishCatalogPolicyError::Repository)?
+            .ok_or(PublishCatalogPolicyError::SourceNotFound)?;
+        if source.active_revision() != Some(&commit) {
+            return Err(PublishCatalogPolicyError::RevisionNotActive);
+        }
+        let revision = repo
+            .find_catalog_revision(&source_id, &commit)
+            .map_err(PublishCatalogPolicyError::Repository)?
+            .ok_or(PublishCatalogPolicyError::RevisionNotFound)?;
+        if !matches!(revision.state(), CatalogRevisionState::Ready { .. }) {
+            return Err(PublishCatalogPolicyError::RevisionNotReady);
+        }
+        let record = repo
+            .find_catalog_document(&source_id, &commit, &input.path)
+            .map_err(PublishCatalogPolicyError::Repository)?
+            .ok_or(PublishCatalogPolicyError::DocumentNotFound)?;
+        if record.document.checksum() != input.checksum {
+            return Err(PublishCatalogPolicyError::ChecksumMismatch);
+        }
+        let provenance = CatalogPolicyProvenance::from_document(&record.document)
+            .map_err(PublishCatalogPolicyError::Catalog)?;
+        let policy = parse_policy_document(&record.body)
+            .map_err(|error| PublishCatalogPolicyError::InvalidPolicy(error.to_string()))?;
+        match repo
+            .publish_catalog_policy_source(&policy, &provenance)
+            .map_err(PublishCatalogPolicyError::Repository)?
+        {
+            CatalogPolicyPublishOutcome::Published => {}
+            CatalogPolicyPublishOutcome::ManualPolicyConflict => {
+                return Err(PublishCatalogPolicyError::ManualPolicyConflict);
+            }
+            CatalogPolicyPublishOutcome::OtherCatalogSourceConflict => {
+                return Err(PublishCatalogPolicyError::OtherCatalogSourceConflict);
+            }
+        }
+        audit
+            .write(AuditEvent {
+                category: AuditCategory::Policy,
+                action: "catalog_policy_published".to_owned(),
+                actor: AuditActor::new(input.actor),
+                target: AuditTarget::new(policy.id.clone()),
+                value: AuditValue::Plain(format!(
+                    "source_id={},commit={},path={},checksum={},name={},version={}",
+                    provenance.source_id(),
+                    provenance.commit(),
+                    provenance.path(),
+                    provenance.checksum(),
+                    policy.name,
+                    policy.version
+                )),
+                occurred_at: input.now,
+            })
+            .map_err(PublishCatalogPolicyError::Audit)?;
         Ok(policy)
     }
 }
@@ -4618,6 +6567,245 @@ fn map_create_runbook_job_error<RepoError, AuditError, SignError>(
         }
         BuildSignedRunbookJobError::NoTargets => CreateRunbookJobError::NoTargets,
         BuildSignedRunbookJobError::Sign(error) => CreateRunbookJobError::Sign(error),
+    }
+}
+
+/// Input for creating a Runbook Job from one immutable, already activated catalog document.
+///
+/// The runbook body deliberately is not caller supplied. The application reads it from the
+/// durable catalog record after verifying the source, active revision, document path, and
+/// checksum supplied by the caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateCatalogRunbookJobInput {
+    pub source_id: String,
+    pub commit: String,
+    pub path: String,
+    pub checksum: String,
+    pub job_id: String,
+    pub target_agent_ids: Vec<String>,
+    pub timeout: Duration,
+    pub confirmed_high_risk: bool,
+    pub confirmed_by: String,
+    pub issued_at: SystemTime,
+    pub expires_at: SystemTime,
+    pub nonce_prefix: String,
+    pub approval_request_id: String,
+    pub approval_expires_at: SystemTime,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CreateCatalogRunbookJobError<RepoError, AuditError, SignError> {
+    Catalog(CatalogError),
+    SourceNotFound,
+    RevisionNotFound,
+    RevisionNotActive,
+    RevisionNotReady,
+    DocumentNotFound,
+    ChecksumMismatch,
+    Domain(JobError),
+    Agent(AgentError),
+    InvalidRunbook(String),
+    NoTargets,
+    Repository(RepoError),
+    Audit(AuditError),
+    Sign(SignError),
+}
+
+pub type CreateCatalogRunbookJobResult<R, A, S> = Result<
+    CreateRunbookJobOutput,
+    CreateCatalogRunbookJobError<
+        <R as TaskAssignmentRepository>::Error,
+        <A as AuditWriter>::Error,
+        <S as TaskEnvelopeSigner>::Error,
+    >,
+>;
+
+impl<RepoError, AuditError, SignError> Display
+    for CreateCatalogRunbookJobError<RepoError, AuditError, SignError>
+where
+    RepoError: Display,
+    AuditError: Display,
+    SignError: Display,
+{
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Catalog(error) => write!(formatter, "catalog error: {error}"),
+            Self::SourceNotFound => formatter.write_str("catalog source was not found"),
+            Self::RevisionNotFound => formatter.write_str("catalog revision was not found"),
+            Self::RevisionNotActive => formatter.write_str("catalog revision is not active"),
+            Self::RevisionNotReady => formatter.write_str("catalog revision is not ready"),
+            Self::DocumentNotFound => formatter.write_str("catalog document was not found"),
+            Self::ChecksumMismatch => {
+                formatter.write_str("catalog document checksum does not match")
+            }
+            Self::Domain(error) => write!(formatter, "{error}"),
+            Self::Agent(error) => write!(formatter, "{error}"),
+            Self::InvalidRunbook(error) => write!(formatter, "invalid runbook: {error}"),
+            Self::NoTargets => formatter.write_str("runbook job requires at least one target"),
+            Self::Repository(error) => write!(formatter, "repository error: {error}"),
+            Self::Audit(error) => write!(formatter, "audit error: {error}"),
+            Self::Sign(error) => write!(formatter, "sign error: {error}"),
+        }
+    }
+}
+
+/// Creates an approved-and-signed Runbook Job using a durable, active catalog snapshot.
+pub struct CreateCatalogRunbookJob;
+
+impl CreateCatalogRunbookJob {
+    pub fn execute<R, A, S>(
+        repo: &mut R,
+        audit: &mut A,
+        signer: &mut S,
+        input: CreateCatalogRunbookJobInput,
+    ) -> CreateCatalogRunbookJobResult<R, A, S>
+    where
+        R: RunbookJobRepository + CatalogRepository<Error = <R as TaskAssignmentRepository>::Error>,
+        A: AuditWriter,
+        S: TaskEnvelopeSigner,
+    {
+        let source_id = CatalogSourceId::new(input.source_id.clone())
+            .map_err(CreateCatalogRunbookJobError::Catalog)?;
+        let commit = CatalogCommitId::new(input.commit.clone())
+            .map_err(CreateCatalogRunbookJobError::Catalog)?;
+        let source = repo
+            .find_catalog_source(&source_id)
+            .map_err(CreateCatalogRunbookJobError::Repository)?
+            .ok_or(CreateCatalogRunbookJobError::SourceNotFound)?;
+        if source.active_revision() != Some(&commit) {
+            return Err(CreateCatalogRunbookJobError::RevisionNotActive);
+        }
+        let revision = repo
+            .find_catalog_revision(&source_id, &commit)
+            .map_err(CreateCatalogRunbookJobError::Repository)?
+            .ok_or(CreateCatalogRunbookJobError::RevisionNotFound)?;
+        if !matches!(revision.state(), CatalogRevisionState::Ready { .. }) {
+            return Err(CreateCatalogRunbookJobError::RevisionNotReady);
+        }
+        let record = repo
+            .find_catalog_document(&source_id, &commit, &input.path)
+            .map_err(CreateCatalogRunbookJobError::Repository)?
+            .ok_or(CreateCatalogRunbookJobError::DocumentNotFound)?;
+        if record.document.checksum() != input.checksum {
+            return Err(CreateCatalogRunbookJobError::ChecksumMismatch);
+        }
+        let provenance = fleet_domain::CatalogRunbookProvenance::from_document(&record.document)
+            .map_err(CreateCatalogRunbookJobError::Catalog)?;
+        let runbook_input = CreateRunbookJobInput {
+            job_id: input.job_id.clone(),
+            target_agent_ids: input.target_agent_ids,
+            runbook_document: record.body,
+            timeout: input.timeout,
+            confirmed_high_risk: input.confirmed_high_risk,
+            confirmed_by: input.confirmed_by.clone(),
+            issued_at: input.issued_at,
+            expires_at: input.expires_at,
+            nonce_prefix: input.nonce_prefix,
+            approval_request_id: input.approval_request_id,
+            approval_expires_at: input.approval_expires_at,
+        };
+        let mut signed = build_signed_runbook_job(
+            signer,
+            BuildSignedRunbookJobInput {
+                job_id: runbook_input.job_id.clone(),
+                target_agent_ids: runbook_input.target_agent_ids,
+                runbook_document: runbook_input.runbook_document,
+                timeout: runbook_input.timeout,
+                issued_at: runbook_input.issued_at,
+                expires_at: runbook_input.expires_at,
+                nonce_prefix: runbook_input.nonce_prefix,
+            },
+        )
+        .map_err(map_create_catalog_runbook_job_error)?;
+        if signed.approval_requirement == fleet_domain::ApprovalRequirement::NotRequired {
+            signed
+                .job
+                .queue(false)
+                .map_err(CreateCatalogRunbookJobError::Domain)?;
+        }
+        repo.save_catalog_runbook_job_with_assignments(
+            signed.job,
+            &signed.task,
+            &provenance,
+            &signed.envelopes,
+        )
+        .map_err(CreateCatalogRunbookJobError::Repository)?;
+        let approval_request =
+            if signed.approval_requirement != fleet_domain::ApprovalRequirement::NotRequired {
+                let approval = ApprovalRequest::new(
+                    ApprovalId::new(runbook_input.approval_request_id.clone())
+                        .map_err(CreateCatalogRunbookJobError::Domain)?,
+                    JobId::new(runbook_input.job_id.clone())
+                        .map_err(CreateCatalogRunbookJobError::Domain)?,
+                    runbook_input.confirmed_by.clone(),
+                    "runbook execution requires manual approval",
+                    runbook_input.approval_expires_at,
+                    runbook_input.issued_at,
+                )
+                .map_err(CreateCatalogRunbookJobError::Domain)?;
+                let record = approval_request_to_record(&approval);
+                repo.insert_approval_request(record.clone())
+                    .map_err(CreateCatalogRunbookJobError::Repository)?;
+                audit
+                    .write(AuditEvent {
+                        category: AuditCategory::Approval,
+                        action: "approval_requested".to_owned(),
+                        actor: AuditActor::new(runbook_input.confirmed_by.clone()),
+                        target: AuditTarget::new(runbook_input.job_id.clone()),
+                        value: AuditValue::Plain(format!(
+                            "approval_id={},reason={},confirmed_high_risk={},target_count={}",
+                            record.id,
+                            record.reason,
+                            runbook_input.confirmed_high_risk,
+                            signed.targets.len()
+                        )),
+                        occurred_at: runbook_input.issued_at,
+                    })
+                    .map_err(CreateCatalogRunbookJobError::Audit)?;
+                Some(record)
+            } else {
+                None
+            };
+        audit
+            .write(AuditEvent {
+                category: AuditCategory::Job,
+                action: "catalog_runbook_job_created".to_owned(),
+                actor: AuditActor::new(runbook_input.confirmed_by.clone()),
+                target: AuditTarget::new(runbook_input.job_id),
+                value: AuditValue::Plain(format!(
+                    "source_id={},commit={},path={},checksum={},confirmed_high_risk={},confirmed_by={},target_count={}",
+                    provenance.source_id(),
+                    provenance.commit(),
+                    provenance.path(),
+                    provenance.checksum(),
+                    runbook_input.confirmed_high_risk,
+                    runbook_input.confirmed_by,
+                    signed.targets.len()
+                )),
+                occurred_at: runbook_input.issued_at,
+            })
+            .map_err(CreateCatalogRunbookJobError::Audit)?;
+
+        Ok(CreateRunbookJobOutput {
+            task: signed.task,
+            targets: signed.targets,
+            envelopes: signed.envelopes,
+            approval_request,
+        })
+    }
+}
+
+fn map_create_catalog_runbook_job_error<RepoError, AuditError, SignError>(
+    error: BuildSignedRunbookJobError<SignError>,
+) -> CreateCatalogRunbookJobError<RepoError, AuditError, SignError> {
+    match error {
+        BuildSignedRunbookJobError::Domain(error) => CreateCatalogRunbookJobError::Domain(error),
+        BuildSignedRunbookJobError::Agent(error) => CreateCatalogRunbookJobError::Agent(error),
+        BuildSignedRunbookJobError::InvalidRunbook(error) => {
+            CreateCatalogRunbookJobError::InvalidRunbook(error)
+        }
+        BuildSignedRunbookJobError::NoTargets => CreateCatalogRunbookJobError::NoTargets,
+        BuildSignedRunbookJobError::Sign(error) => CreateCatalogRunbookJobError::Sign(error),
     }
 }
 
@@ -6915,6 +9103,160 @@ mod tests {
     }
 
     #[test]
+    fn active_catalog_runbook_creates_an_approved_signed_job_from_the_durable_snapshot() {
+        let mut repo = FakeCommandJobRepository::default();
+        let (source, revision, document) = ready_active_catalog_runbook();
+        repo.catalog_sources.push(source);
+        repo.catalog_revisions.push(revision);
+        repo.catalog_documents.push(CatalogDocumentRecord {
+            document,
+            body: remediation_runbook_document(),
+        });
+        let mut audit = FakeAuditWriter::default();
+        let mut signer = FakeSigner;
+
+        let output = CreateCatalogRunbookJob::execute(
+            &mut repo,
+            &mut audit,
+            &mut signer,
+            catalog_runbook_input(),
+        )
+        .unwrap();
+
+        assert_eq!(repo.atomic_save_count, 1);
+        assert_eq!(repo.saved_assignments.len(), 1);
+        assert_eq!(
+            repo.saved_runbook_document.as_deref(),
+            Some(remediation_runbook_document().as_str())
+        );
+        assert_eq!(
+            repo.saved_catalog_runbook_provenance,
+            Some((
+                "catalog-main".to_owned(),
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+                "runbooks/nginx-basic.yaml".to_owned(),
+                "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_owned(),
+            ))
+        );
+        assert_eq!(
+            output.approval_request.unwrap().id,
+            "approval-catalog-runbook"
+        );
+        assert!(output.envelopes[0].signature.is_some());
+        assert!(
+            audit
+                .events
+                .iter()
+                .all(|event| !plain_audit_value(event).contains("tasks:"))
+        );
+    }
+
+    #[test]
+    fn inactive_catalog_runbook_cannot_create_a_job_or_assignment() {
+        let mut repo = FakeCommandJobRepository::default();
+        let (mut source, revision, document) = ready_active_catalog_runbook();
+        source = CatalogSource::new(
+            source.id().clone(),
+            source.url().clone(),
+            source.reference().clone(),
+        );
+        repo.catalog_sources.push(source);
+        repo.catalog_revisions.push(revision);
+        repo.catalog_documents.push(CatalogDocumentRecord {
+            document,
+            body: remediation_runbook_document(),
+        });
+        let mut audit = FakeAuditWriter::default();
+        let mut signer = FakeSigner;
+
+        let result = CreateCatalogRunbookJob::execute(
+            &mut repo,
+            &mut audit,
+            &mut signer,
+            catalog_runbook_input(),
+        );
+
+        assert!(matches!(
+            result,
+            Err(CreateCatalogRunbookJobError::RevisionNotActive)
+        ));
+        assert_eq!(repo.saved_count, 0);
+        assert!(repo.saved_assignments.is_empty());
+        assert!(repo.approval_requests.is_empty());
+        assert!(audit.events.is_empty());
+    }
+
+    #[test]
+    fn unready_missing_or_stale_catalog_runbook_cannot_create_a_job() {
+        let (source, ready_revision, document) = ready_active_catalog_runbook();
+
+        let mut unready_repo = FakeCommandJobRepository::default();
+        let unready_revision = CatalogRevision::restore(
+            source.id().clone(),
+            ready_revision.commit().clone(),
+            CatalogRevisionState::Fetching,
+        )
+        .unwrap();
+        unready_repo.catalog_sources.push(source.clone());
+        unready_repo.catalog_revisions.push(unready_revision);
+        unready_repo.catalog_documents.push(CatalogDocumentRecord {
+            document: document.clone(),
+            body: remediation_runbook_document(),
+        });
+
+        let mut missing_repo = FakeCommandJobRepository::default();
+        missing_repo.catalog_sources.push(source.clone());
+        missing_repo.catalog_revisions.push(ready_revision.clone());
+
+        let mut stale_repo = FakeCommandJobRepository::default();
+        stale_repo.catalog_sources.push(source);
+        stale_repo.catalog_revisions.push(ready_revision);
+        stale_repo.catalog_documents.push(CatalogDocumentRecord {
+            document,
+            body: remediation_runbook_document(),
+        });
+        let mut stale_input = catalog_runbook_input();
+        stale_input.checksum =
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned();
+
+        let mut audit = FakeAuditWriter::default();
+        let mut signer = FakeSigner;
+        let unready = CreateCatalogRunbookJob::execute(
+            &mut unready_repo,
+            &mut audit,
+            &mut signer,
+            catalog_runbook_input(),
+        );
+        let missing = CreateCatalogRunbookJob::execute(
+            &mut missing_repo,
+            &mut audit,
+            &mut signer,
+            catalog_runbook_input(),
+        );
+        let stale =
+            CreateCatalogRunbookJob::execute(&mut stale_repo, &mut audit, &mut signer, stale_input);
+
+        assert!(matches!(
+            unready,
+            Err(CreateCatalogRunbookJobError::RevisionNotReady)
+        ));
+        assert!(matches!(
+            missing,
+            Err(CreateCatalogRunbookJobError::DocumentNotFound)
+        ));
+        assert!(matches!(
+            stale,
+            Err(CreateCatalogRunbookJobError::ChecksumMismatch)
+        ));
+        for repo in [&unready_repo, &missing_repo, &stale_repo] {
+            assert_eq!(repo.saved_count, 0);
+            assert!(repo.saved_assignments.is_empty());
+            assert!(repo.approval_requests.is_empty());
+        }
+        assert!(audit.events.is_empty());
+    }
+
+    #[test]
     fn create_enrollment_token_persists_hash_and_audit_secret_ref() {
         let mut repo = FakeEnrollmentTokenRepository::default();
         let mut audit = FakeAuditWriter::default();
@@ -7371,6 +9713,92 @@ mod tests {
             .unwrap()
             .is_empty()
         );
+    }
+
+    #[test]
+    fn active_catalog_policy_is_published_with_immutable_provenance_without_assignment() {
+        let mut repo = FakePolicyRepository::default();
+        let (source, revision, document) = ready_active_catalog_policy();
+        repo.catalog_sources.push(source);
+        repo.catalog_revisions.push(revision);
+        repo.catalog_documents.push(CatalogDocumentRecord {
+            document,
+            body: policy_document("nginx-running"),
+        });
+        let mut audit = FakeAuditWriter::default();
+
+        let policy = PublishCatalogPolicy::execute(
+            &mut repo,
+            &mut audit,
+            PublishCatalogPolicyInput {
+                source_id: "catalog-policy".to_owned(),
+                commit: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+                path: "policies/nginx-running.yaml".to_owned(),
+                checksum: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                    .to_owned(),
+                actor: "admin".to_owned(),
+                now: SystemTime::UNIX_EPOCH,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(policy.id, "nginx-running");
+        assert_eq!(repo.catalog_policy_provenance.len(), 1);
+        assert!(repo.assignments.is_empty());
+        assert!(repo.schedules.is_empty());
+        assert_eq!(audit.events[0].action, "catalog_policy_published");
+        assert!(!plain_audit_value(&audit.events[0]).contains("checks:"));
+    }
+
+    #[test]
+    fn catalog_policy_cannot_overwrite_a_manual_or_other_catalog_source_policy() {
+        let (source, revision, document) = ready_active_catalog_policy();
+        let mut manual_repo = FakePolicyRepository {
+            policies: vec![PolicyRecord {
+                id: "nginx-running".to_owned(),
+                name: "nginx-running".to_owned(),
+                version: 1,
+                source: policy_document("nginx-running"),
+                created_at: SystemTime::UNIX_EPOCH,
+                updated_at: SystemTime::UNIX_EPOCH,
+            }],
+            catalog_sources: vec![source.clone()],
+            catalog_revisions: vec![revision.clone()],
+            catalog_documents: vec![CatalogDocumentRecord {
+                document: document.clone(),
+                body: policy_document("nginx-running"),
+            }],
+            ..Default::default()
+        };
+        let mut other_catalog_repo = FakePolicyRepository {
+            policies: manual_repo.policies.clone(),
+            catalog_sources: vec![source],
+            catalog_revisions: vec![revision],
+            catalog_documents: vec![CatalogDocumentRecord {
+                document,
+                body: policy_document("nginx-running"),
+            }],
+            catalog_policy_provenance: vec![catalog_policy_provenance_for(
+                "other-catalog",
+                "ffffffffffffffffffffffffffffffffffffffff",
+            )],
+            ..Default::default()
+        };
+        let mut audit = FakeAuditWriter::default();
+        let input = publish_catalog_policy_input();
+
+        let manual = PublishCatalogPolicy::execute(&mut manual_repo, &mut audit, input.clone());
+        let other = PublishCatalogPolicy::execute(&mut other_catalog_repo, &mut audit, input);
+
+        assert!(matches!(
+            manual,
+            Err(PublishCatalogPolicyError::ManualPolicyConflict)
+        ));
+        assert!(matches!(
+            other,
+            Err(PublishCatalogPolicyError::OtherCatalogSourceConflict)
+        ));
+        assert!(audit.events.is_empty());
     }
 
     #[test]
@@ -8304,6 +10732,48 @@ spec:
         }
     }
 
+    fn catalog_runbook_input() -> CreateCatalogRunbookJobInput {
+        CreateCatalogRunbookJobInput {
+            source_id: "catalog-main".to_owned(),
+            commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            path: "runbooks/nginx-basic.yaml".to_owned(),
+            checksum: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_owned(),
+            job_id: "catalog-runbook-job-1".to_owned(),
+            target_agent_ids: vec!["agent-1".to_owned()],
+            timeout: Duration::from_secs(30),
+            confirmed_high_risk: true,
+            confirmed_by: "admin".to_owned(),
+            issued_at: SystemTime::UNIX_EPOCH,
+            expires_at: SystemTime::UNIX_EPOCH + Duration::from_secs(60),
+            nonce_prefix: "nonce-catalog-runbook".to_owned(),
+            approval_request_id: "approval-catalog-runbook".to_owned(),
+            approval_expires_at: SystemTime::UNIX_EPOCH + Duration::from_secs(60),
+        }
+    }
+
+    fn ready_active_catalog_runbook() -> (CatalogSource, CatalogRevision, CatalogDocument) {
+        let source_id = CatalogSourceId::new("catalog-main").unwrap();
+        let commit = CatalogCommitId::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let mut source = CatalogSource::new(
+            source_id.clone(),
+            PublicCatalogUrl::new("https://example.com/fleet/catalog.git").unwrap(),
+            CatalogReference::new("main").unwrap(),
+        );
+        let mut revision = source.begin_sync(commit.clone());
+        revision.begin_validation().unwrap();
+        revision.mark_ready(1).unwrap();
+        source.activate(&revision).unwrap();
+        let document = CatalogDocument::new(
+            source_id,
+            commit,
+            CatalogDocumentKind::Runbook,
+            "runbooks/nginx-basic.yaml",
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        )
+        .unwrap();
+        (source, revision, document)
+    }
+
     fn remediation_runbook_document() -> String {
         r#"
 apiVersion: fleet.sponzey.dev/v1alpha1
@@ -8377,10 +10847,15 @@ spec:
         saved_program: Option<String>,
         saved_drift_policy: Option<String>,
         saved_runbook_document: Option<String>,
+        saved_catalog_runbook_provenance: Option<(String, String, String, String)>,
         saved_assignments: Vec<TaskEnvelope>,
         approval_requests: Vec<ApprovalRequestRecord>,
         approval_status_updates: Vec<(String, JobStatus)>,
         remediation_requests: Vec<RemediationRequestRecord>,
+        catalog_sources: Vec<CatalogSource>,
+        catalog_revisions: Vec<CatalogRevision>,
+        catalog_documents: Vec<CatalogDocumentRecord>,
+        catalog_sync_operations: Vec<CatalogSyncOperation>,
     }
 
     impl TaskAssignmentRepository for FakeCommandJobRepository {
@@ -8460,6 +10935,140 @@ spec:
             self.atomic_save_count += 1;
             self.save_runbook_job(job, task)?;
             self.saved_assignments.extend(assignments.iter().cloned());
+            Ok(())
+        }
+
+        fn save_catalog_runbook_job_with_assignments(
+            &mut self,
+            job: Job,
+            task: &RunbookExecutionTask,
+            provenance: &fleet_domain::CatalogRunbookProvenance,
+            assignments: &[TaskEnvelope],
+        ) -> Result<(), <Self as TaskAssignmentRepository>::Error> {
+            self.saved_catalog_runbook_provenance = Some((
+                provenance.source_id().as_str().to_owned(),
+                provenance.commit().as_str().to_owned(),
+                provenance.path().to_owned(),
+                provenance.checksum().to_owned(),
+            ));
+            self.save_runbook_job_with_assignments(job, task, assignments)
+        }
+    }
+
+    impl CatalogRepository for FakeCommandJobRepository {
+        type Error = Infallible;
+
+        fn save_catalog_source(&mut self, source: CatalogSource) -> Result<(), Self::Error> {
+            self.catalog_sources.push(source);
+            Ok(())
+        }
+
+        fn find_catalog_source(
+            &self,
+            source_id: &CatalogSourceId,
+        ) -> Result<Option<CatalogSource>, Self::Error> {
+            Ok(self
+                .catalog_sources
+                .iter()
+                .find(|source| source.id() == source_id)
+                .cloned())
+        }
+
+        fn find_catalog_revision(
+            &self,
+            source_id: &CatalogSourceId,
+            commit: &CatalogCommitId,
+        ) -> Result<Option<CatalogRevision>, Self::Error> {
+            Ok(self
+                .catalog_revisions
+                .iter()
+                .find(|revision| revision.source_id() == source_id && revision.commit() == commit)
+                .cloned())
+        }
+
+        fn save_catalog_revision(&mut self, revision: CatalogRevision) -> Result<(), Self::Error> {
+            self.catalog_revisions.push(revision);
+            Ok(())
+        }
+
+        fn begin_or_observe_catalog_sync_operation(
+            &mut self,
+            operation: CatalogSyncOperation,
+        ) -> Result<CatalogSyncOperation, Self::Error> {
+            self.catalog_sync_operations.push(operation.clone());
+            Ok(operation)
+        }
+
+        fn save_catalog_sync_operation(
+            &mut self,
+            operation: CatalogSyncOperation,
+        ) -> Result<(), Self::Error> {
+            self.catalog_sync_operations.push(operation);
+            Ok(())
+        }
+
+        fn find_catalog_sync_operation(
+            &self,
+            operation_id: &CatalogSyncOperationId,
+        ) -> Result<Option<CatalogSyncOperation>, Self::Error> {
+            Ok(self
+                .catalog_sync_operations
+                .iter()
+                .find(|operation| operation.id() == operation_id)
+                .cloned())
+        }
+
+        fn save_catalog_document(
+            &mut self,
+            document: CatalogDocument,
+            body: String,
+        ) -> Result<(), Self::Error> {
+            self.catalog_documents
+                .push(CatalogDocumentRecord { document, body });
+            Ok(())
+        }
+
+        fn reuse_catalog_document(&mut self, document: CatalogDocument) -> Result<(), Self::Error> {
+            let body = self
+                .catalog_documents
+                .iter()
+                .find(|existing| existing.document.checksum() == document.checksum())
+                .map(|existing| existing.body.clone())
+                .unwrap_or_default();
+            self.catalog_documents
+                .push(CatalogDocumentRecord { document, body });
+            Ok(())
+        }
+
+        fn find_catalog_document(
+            &self,
+            source_id: &CatalogSourceId,
+            commit: &CatalogCommitId,
+            path: &str,
+        ) -> Result<Option<CatalogDocumentRecord>, Self::Error> {
+            Ok(self
+                .catalog_documents
+                .iter()
+                .find(|record| {
+                    record.document.source_id() == source_id
+                        && record.document.commit() == commit
+                        && record.document.path() == path
+                })
+                .cloned())
+        }
+
+        fn activate_catalog_revision(
+            &mut self,
+            source: CatalogSource,
+            _revision: &CatalogRevision,
+        ) -> Result<(), Self::Error> {
+            if let Some(existing) = self
+                .catalog_sources
+                .iter_mut()
+                .find(|existing| existing.id() == source.id())
+            {
+                *existing = source;
+            }
             Ok(())
         }
     }
@@ -9337,6 +11946,52 @@ spec:
         )
     }
 
+    fn publish_catalog_policy_input() -> PublishCatalogPolicyInput {
+        PublishCatalogPolicyInput {
+            source_id: "catalog-policy".to_owned(),
+            commit: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+            path: "policies/nginx-running.yaml".to_owned(),
+            checksum: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".to_owned(),
+            actor: "admin".to_owned(),
+            now: SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    fn ready_active_catalog_policy() -> (CatalogSource, CatalogRevision, CatalogDocument) {
+        let source_id = CatalogSourceId::new("catalog-policy").unwrap();
+        let commit = CatalogCommitId::new("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
+        let mut source = CatalogSource::new(
+            source_id.clone(),
+            PublicCatalogUrl::new("https://example.com/fleet/catalog.git").unwrap(),
+            CatalogReference::new("main").unwrap(),
+        );
+        let mut revision = source.begin_sync(commit.clone());
+        revision.begin_validation().unwrap();
+        revision.mark_ready(1).unwrap();
+        source.activate(&revision).unwrap();
+        let document = CatalogDocument::new(
+            source_id,
+            commit,
+            CatalogDocumentKind::Policy,
+            "policies/nginx-running.yaml",
+            "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        )
+        .unwrap();
+        (source, revision, document)
+    }
+
+    fn catalog_policy_provenance_for(source_id: &str, commit: &str) -> CatalogPolicyProvenance {
+        let document = CatalogDocument::new(
+            CatalogSourceId::new(source_id).unwrap(),
+            CatalogCommitId::new(commit).unwrap(),
+            CatalogDocumentKind::Policy,
+            "policies/nginx-running.yaml",
+            "e".repeat(64),
+        )
+        .unwrap();
+        CatalogPolicyProvenance::from_document(&document).unwrap()
+    }
+
     fn scheduled_drift_repo_fixture(next_due_at: SystemTime) -> FakePolicyRepository {
         let source = policy_document("nginx-running");
         FakePolicyRepository {
@@ -9390,6 +12045,11 @@ spec:
         remediation_requests: Vec<RemediationRequestRecord>,
         remediation_verification_jobs: Vec<(String, String)>,
         remediation_verification_audits: Vec<AuditEvent>,
+        catalog_sources: Vec<CatalogSource>,
+        catalog_revisions: Vec<CatalogRevision>,
+        catalog_documents: Vec<CatalogDocumentRecord>,
+        catalog_sync_operations: Vec<CatalogSyncOperation>,
+        catalog_policy_provenance: Vec<CatalogPolicyProvenance>,
     }
 
     impl AgentRepository for FakePolicyRepository {
@@ -9428,6 +12088,49 @@ spec:
                 updated_at: SystemTime::UNIX_EPOCH,
             });
             Ok(())
+        }
+
+        fn publish_catalog_policy_source(
+            &mut self,
+            policy: &Policy,
+            provenance: &CatalogPolicyProvenance,
+        ) -> Result<CatalogPolicyPublishOutcome, Self::Error> {
+            if let Some(existing) = self
+                .policies
+                .iter()
+                .position(|existing| existing.id == policy.id)
+            {
+                let Some(existing_provenance) = self
+                    .catalog_policy_provenance
+                    .iter_mut()
+                    .find(|existing| existing.path() == provenance.path())
+                else {
+                    return Ok(CatalogPolicyPublishOutcome::ManualPolicyConflict);
+                };
+                if existing_provenance.source_id() != provenance.source_id() {
+                    return Ok(CatalogPolicyPublishOutcome::OtherCatalogSourceConflict);
+                }
+                self.policies[existing] = PolicyRecord {
+                    id: policy.id.clone(),
+                    name: policy.name.clone(),
+                    version: policy.version,
+                    source: policy.source.clone(),
+                    created_at: SystemTime::UNIX_EPOCH,
+                    updated_at: SystemTime::UNIX_EPOCH,
+                };
+                *existing_provenance = provenance.clone();
+            } else {
+                self.policies.push(PolicyRecord {
+                    id: policy.id.clone(),
+                    name: policy.name.clone(),
+                    version: policy.version,
+                    source: policy.source.clone(),
+                    created_at: SystemTime::UNIX_EPOCH,
+                    updated_at: SystemTime::UNIX_EPOCH,
+                });
+                self.catalog_policy_provenance.push(provenance.clone());
+            }
+            Ok(CatalogPolicyPublishOutcome::Published)
         }
 
         fn list_policies(&self) -> Result<Vec<PolicyRecord>, Self::Error> {
@@ -9544,6 +12247,124 @@ spec:
                 job_id.to_owned(),
             ));
             Ok(self.resolve_latest_result)
+        }
+    }
+
+    impl CatalogRepository for FakePolicyRepository {
+        type Error = Infallible;
+
+        fn save_catalog_source(&mut self, source: CatalogSource) -> Result<(), Self::Error> {
+            self.catalog_sources.push(source);
+            Ok(())
+        }
+
+        fn find_catalog_source(
+            &self,
+            source_id: &CatalogSourceId,
+        ) -> Result<Option<CatalogSource>, Self::Error> {
+            Ok(self
+                .catalog_sources
+                .iter()
+                .find(|source| source.id() == source_id)
+                .cloned())
+        }
+
+        fn find_catalog_revision(
+            &self,
+            source_id: &CatalogSourceId,
+            commit: &CatalogCommitId,
+        ) -> Result<Option<CatalogRevision>, Self::Error> {
+            Ok(self
+                .catalog_revisions
+                .iter()
+                .find(|revision| revision.source_id() == source_id && revision.commit() == commit)
+                .cloned())
+        }
+
+        fn save_catalog_revision(&mut self, revision: CatalogRevision) -> Result<(), Self::Error> {
+            self.catalog_revisions.push(revision);
+            Ok(())
+        }
+
+        fn begin_or_observe_catalog_sync_operation(
+            &mut self,
+            operation: CatalogSyncOperation,
+        ) -> Result<CatalogSyncOperation, Self::Error> {
+            self.catalog_sync_operations.push(operation.clone());
+            Ok(operation)
+        }
+
+        fn save_catalog_sync_operation(
+            &mut self,
+            operation: CatalogSyncOperation,
+        ) -> Result<(), Self::Error> {
+            self.catalog_sync_operations.push(operation);
+            Ok(())
+        }
+
+        fn find_catalog_sync_operation(
+            &self,
+            operation_id: &CatalogSyncOperationId,
+        ) -> Result<Option<CatalogSyncOperation>, Self::Error> {
+            Ok(self
+                .catalog_sync_operations
+                .iter()
+                .find(|operation| operation.id() == operation_id)
+                .cloned())
+        }
+
+        fn save_catalog_document(
+            &mut self,
+            document: CatalogDocument,
+            body: String,
+        ) -> Result<(), Self::Error> {
+            self.catalog_documents
+                .push(CatalogDocumentRecord { document, body });
+            Ok(())
+        }
+
+        fn reuse_catalog_document(&mut self, document: CatalogDocument) -> Result<(), Self::Error> {
+            let body = self
+                .catalog_documents
+                .iter()
+                .find(|existing| existing.document.checksum() == document.checksum())
+                .map(|existing| existing.body.clone())
+                .unwrap_or_default();
+            self.catalog_documents
+                .push(CatalogDocumentRecord { document, body });
+            Ok(())
+        }
+
+        fn find_catalog_document(
+            &self,
+            source_id: &CatalogSourceId,
+            commit: &CatalogCommitId,
+            path: &str,
+        ) -> Result<Option<CatalogDocumentRecord>, Self::Error> {
+            Ok(self
+                .catalog_documents
+                .iter()
+                .find(|record| {
+                    record.document.source_id() == source_id
+                        && record.document.commit() == commit
+                        && record.document.path() == path
+                })
+                .cloned())
+        }
+
+        fn activate_catalog_revision(
+            &mut self,
+            source: CatalogSource,
+            _revision: &CatalogRevision,
+        ) -> Result<(), Self::Error> {
+            if let Some(existing) = self
+                .catalog_sources
+                .iter_mut()
+                .find(|existing| existing.id() == source.id())
+            {
+                *existing = source;
+            }
+            Ok(())
         }
     }
 

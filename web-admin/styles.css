@@ -725,6 +725,71 @@ button:disabled {
   gap: 8px;
 }
 
+.catalog-panel {
+  grid-column: span 2;
+}
+
+.catalog-browser {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.catalog-section {
+  min-width: 0;
+}
+
+.catalog-section h3 {
+  margin-bottom: 8px;
+}
+
+.catalog-row,
+.catalog-document {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 58px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface-raised);
+  color: var(--ink);
+  padding: 10px;
+  text-align: left;
+}
+
+.catalog-row.selected {
+  border-color: var(--accent);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+.catalog-row strong,
+.catalog-row small,
+.catalog-document strong,
+.catalog-document small {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.catalog-row small,
+.catalog-document small {
+  margin-top: 3px;
+  color: var(--ink-muted);
+}
+
+.catalog-document {
+  grid-template-columns: auto minmax(0, 1fr);
+}
+
+.catalog-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  align-items: end;
+}
+
 .status-pill.active {
   background: #e5f6ea;
   color: #176c37;
@@ -794,6 +859,8 @@ code {
   .remediation-form,
   .policy-form,
   .signing-form,
+  .catalog-form,
+  .catalog-browser,
   .policy-actions,
   .token-form,
   .token-row {
@@ -808,6 +875,7 @@ code {
   .job-panel,
   .audit-panel,
   .runbook-panel,
+  .catalog-panel,
   .policy-panel,
   .token-panel,
   .signing-panel {

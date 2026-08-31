@@ -163,7 +163,7 @@ signature smoke가 포함되어야 한다. 해당 smoke가 빠지면 release 후
 | Artifact retention gate | Phase 4 | local `ArtifactStore` checksum and retention class smoke |
 | mTLS/key rotation gate | Phase 5 | TLS loopback with certificate/key rotation state tests |
 | OIDC/RBAC gate | Phase 6 | route permission matrix and project-scope integration test |
-| Git catalog gate | Phase 7 | fake Git sync, validation error, activation audit smoke |
+| Git catalog gate | Current catalog plan | fake Git sync, validation error, activation audit, durable metadata paging, and 1,000-document deterministic reuse smoke; pinned-runner timing threshold remains separate |
 | Notification/export gate | Phase 8 | redacted webhook payload and exporter mapping tests |
 | Installer/package/update gate | Phase 9 | one-line installer dry-run, package smoke, signed update artifact test |
 | HA coordination gate | Phase 10 | two-controller lease/claim simulation |

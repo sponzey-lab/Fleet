@@ -13,6 +13,12 @@ const state = {
   metricsWindowMs: 5 * 60 * 1000,
   auditCursor: "",
   auditItems: [],
+  catalogSources: [],
+  catalogRevisions: [],
+  catalogDocuments: [],
+  selectedCatalogSourceId: "",
+  selectedCatalogCommit: "",
+  catalogActionInFlight: false,
 };
 
 const ADMIN_ROUTES = new Set([
@@ -1562,6 +1568,7 @@ async function refreshAll() {
   }
   setStatus("Loading controller data...");
   await loadAgents();
+  await loadCatalogSources();
   const [jobs, enrollmentTokens, approvals, policies, remediations, signingStatus] = await Promise.all([
     api.listJobs(),
     api.listEnrollmentTokens(),
@@ -1609,6 +1616,178 @@ async function refreshAll() {
     });
   }
   setStatus("Loaded latest controller data.", "ok");
+}
+
+export function renderCatalogSources(sources, selectedSourceId = "") {
+  if (!Array.isArray(sources) || sources.length === 0) {
+    return '<div class="empty">No catalog sources registered.</div>';
+  }
+  return sources
+    .map((source) => {
+      const selected = source.id === selectedSourceId ? " selected" : "";
+      const active = source.active_commit
+        ? `<span class="status-pill active">active ${escapeHtml(source.active_commit.slice(0, 12))}</span>`
+        : '<span class="status-pill">no active revision</span>';
+      return `<button class="catalog-row${selected}" type="button" data-catalog-source-id="${escapeHtml(source.id)}"><span><strong>${escapeHtml(source.id)}</strong><small>${escapeHtml(source.reference)}</small></span>${active}</button>`;
+    })
+    .join("");
+}
+
+export function renderCatalogRevisions(revisions, selectedCommit = "", activeCommit = "") {
+  if (!Array.isArray(revisions) || revisions.length === 0) {
+    return '<div class="empty">No synced revisions for this source.</div>';
+  }
+  return revisions
+    .map((revision) => {
+      const selected = revision.commit === selectedCommit ? " selected" : "";
+      const active = revision.commit === activeCommit ? '<span class="status-pill active">active</span>' : "";
+      const failure = revision.failure ? `<small>${escapeHtml(revision.failure)}</small>` : "";
+      return `<button class="catalog-row${selected}" type="button" data-catalog-commit="${escapeHtml(revision.commit)}"><span><strong>${escapeHtml(revision.commit.slice(0, 12))}</strong><small>${escapeHtml(revision.state)} · ${escapeHtml(revision.document_count)} documents</small>${failure}</span>${active}</button>`;
+    })
+    .join("");
+}
+
+export function renderCatalogDocuments(documents) {
+  if (!Array.isArray(documents) || documents.length === 0) {
+    return '<div class="empty">No validated runbook or policy documents in this revision.</div>';
+  }
+  return documents
+    .map(
+      (document) =>
+        `<div class="catalog-document"><span class="status-pill">${escapeHtml(document.kind)}</span><span><strong>${escapeHtml(document.path)}</strong><small>checksum ${escapeHtml(document.checksum.slice(0, 12))}</small></span></div>`,
+    )
+    .join("");
+}
+
+function catalogSourceById(sourceId) {
+  return state.catalogSources.find((source) => source.id === sourceId) || null;
+}
+
+function setCatalogActionPending(form, pending) {
+  form.querySelectorAll('button[name="catalog-action"]').forEach((button) => {
+    button.disabled = pending;
+  });
+}
+
+function renderCatalogDetails() {
+  const revisions = document.querySelector("#catalog-revisions");
+  const documents = document.querySelector("#catalog-documents");
+  const source = catalogSourceById(state.selectedCatalogSourceId);
+  if (revisions) {
+    revisions.innerHTML = renderCatalogRevisions(
+      state.catalogRevisions,
+      state.selectedCatalogCommit,
+      source?.active_commit || "",
+    );
+  }
+  if (documents) {
+    documents.innerHTML = renderCatalogDocuments(state.catalogDocuments);
+  }
+}
+
+async function loadCatalogDocuments(sourceId, commit) {
+  const documents = document.querySelector("#catalog-documents");
+  if (!documents || !sourceId || !commit) {
+    return;
+  }
+  documents.innerHTML = '<div class="empty">Loading document metadata…</div>';
+  try {
+    const page = await api.listCatalogDocuments(sourceId, commit);
+    if (state.selectedCatalogSourceId !== sourceId || state.selectedCatalogCommit !== commit) {
+      return;
+    }
+    state.catalogDocuments = Array.isArray(page.items) ? page.items : [];
+    documents.innerHTML = renderCatalogDocuments(state.catalogDocuments);
+  } catch (error) {
+    documents.innerHTML = '<div class="empty">Document metadata could not be loaded. Refresh or check permissions.</div>';
+  }
+}
+
+async function loadCatalogRevisions(sourceId) {
+  const revisions = document.querySelector("#catalog-revisions");
+  const documents = document.querySelector("#catalog-documents");
+  if (!revisions || !documents || !sourceId) {
+    return;
+  }
+  revisions.innerHTML = '<div class="empty">Loading revisions…</div>';
+  documents.innerHTML = '<div class="empty">Choose a revision to load document metadata.</div>';
+  state.catalogDocuments = [];
+  try {
+    const page = await api.listCatalogRevisions(sourceId);
+    if (state.selectedCatalogSourceId !== sourceId) {
+      return;
+    }
+    state.catalogRevisions = Array.isArray(page.items) ? page.items : [];
+    const source = catalogSourceById(sourceId);
+    if (!state.catalogRevisions.some((revision) => revision.commit === state.selectedCatalogCommit)) {
+      state.selectedCatalogCommit = source?.active_commit || state.catalogRevisions[0]?.commit || "";
+    }
+    renderCatalogDetails();
+    await loadCatalogDocuments(sourceId, state.selectedCatalogCommit);
+  } catch (error) {
+    state.catalogRevisions = [];
+    state.selectedCatalogCommit = "";
+    revisions.innerHTML = '<div class="empty">Revisions could not be loaded. Refresh or check permissions.</div>';
+  }
+}
+
+async function loadCatalogSources() {
+  const list = document.querySelector("#catalog-list");
+  if (!list || !state.token) return;
+  list.innerHTML = '<div class="empty">Loading catalog sources…</div>';
+  try {
+    const page = await api.listCatalogSources();
+    state.catalogSources = Array.isArray(page.items) ? page.items : [];
+    if (!state.catalogSources.some((source) => source.id === state.selectedCatalogSourceId)) {
+      state.selectedCatalogSourceId = state.catalogSources[0]?.id || "";
+      state.selectedCatalogCommit = "";
+    }
+    list.innerHTML = renderCatalogSources(state.catalogSources, state.selectedCatalogSourceId);
+    if (state.selectedCatalogSourceId) {
+      await loadCatalogRevisions(state.selectedCatalogSourceId);
+    } else {
+      state.catalogRevisions = [];
+      state.catalogDocuments = [];
+      renderCatalogDetails();
+    }
+  } catch (error) {
+    list.innerHTML = '<div class="empty">Catalog could not be loaded. Refresh or check permissions.</div>';
+  }
+}
+
+async function submitCatalogAction(form, submitter) {
+  if (state.catalogActionInFlight) return;
+  const data = new FormData(form);
+  const action = submitter instanceof HTMLButtonElement ? submitter.value : "";
+  const sourceId = String(data.get("source-id") || "").trim();
+  if (!sourceId) throw new Error("Catalog source ID is required.");
+  state.catalogActionInFlight = true;
+  setCatalogActionPending(form, true);
+  setStatus(`Catalog ${action} request in progress…`);
+  try {
+    if (action === "register") {
+      const url = String(data.get("url") || "").trim();
+      const reference = String(data.get("reference") || "").trim();
+      if (!url || !reference) throw new Error("A public HTTPS URL and reference are required to register a source.");
+      await api.registerCatalogSource({ source_id: sourceId, url, reference });
+    } else if (action === "sync") {
+      const operationId = String(data.get("operation-id") || "").trim();
+      if (!operationId) throw new Error("A sync operation ID is required.");
+      await api.startCatalogSync(sourceId, { operation_id: operationId });
+    } else if (action === "activate") {
+      const commit = String(data.get("commit") || "").trim();
+      if (!commit) throw new Error("A ready revision commit is required for activation.");
+      await api.activateCatalogRevision(sourceId, { commit });
+    } else {
+      throw new Error("Choose a catalog action.");
+    }
+    state.selectedCatalogSourceId = sourceId;
+    await loadCatalogSources();
+    setStatus(`Catalog ${action} request completed.`, "ok");
+  } finally {
+    state.catalogActionInFlight = false;
+    setCatalogActionPending(form, false);
+  }
 }
 
 function renderPolicyList() {
@@ -2258,6 +2437,37 @@ function boot() {
   document.querySelector("#expire-approvals")?.addEventListener("click", () => {
     expireDueApprovals().catch((error) => setStatus(error.message, "error"));
   });
+  document.querySelector("#refresh-catalog")?.addEventListener("click", () => {
+    loadCatalogSources().catch((error) => setStatus(error.message, "error"));
+  });
+  document.querySelector("#catalog-list")?.addEventListener("click", (event) => {
+    const button = event.target?.closest?.("[data-catalog-source-id]");
+    if (!(button instanceof HTMLButtonElement)) return;
+    state.selectedCatalogSourceId = button.dataset.catalogSourceId || "";
+    state.selectedCatalogCommit = "";
+    document.querySelector("#catalog-list").innerHTML = renderCatalogSources(
+      state.catalogSources,
+      state.selectedCatalogSourceId,
+    );
+    loadCatalogRevisions(state.selectedCatalogSourceId).catch((error) => setStatus(error.message, "error"));
+  });
+  document.querySelector("#catalog-revisions")?.addEventListener("click", (event) => {
+    const button = event.target?.closest?.("[data-catalog-commit]");
+    if (!(button instanceof HTMLButtonElement) || !state.selectedCatalogSourceId) return;
+    state.selectedCatalogCommit = button.dataset.catalogCommit || "";
+    renderCatalogDetails();
+    loadCatalogDocuments(state.selectedCatalogSourceId, state.selectedCatalogCommit).catch((error) =>
+      setStatus(error.message, "error"),
+    );
+  });
+  const catalogActionForm = document.querySelector("#catalog-action-form");
+  if (catalogActionForm instanceof HTMLFormElement) {
+    catalogActionForm.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const submitter = event.submitter instanceof HTMLButtonElement ? event.submitter : null;
+      submitCatalogAction(catalogActionForm, submitter).catch((error) => setStatus(error.message, "error"));
+    });
+  }
   document.querySelector("#refresh-audit")?.addEventListener("click", () => {
     loadAuditPage().catch((error) => setStatus(error.message, "error"));
   });
