@@ -199,6 +199,38 @@ jobs:
           done
           (cd dist/release && sha256sum *.tar.gz > SHA256SUMS)
 
+      - name: Sign release checksums
+        if: github.event_name == 'push' && needs.validate.outputs.dry_run == 'false'
+        shell: bash
+        env:
+          RELEASE_SIGNING_PRIVATE_KEY: ${{ secrets.RELEASE_SIGNING_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$RELEASE_SIGNING_PRIVATE_KEY" ]]; then
+            echo "RELEASE_SIGNING_PRIVATE_KEY must be configured before a release can publish." >&2
+            exit 1
+          fi
+          test -f docs/release-signing-public.pem
+
+          umask 077
+          private_key="$(mktemp)"
+          derived_public_key="$(mktemp)"
+          cleanup() {
+            rm -f "$private_key" "$derived_public_key"
+          }
+          trap cleanup EXIT
+
+          printf '%s' "$RELEASE_SIGNING_PRIVATE_KEY" > "$private_key"
+          openssl pkey -in "$private_key" -pubout -out "$derived_public_key"
+          if ! cmp -s "$derived_public_key" docs/release-signing-public.pem; then
+            echo "release signing private key does not match docs/release-signing-public.pem" >&2
+            exit 1
+          fi
+
+          ./scripts/sign_release_sums.sh dist/release "$private_key"
+          ./scripts/verify_release_signature.sh dist/release docs/release-signing-public.pem
+
       - name: Upload GitHub Release artifacts
         if: github.event_name == 'push' && needs.validate.outputs.dry_run == 'false'
         uses: softprops/action-gh-release@v2
@@ -206,6 +238,8 @@ jobs:
           files: |
             dist/release/*.tar.gz
             dist/release/SHA256SUMS
+            dist/release/SHA256SUMS.sig
+            docs/release-signing-public.pem
 
       - name: Publish platform packages, then wrapper
         shell: bash

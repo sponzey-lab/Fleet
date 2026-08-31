@@ -40,9 +40,10 @@ The publish job:
 - receives short-lived OIDC credentials automatically during each
   `npm publish` command.
 
-Trusted Publishing applies only to npm publish operations. The local manual
-publish helper still accepts `FLEET_NPM_TOKEN_FILE` because a developer shell
-cannot assume the GitHub Actions OIDC identity.
+Trusted Publishing applies only to npm publish operations. It is separate from
+the release checksum signing identity. The local manual publish helper still
+accepts `FLEET_NPM_TOKEN_FILE` because a developer shell cannot assume the
+GitHub Actions OIDC identity.
 
 ## Release checklist
 
@@ -51,8 +52,10 @@ cannot assume the GitHub Actions OIDC identity.
 3. Run `npm test --workspace @sponzey/fleet` and the release gate.
 4. Commit the release metadata.
 5. Push a new matching `v*.*.*` tag.
-6. Confirm all platform builds and the final publish job succeed.
-7. Verify the wrapper and platform versions on npm.
+6. Confirm the release signing public key is committed and the
+   `RELEASE_SIGNING_PRIVATE_KEY` repository secret is configured.
+7. Confirm all platform builds, checksum signature upload, and the final publish job succeed.
+8. Verify the wrapper and platform versions on npm.
 
 Do not move an already published release tag to adopt workflow changes. A
 workflow rerun uses the commit referenced by that tag. Apply workflow or package

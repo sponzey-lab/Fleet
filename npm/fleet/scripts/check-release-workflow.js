@@ -16,6 +16,12 @@ const requirements = [
   ["id-token: write", "publish job must grant id-token: write for npm OIDC"],
   ["npm install --global npm@11", "publish job must install npm 11 for Trusted Publishing"],
   ["package-manager-cache: false", "release setup must disable package manager caching"],
+  ["RELEASE_SIGNING_PRIVATE_KEY", "release workflow must require the signing key secret"],
+  ["./scripts/sign_release_sums.sh", "release workflow must sign SHA256SUMS"],
+  ["test -f docs/release-signing-public.pem", "release workflow must fail when the public key is absent"],
+  ["docs/release-signing-public.pem", "release workflow must publish the pinned release public key"],
+  ["dist/release/SHA256SUMS.sig", "release workflow must upload the detached checksum signature"],
+  ["- name: Sign release checksums\n        if: github.event_name == 'push' && needs.validate.outputs.dry_run == 'false'", "only an actual tagged release may require the signing identity"],
 ];
 
 for (const [fragment, message] of requirements) {
