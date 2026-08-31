@@ -127,7 +127,7 @@ Planned 또는 Partial 항목은 다음 phase 번호를 기준으로 실행한�
 | Standalone release tarballs | Implemented | release workflow artifact packaging and checksum verification script |
 | Linux glibc baseline check | Implemented | Ubuntu 22.04 build and check script |
 | Linux systemd service commands | Implemented | install/start/status/logs/uninstall with dry-run support |
-| Release signature verification | Partial | `SHA256SUMS.sig` sign/verify scripts와 gate smoke 지원. Phase 9에서 release public key publication/rotation 기준 확정 |
+| Release signature verification | Implemented | committed release public key, fail-closed GitHub signing secret, detached checksum signature, and signed dry-run evidence artifact |
 | Windows package | Planned | Phase 12 agent/service support 후 Phase 9 packaging track에서 publish gate 추가 |
 | `.deb`, `.rpm`, Homebrew, Docker | Planned | Phase 9: package decision record, smoke command, signature/version pinning |
 | One-line installer | Planned | Phase 9: dry-run, version pinning, checksum/signature verification |

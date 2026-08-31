@@ -54,11 +54,14 @@ manifest signature도 검증한다.
 ./scripts/verify_release_signature.sh dist/release ./release-public-key.pem
 ```
 
-Official releases are fail-closed: the release workflow requires the
-`RELEASE_SIGNING_PRIVATE_KEY` repository secret and the matching committed
-`docs/release-signing-public.pem`. It verifies the pair before publishing
-`SHA256SUMS.sig` and the public key with the release assets. This signing key
-is separate from npm Trusted Publishing and is never written to the release.
+Tagged releases and manual workflow runs are fail-closed: the release workflow
+requires the `RELEASE_SIGNING_PRIVATE_KEY` repository secret and the matching
+committed `docs/release-signing-public.pem`. It verifies the pair before
+publishing `SHA256SUMS.sig` and the public key with tagged release assets. A
+manual dry-run retains only `SHA256SUMS`, its detached signature, and the
+public key as a short-lived verification artifact; it does not publish npm
+packages or create a GitHub Release. This signing key is separate from npm
+Trusted Publishing and is never written to an artifact.
 
 `target/release/fleet`가 존재하면 Linux release binary는 glibc baseline도 확인한다.
 

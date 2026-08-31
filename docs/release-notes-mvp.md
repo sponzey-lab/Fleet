@@ -49,7 +49,7 @@ This document captures the current post-MVP state and known limits.
 - S3-compatible adapter decision is recorded: implementation is deferred until typed bootstrap artifact store settings, external secret reference credentials, feature-gated contract tests, and redaction tests exist.
 - Systemd install/start commands are implemented for Linux root environments; reboot verification remains manual.
 - Automatic self-upgrade, one-line installer, `.deb`, `.rpm`, Homebrew, Docker, and Windows service packaging are Phase 9 and Phase 12 work.
-- Release checksum signature verification scripts exist for `SHA256SUMS.sig`; official release key publication and operational signing process are Phase 9 work.
+- Release checksum signatures use a committed public key and a fail-closed GitHub signing secret; tagged releases upload `SHA256SUMS.sig`, while manual dry-runs retain short-lived signed verification evidence. Key rotation policy remains Phase 9 work.
 - Retention worker uses code-default MVP durations and has no runtime configuration endpoint or HA lease/leader election. Cleanup keeps audit events out of normal deletion and separates job output, facts, metrics, and agent log cutoffs. HA-safe lease coordination is Phase 10 work; runtime config patching remains prohibited.
 - No production controller signing key rotation, agent certificate rotation, or mTLS client-certificate lifecycle exists. These are Phase 5 work.
 - Capability reporting, persistence, and basic dispatch rejection gate exist with a 24-hour stale snapshot guard. Platform-specific privilege/package/service probing and manual platform smoke are Phase 12 and Phase 15 work.

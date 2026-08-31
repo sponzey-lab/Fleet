@@ -54,8 +54,11 @@ GitHub Actions OIDC identity.
 5. Push a new matching `v*.*.*` tag.
 6. Confirm the release signing public key is committed and the
    `RELEASE_SIGNING_PRIVATE_KEY` repository secret is configured.
-7. Confirm all platform builds, checksum signature upload, and the final publish job succeed.
-8. Verify the wrapper and platform versions on npm.
+7. Optionally run `npm release` manually with `dry_run=true`; download its
+   short-lived signed rehearsal artifact and verify `SHA256SUMS.sig` with the
+   committed public key. This run does not publish a package or create a release.
+8. Confirm all platform builds, checksum signature upload, and the final publish job succeed.
+9. Verify the wrapper and platform versions on npm.
 
 Do not move an already published release tag to adopt workflow changes. A
 workflow rerun uses the commit referenced by that tag. Apply workflow or package

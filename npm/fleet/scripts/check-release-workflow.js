@@ -21,7 +21,8 @@ const requirements = [
   ["test -f docs/release-signing-public.pem", "release workflow must fail when the public key is absent"],
   ["docs/release-signing-public.pem", "release workflow must publish the pinned release public key"],
   ["dist/release/SHA256SUMS.sig", "release workflow must upload the detached checksum signature"],
-  ["- name: Sign release checksums\n        if: github.event_name == 'push' && needs.validate.outputs.dry_run == 'false'", "only an actual tagged release may require the signing identity"],
+  ["- name: Sign release checksums\n        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'", "tagged releases and manual rehearsals must require the signing identity"],
+  ["- name: Upload signed rehearsal artifact\n        if: github.event_name == 'workflow_dispatch' && success()", "manual signing rehearsal must retain its public verification evidence"],
 ];
 
 for (const [fragment, message] of requirements) {
