@@ -56,7 +56,8 @@ GitHub Actions OIDC identity.
    `RELEASE_SIGNING_PRIVATE_KEY` repository secret is configured.
 7. Optionally run `npm release` manually with `dry_run=true`; download its
    short-lived signed rehearsal artifact and verify `SHA256SUMS.sig` with the
-   committed public key. This run does not publish a package or create a release.
+   committed public key. This run packages each distribution with `npm pack
+   --dry-run`; it does not publish a package or create a release.
 8. Confirm all platform builds, checksum signature upload, and the final publish job succeed.
 9. Verify the wrapper and platform versions on npm.
 

@@ -261,10 +261,20 @@ jobs:
         run: |
           set -euo pipefail
 
-          publish_flags=(--access public --tag "$NPM_TAG")
           if [[ "$DRY_RUN" == "true" ]]; then
-            publish_flags+=(--dry-run)
+            for package in \
+              fleet-darwin-arm64 \
+              fleet-darwin-x64 \
+              fleet-linux-arm64 \
+              fleet-linux-x64
+            do
+              npm pack "./dist/npm/$package" --dry-run
+            done
+            npm pack ./npm/fleet --dry-run
+            exit 0
           fi
+
+          publish_flags=(--access public --tag "$NPM_TAG")
 
           for package in \
             fleet-darwin-arm64 \

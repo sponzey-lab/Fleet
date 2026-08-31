@@ -23,6 +23,7 @@ const requirements = [
   ["dist/release/SHA256SUMS.sig", "release workflow must upload the detached checksum signature"],
   ["- name: Sign release checksums\n        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'", "tagged releases and manual rehearsals must require the signing identity"],
   ["- name: Upload signed rehearsal artifact\n        if: github.event_name == 'workflow_dispatch' && success()", "manual signing rehearsal must retain its public verification evidence"],
+  ["npm pack \"./dist/npm/$package\" --dry-run", "release dry-run must validate package contents without attempting to republish an existing version"],
 ];
 
 for (const [fragment, message] of requirements) {
