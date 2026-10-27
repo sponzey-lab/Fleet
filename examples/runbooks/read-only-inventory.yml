@@ -1,7 +1,7 @@
 apiVersion: fleet.sponzey.dev/v1alpha1
 kind: Runbook
 name: read-only-inventory
-description: Read system facts for a rootless catalog integration check.
+description: Read system facts for a rootless catalog integration check; revised description for provenance verification.
 selector: role=ui-smoke
 steps:
   - id: collect-facts
