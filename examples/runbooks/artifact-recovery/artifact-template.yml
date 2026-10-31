@@ -1,0 +1,17 @@
+apiVersion: fleet.sponzey.dev/v1alpha1
+kind: Runbook
+name: artifact-recovery-fixture
+description: Create one public fixture artifact inside an owned private test directory.
+selector: fixture=artifact-catalog
+strategy:
+  concurrency: 1
+  maxFailures: 1
+steps:
+  - id: execution-marker
+    port.check:
+      host: 127.0.0.1
+      port: 47731
+  - id: fixture-artifact
+    file.template:
+      dest: /tmp/fleet-artifact-catalog-fixture/catalog.conf
+      content: public-artifact-recovery-fixture
